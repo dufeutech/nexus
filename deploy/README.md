@@ -1,5 +1,15 @@
 # deploy/ — production topology (first-party services only)
 
+> [!IMPORTANT]
+> **TLS is handled *before* this service — it is not in scope here.** These
+> services resolve per-request tenant + identity context and attach trusted
+> headers; they are intended to run **behind** a TLS-terminating layer (an
+> ingress controller, load balancer, or reverse proxy) on a trusted network. The
+> edge listener speaks **plaintext** by design. Do **not** expose it directly to
+> the public internet — terminate north–south TLS upstream and forward to it.
+> This is a deliberate scope boundary, not an omission (see `../INFO.md` §6
+> anti-scope).
+
 This directory deploys **only what this repo owns**: the two Rust resolution
 planes (`../identity-rs`, `../routing-rs`) and the Envoy edge. Every **stateful**
 dependency is **external** and operated outside this project:
