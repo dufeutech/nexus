@@ -488,7 +488,7 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
 // --------------------------------------------------------------------------- //
 mod api {
     use super::*;
-    use axum::extract::{Path, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
@@ -498,7 +498,39 @@ mod api {
         AxumRouter::new()
             .route("/healthz", get(healthz))
             .route("/resolve/{host}", get(resolve))
+            .route("/authorize", get(authorize))
             .with_state(state)
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AuthorizeQuery {
+        domain: Option<String>,
+    }
+
+    /// Per-host certificate-authorization gate (RFC C2 / N1): the on-demand-TLS
+    /// `ask`. Affirmative (`200`) iff the host is a known, verified, routable
+    /// domain — decided by the SAME predicate as routing (`resolve`), so a host
+    /// the gate authorizes is, by construction, one the router will route. Every
+    /// other case is `403` (fail-closed): not-yet-ready, missing/empty domain,
+    /// unknown/pending host, or a store error surfaced as an unresolved miss.
+    async fn authorize(State(s): State<AppState>, Query(q): Query<AuthorizeQuery>) -> impl IntoResponse {
+        let domain = q.domain.unwrap_or_default();
+        // Fail closed until the plane is ready: deny rather than authorize a cert
+        // for a host we cannot yet evaluate.
+        if domain.is_empty() || !s.ready.load(Ordering::Relaxed) {
+            counter!("router_authorize_total", "result" => "deny").increment(1);
+            return StatusCode::FORBIDDEN;
+        }
+        match s.resolve(&domain).await {
+            Some(_) => {
+                counter!("router_authorize_total", "result" => "allow").increment(1);
+                StatusCode::OK
+            }
+            None => {
+                counter!("router_authorize_total", "result" => "deny").increment(1);
+                StatusCode::FORBIDDEN
+            }
+        }
     }
 
     async fn healthz(State(s): State<AppState>) -> impl IntoResponse {

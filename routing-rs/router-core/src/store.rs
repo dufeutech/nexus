@@ -10,6 +10,27 @@ use crate::domain::TenantConfig;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A stored domain mapping as the control plane sees it (RFC §3.13): which tenant
+/// owns it, whether it is a wildcard, and whether it is verified. Unlike the
+/// hot-path `lookup_domain`, this reads a row regardless of verification state —
+/// the lifecycle (declare/verify) needs to see pending rows too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainRecord {
+    pub tenant_id: String,
+    pub wildcard: bool,
+    pub verified: bool,
+}
+
+/// A live ownership-proof challenge (RFC C4): the minted token and whether it has
+/// passed its time-to-live. The challenge name is derived (see
+/// `crate::verify::challenge_name`), not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    pub domain: String,
+    pub token: String,
+    pub expired: bool,
+}
+
 /// Abstract routing store: point lookups by domain and tenant on the request
 /// path (no scans, RFC §3.10), plus the control-plane write surface (RFC §3.13).
 ///
@@ -51,6 +72,51 @@ pub trait RoutingStore: Send + Sync {
     /// The domains owned by a tenant — used by the control plane to publish the
     /// precise invalidations for a tenant-config change.
     async fn domains_for_tenant(&self, tenant_id: &str) -> Result<Vec<String>, BoxError>;
+
+    /// Read a domain row regardless of verification state (RFC C3): lets the
+    /// lifecycle detect a cross-tenant claim and an idempotent re-declare. `None`
+    /// if the domain is unknown.
+    async fn get_domain(&self, domain: &str) -> Result<Option<DomainRecord>, BoxError>;
+
+    /// Count the domains a tenant holds — **verified plus pending** (RFC C3/I6),
+    /// the figure the quota gate compares against the plan limit.
+    async fn count_domains_for_tenant(&self, tenant_id: &str) -> Result<u32, BoxError>;
+
+    /// The pending (unverified) domains, for the periodic verification poll
+    /// (RFC C4). Order is unspecified.
+    async fn pending_domains(&self) -> Result<Vec<String>, BoxError>;
+
+    /// Expire pending (unverified) domains older than `ttl_secs` (RFC C3): an
+    /// abandoned declare is removed, freeing its quota slot and dropping out of
+    /// the verification poll. Returns the removed domain keys. A pending domain
+    /// never routed, so its removal changes no resolution/authorization outcome
+    /// and MUST NOT trigger an invalidation.
+    async fn expire_pending_domains(&self, ttl_secs: i64) -> Result<Vec<String>, BoxError>;
+}
+
+/// The ownership-proof challenge store (RFC C4). Kept distinct from the routing
+/// store so the challenge lifecycle (a control-plane concern) never touches the
+/// hot read path; an adapter MAY back both with one technology (rules §2).
+#[async_trait]
+pub trait ChallengeStore: Send + Sync {
+    /// Idempotently obtain the challenge for a domain (RFC C3 idempotence): if a
+    /// live (unexpired) challenge exists, return it unchanged; if none exists, or
+    /// the existing one has expired, mint a fresh token with the given TTL and
+    /// return that. Re-declaring a pending domain therefore yields the SAME
+    /// challenge until it expires, then a re-issued one (RFC C4: re-issuable).
+    async fn mint_or_get_challenge(
+        &self,
+        domain: &str,
+        tenant_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Challenge, BoxError>;
+
+    /// Read the current challenge with its expiry computed, if any.
+    async fn get_challenge(&self, domain: &str) -> Result<Option<Challenge>, BoxError>;
+
+    /// Retire a challenge on successful verification (idempotent — missing is not
+    /// an error).
+    async fn delete_challenge(&self, domain: &str) -> Result<(), BoxError>;
 }
 
 /// A live invalidation feed (RFC C16): the control plane publishes the affected

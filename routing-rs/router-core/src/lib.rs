@@ -16,6 +16,9 @@ pub mod context;
 pub mod domain;
 pub mod geo;
 pub mod normalize;
+pub mod plan;
 pub mod store;
+pub mod verify;
 
 pub use domain::{Pool, RoutingDecision, TenantConfig};
+pub use plan::{DomainLimit, PlanLimits, QuotaExceeded};

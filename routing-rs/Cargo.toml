@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["router-core", "store-postgres", "cache-redis", "tenant-router", "control-plane"]
+members = ["router-core", "store-postgres", "cache-redis", "dns-resolver", "tenant-router", "control-plane"]
 
 [workspace.package]
 edition = "2021"
@@ -16,6 +16,8 @@ futures = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 # Optional shared L2 cache tier
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+# Ownership-proof (TXT) resolution adapter — public recursive view of tenant DNS
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
 # Runtime / observability shared across the binaries
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
