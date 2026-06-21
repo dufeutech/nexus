@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["router-core", "store-postgres", "cache-redis", "tenant-router", "control-plane"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Domain + shared
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+# Routing store adapter (authoritative, control-plane-written) + invalidation feed
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+# Optional shared L2 cache tier
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+# Runtime / observability shared across the binaries
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.8"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
+
+[profile.release]
+opt-level = 2

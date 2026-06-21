@@ -1,0 +1,26 @@
+[package]
+name = "tenant-router"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "tenant-router"
+path = "src/main.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+store-postgres = { path = "../store-postgres" }
+cache-redis = { path = "../cache-redis" }
+tonic = "0.14"
+envoy-types = "0.7"
+tokio.workspace = true
+tokio-stream = "0.1"
+futures.workspace = true
+moka = { version = "0.12", features = ["future"] }
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

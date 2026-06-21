@@ -1,0 +1,148 @@
+{{- $iv := index .Values "identity-plane" -}}
+{{- $rv := index .Values "routing-plane" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-edge
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  {{- if not .Values.edge.autoscaling.enabled }}
+  replicas: {{ .Values.edge.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "edge-platform.labels" . | nindent 8 }}
+        {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 8 }}
+      annotations:
+        checksum/envoy-config: {{ include (print $.Template.BasePath "/edge-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        # ---- Tenant router (routing plane): ext_proc :50052 (loopback) ----
+        - name: tenant-router
+          image: {{ include "edge-platform.image" (dict "repo" $rv.images.tenantRouter.repository "tag" $rv.images.tenantRouter.tag "ctx" .) }}
+          imagePullPolicy: {{ $rv.images.tenantRouter.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: ROUTING_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "edge-platform.routingPgSecret" . }}
+                  key: {{ include "edge-platform.routingPgSecretKey" . }}
+            {{- if eq (include "edge-platform.hasRoutingPgRead" .) "true" }}
+            # OPTIONAL pooled read endpoint (cache-miss reads only). The LISTEN
+            # invalidation feed stays on ROUTING_PG_URL (direct) — see deploy README.
+            - name: ROUTING_PG_READ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "edge-platform.routingPgReadSecret" . }}
+                  key: {{ include "edge-platform.routingPgReadSecretKey" . }}
+            {{- end }}
+            {{- $redis := include "edge-platform.redisUrl" . }}
+            {{- if $redis }}
+            - name: REDIS_URL
+              value: {{ $redis | quote }}
+            {{- end }}
+            - name: ROUTING_CACHE_CAPACITY
+              value: {{ $rv.router.cacheCapacity | quote }}
+            - name: ROUTING_CACHE_TTL
+              value: {{ $rv.router.cacheTtlSeconds | quote }}
+            - name: ROUTING_L2_TTL
+              value: {{ $rv.router.l2TtlSeconds | quote }}
+            - name: RUST_LOG
+              value: {{ $rv.router.rustLog | quote }}
+            - name: LOG_FORMAT
+              value: {{ $rv.router.logFormat | quote }}
+          ports:
+            - { name: rt-ext-proc, containerPort: 50052 }
+            - { name: rt-debug, containerPort: 9300 }
+            - { name: rt-metrics, containerPort: 9302 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: rt-debug }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: rt-ext-proc }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.tenantRouter | nindent 12 }}
+        # ---- Identity sidecar (identity plane): ext_proc :50051 (loopback) ----
+        - name: identity-sidecar
+          image: {{ include "edge-platform.image" (dict "repo" $iv.images.sidecar.repository "tag" $iv.images.sidecar.tag "ctx" .) }}
+          imagePullPolicy: {{ $iv.images.sidecar.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: MONGO_URL
+              value: {{ include "edge-platform.mongoUrl" . | quote }}
+            - name: MONGO_DB
+              value: {{ $iv.mongo.db | quote }}
+            - name: MONGO_COLLECTION
+              value: {{ $iv.mongo.collection | quote }}
+            - name: CACHE_TTL_SECONDS
+              value: {{ $iv.sidecar.cacheTtlSeconds | quote }}
+            - name: READINESS_DELAY_SECONDS
+              value: {{ $iv.sidecar.readinessDelaySeconds | quote }}
+            - name: RUST_LOG
+              value: {{ $iv.sidecar.rustLog | quote }}
+            - name: LOG_FORMAT
+              value: {{ $iv.sidecar.logFormat | quote }}
+          ports:
+            - { name: id-ext-proc, containerPort: 50051 }
+            - { name: id-profile, containerPort: 9200 }
+            - { name: id-metrics, containerPort: 9202 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: id-profile }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: id-ext-proc }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.identitySidecar | nindent 12 }}
+        # ---- Envoy edge (the combined tenant-first chain) ----
+        - name: envoy
+          image: {{ include "edge-platform.image" (dict "repo" $rv.images.envoy.repository "tag" $rv.images.envoy.tag "ctx" .) }}
+          imagePullPolicy: {{ $rv.images.envoy.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - { name: http, containerPort: 10000 }
+            - { name: admin, containerPort: 9901 }
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.envoy | nindent 12 }}
+          volumeMounts:
+            - { name: envoy-config, mountPath: /etc/envoy, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: {{ include "edge-platform.fullname" . }}-edge-envoy
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

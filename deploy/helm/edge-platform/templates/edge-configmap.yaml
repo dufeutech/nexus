@@ -1,0 +1,224 @@
+{{- /*
+Combined TENANT-FIRST Envoy edge (RFC C17). Parameterized from the subchart
+values: ZITADEL config + sidecar cache from identity-plane; pools from
+routing-plane. Mirrors the verified ../../kind/full-stack/manifests/edge.yaml.
+
+Filter order is load-bearing:
+  header_mutation  strip client x-tenant-* and x-user-*           (C3)
+    tenant-router ext_proc   host -> tenant -> x-route-pool; reject unknown (C18)
+    jwt_authn                verify the bearer credential                    (C1)
+    identity ext_proc        inject x-user-* from the verified subject       (C2)
+    router                   forward to the pool the decision chose
+*/ -}}
+{{- $iv := index .Values "identity-plane" -}}
+{{- $rv := index .Values "routing-plane" -}}
+{{- $u := $iv.zitadel.internalUrl | trimPrefix "http://" | trimPrefix "https://" | trimSuffix "/" -}}
+{{- $zHost := $u -}}
+{{- $zPort := "8080" -}}
+{{- if contains ":" $u -}}
+{{- $zHost = first (splitList ":" $u) -}}
+{{- $zPort = last (splitList ":" $u) -}}
+{{- end -}}
+{{- if not (hasKey $rv.pools "application") -}}
+{{- fail "routing-plane.pools.application is required: it is the default route target." -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-edge-envoy
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+    static_resources:
+      listeners:
+        - name: listener_0
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 10000 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: edge
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: edge
+                          domains: ["*"]
+                          routes:
+                            {{- range .Values.edge.publicPaths }}
+                            # Public path: tenant-routed + authenticated, but
+                            # identity enrichment disabled (fail-open, C10).
+                            - match: { prefix: {{ . | quote }} }
+                              route: { cluster: pool_application }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_proc:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                                  disabled: true
+                            {{- end }}
+                            {{- range $name, $pool := $rv.pools }}
+                            - match:
+                                prefix: "/"
+                                headers: [{ name: x-route-pool, string_match: { exact: {{ $name | quote }} } }]
+                              route: { cluster: pool_{{ $name }} }
+                            {{- end }}
+                            - match: { prefix: "/" }
+                              route: { cluster: pool_application }
+                    http_filters:
+                      # FIRST: strip client-supplied trusted headers (RFC C3).
+                      - name: envoy.filters.http.header_mutation
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                          mutations:
+                            request_mutations:
+                              - remove: "x-tenant-id"
+                              - remove: "x-tenant-plan"
+                              - remove: "x-tenant-features"
+                              - remove: "x-route-pool"
+                              - remove: "x-routed-by"
+                              # Edge geo (x-geo-*) normalized + injected by
+                              # tenant-router; strip client copies (C3).
+                              - remove: "x-geo-source"
+                              - remove: "x-geo-country"
+                              - remove: "x-geo-continent"
+                              - remove: "x-geo-region"
+                              - remove: "x-geo-city"
+                              - remove: "x-geo-postal-code"
+                              - remove: "x-geo-timezone"
+                              - remove: "x-geo-latitude"
+                              - remove: "x-geo-longitude"
+                              - remove: "x-geo-client-ip"
+                              # Request-context normalized + injected by
+                              # tenant-router; strip client copies (C3).
+                              - remove: "x-locale"
+                              - remove: "x-lang"
+                              - remove: "x-currency"
+                              - remove: "x-privacy-gpc"
+                              - remove: "x-privacy-dnt"
+                              - remove: "x-device-type"
+                              - remove: "x-user-id"
+                              - remove: "x-user-org"
+                              - remove: "x-user-roles"
+                              - remove: "x-user-roles-source"
+                              - remove: "x-user-entitlements"
+                              - remove: "x-user-suspended"
+                              - remove: "x-user-enriched-by"
+                              # Trusted auth-state from the identity sidecar; strip
+                              # client copies so is-anonymous is unforgeable (C3).
+                              - remove: "x-auth-anonymous"
+                              - remove: "x-auth-method"
+                      # Tenant routing (C14/C15/C18) — runs BEFORE auth so
+                      # verification may be tenant-scoped (C17).
+                      - name: tenant-router.ext_proc
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                          grpc_service:
+                            envoy_grpc: { cluster_name: tenant_router }
+                          failure_mode_allow: {{ .Values.edge.failureModeAllow }}
+                          message_timeout: {{ .Values.edge.extProcTimeout }}
+                          processing_mode:
+                            request_header_mode: SEND
+                            response_header_mode: SKIP
+                            request_body_mode: NONE
+                            response_body_mode: NONE
+                            request_trailer_mode: SKIP
+                            response_trailer_mode: SKIP
+                      # Verify the bearer credential (C1).
+                      - name: envoy.filters.http.jwt_authn
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                          providers:
+                            zitadel:
+                              issuer: {{ $iv.zitadel.issuer | quote }}
+                              remote_jwks:
+                                http_uri:
+                                  uri: "http://{{ include "edge-platform.jwksHost" . }}{{ $iv.zitadel.jwksPath }}"
+                                  cluster: zitadel_jwks
+                                  timeout: 5s
+                                cache_duration: { seconds: {{ $iv.zitadel.jwksCacheSeconds }} }
+                              payload_in_metadata: verified
+                              forward: true
+                          rules:
+                            - match: { prefix: "/" }
+                              requires: { provider_name: zitadel }
+                      # Enrich from the verified subject (C2).
+                      - name: envoy.filters.http.ext_proc
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                          grpc_service:
+                            envoy_grpc: { cluster_name: identity_sidecar }
+                          failure_mode_allow: {{ .Values.edge.failureModeAllow }}
+                          message_timeout: {{ .Values.edge.extProcTimeout }}
+                          processing_mode:
+                            request_header_mode: SEND
+                            response_header_mode: SKIP
+                            request_body_mode: NONE
+                            response_body_mode: NONE
+                            request_trailer_mode: SKIP
+                            response_trailer_mode: SKIP
+                          metadata_options:
+                            forwarding_namespaces:
+                              untyped: ["envoy.filters.http.jwt_authn"]
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      clusters:
+        - name: tenant_router
+          type: STATIC
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: tenant_router
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 50052 }
+        - name: identity_sidecar
+          type: STATIC
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: identity_sidecar
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 50051 }
+        - name: zitadel_jwks
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: zitadel_jwks
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: {{ $zHost | quote }}, port_value: {{ $zPort }} }
+        {{- range $name, $pool := $rv.pools }}
+        - name: pool_{{ $name }}
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: pool_{{ $name }}
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: {{ $pool.host | quote }}, port_value: {{ $pool.port }} }
+        {{- end }}

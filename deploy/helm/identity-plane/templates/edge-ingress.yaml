@@ -1,0 +1,34 @@
+{{- if and .Values.edge.enabled .Values.edge.ingress.enabled -}}
+{{- $fullName := include "identity-plane.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-edge
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+  {{- with .Values.edge.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.edge.ingress.className }}
+  {{- if .Values.edge.ingress.tls.enabled }}
+  # TLS terminated by the ingress controller (north-south). This is why the
+  # plane carries no in-app TLS; east-west encryption, if required, is a service
+  # mesh concern (see deploy/README.md).
+  tls:
+    - hosts: [{{ .Values.edge.ingress.host | quote }}]
+      secretName: {{ .Values.edge.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.edge.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-edge
+                port:
+                  number: {{ .Values.edge.service.port }}
+{{- end }}

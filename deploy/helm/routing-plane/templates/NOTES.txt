@@ -1,0 +1,41 @@
+Tenant Routing Plane deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  - edge          : Envoy + tenant-router (per-pod, routing-only), {{ .Values.edge.replicas }} replica(s)
+  - control-plane : {{ .Values.controlPlane.replicas }} replica (admin API, RFC C16 — off the hot path)
+  - postgres      : external (operated outside this chart) — secret {{ include "routing-plane.pgSecretName" . }}
+{{- if not .Values.redis.enabled }}
+  - redis (L2)    : disabled (router runs L1-only — still correct)
+{{- else }}
+  - redis (L2)    : external ({{ .Values.redis.url }}) — optional; degrades to L1-only on failure
+{{- end }}
+
+Edge entry point:
+{{- if .Values.edge.ingress.enabled }}
+  Hosts {{ join ", " .Values.edge.ingress.hosts }} via the "{{ .Values.edge.ingress.className }}" ingress (TLS terminated there)
+{{- else }}
+  Service {{ include "routing-plane.fullname" . }}-edge:{{ .Values.edge.service.port }} (no ingress; expose it yourself)
+{{- end }}
+
+Routing keys on the request HOST. Only VERIFIED domains resolve (RFC C16); an
+unknown/unverified host is rejected at the edge with 404 (RFC C18) — never
+defaulted to a tenant.
+
+Register routing config via the control plane (administrative boundary — NOT public):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "routing-plane.fullname" . }}-control-plane 9400:9400 &
+  curl -X POST localhost:9400/tenants -H content-type:application/json \
+       -d '{"tenant_id":"acme","plan":"pro","target_pool":"application"}'
+  curl -X POST localhost:9400/domains -H content-type:application/json \
+       -d '{"domain":"app.acme.example.com","tenant_id":"acme","verified":true}'
+
+Smoke test (from inside the cluster, once a verified domain is registered):
+  curl -s -H 'Host: app.acme.example.com' http://{{ include "routing-plane.fullname" . }}-edge.{{ .Release.Namespace }}.svc/ | grep -i '^x-tenant'
+  # expect x-tenant-id / x-tenant-plan / x-route-pool injected, routed to its pool
+
+For the tenant-first composition WITH the identity plane (routing -> auth ->
+enrichment on one edge), use the ../edge-platform umbrella chart instead.
+
+External dependencies (operated OUTSIDE this chart): see deploy/README.md
+  - Postgres (the authoritative routing store; HA is your operator's concern)
+  - Redis (optional L2; the plane is correct without it)
+  - The backend pools the routing decision selects among (pools.*)

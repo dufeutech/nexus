@@ -1,0 +1,88 @@
+name: Build images
+
+# The "Run workflow" button (manual trigger) lives on this workflow in the
+# Actions tab thanks to workflow_dispatch. It also builds automatically on a
+# version tag (v*) and can be reused by other workflows.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra image tag (e.g. 0.1.0). The short commit SHA is always tagged too."
+        type: string
+        required: false
+        default: ""
+      push:
+        description: "Push to GHCR (uncheck to build only)"
+        type: boolean
+        required: false
+        default: true
+  push:
+    tags:
+      - "v*"
+
+# GHCR auth uses the built-in GITHUB_TOKEN — no extra secrets to configure.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Identity plane — one workspace, three targets (../identity-rs)
+          - { name: identity-sidecar-rs,  context: identity-rs, target: sidecar }
+          - { name: identity-sync-worker, context: identity-rs, target: sync-worker }
+          - { name: identity-reconciler,  context: identity-rs, target: reconciler }
+          # Routing plane — one workspace, two targets (../routing-rs)
+          - { name: tenant-router,        context: routing-rs,  target: tenant-router }
+          - { name: control-plane,        context: routing-rs,  target: control-plane }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GHCR image names must be lowercase; the repo owner may not be.
+      - name: Compute image base
+        id: img
+        run: echo "base=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Only needed when we actually push (the manual build-only run skips it).
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.base }}
+          tags: |
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build${{ (github.event_name != 'workflow_dispatch' || inputs.push) && ' & push' || '' }} ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers across runs to keep the Rust build fast.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

@@ -1,0 +1,103 @@
+{{- if .Values.edge.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-edge
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  {{- if not .Values.edge.autoscaling.enabled }}
+  replicas: {{ .Values.edge.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity-plane.labels" . | nindent 8 }}
+        {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 8 }}
+      annotations:
+        # Roll pods when the Envoy config changes.
+        checksum/envoy-config: {{ include (print $.Template.BasePath "/edge-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        # ---- Identity sidecar (per-pod): ext_proc :50051, profile/health :9200,
+        #      metrics :9202. Reached by Envoy over 127.0.0.1. ----
+        - name: sidecar
+          image: {{ include "identity-plane.image" (dict "repo" .Values.images.sidecar.repository "tag" .Values.images.sidecar.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.sidecar.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: MONGO_URL
+              value: {{ include "identity-plane.mongoUri" . | quote }}
+            - name: MONGO_DB
+              value: {{ .Values.mongo.db | quote }}
+            - name: MONGO_COLLECTION
+              value: {{ .Values.mongo.collection | quote }}
+            - name: CACHE_TTL_SECONDS
+              value: {{ .Values.sidecar.cacheTtlSeconds | quote }}
+            - name: READINESS_DELAY_SECONDS
+              value: {{ .Values.sidecar.readinessDelaySeconds | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.sidecar.rustLog | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.sidecar.logFormat | quote }}
+          ports:
+            - { name: ext-proc, containerPort: 50051 }
+            - { name: profile, containerPort: 9200 }
+            - { name: metrics, containerPort: 9202 }
+          # /healthz returns 503 until the initial KV replay completes (RFC C6),
+          # so readiness gates the pod out of rotation until the cache is warm.
+          readinessProbe:
+            httpGet: { path: /healthz, port: profile }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: ext-proc }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.sidecar | nindent 12 }}
+        # ---- Envoy edge ----
+        - name: envoy
+          image: {{ include "identity-plane.image" (dict "repo" .Values.images.envoy.repository "tag" .Values.images.envoy.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.envoy.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - { name: http, containerPort: 10000 }
+            - { name: admin, containerPort: 9901 }
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.envoy | nindent 12 }}
+          volumeMounts:
+            - { name: envoy-config, mountPath: /etc/envoy, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: {{ include "identity-plane.fullname" . }}-edge-envoy
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

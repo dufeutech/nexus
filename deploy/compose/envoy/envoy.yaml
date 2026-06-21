@@ -1,0 +1,249 @@
+# Combined TENANT-FIRST edge (RFC C17) for the docker-compose production stack.
+#
+# This is the data plane. The two resolution planes are separate containers on
+# the compose network (NOT loopback as in the per-pod k8s topology), so the
+# ext_proc clusters below dial them by their compose service DNS names.
+#
+# Filter order is load-bearing (see ../../INFO.md §2):
+#   header_mutation  strip client x-tenant-* / x-user-* / x-geo-* / ...   (C3)
+#     tenant-router ext_proc   host -> tenant -> x-route-pool; reject unknown (C18)
+#     jwt_authn                verify the bearer credential vs ZITADEL JWKS  (C1)
+#     identity ext_proc        inject x-user-* from the verified subject     (C2)
+#     router                   forward to the pool the routing decision chose
+#
+# EXTERNAL upstreams you MUST point at your own infrastructure (this project does
+# not run them): the `zitadel_jwks` cluster and every `pool_*` cluster at the
+# bottom. The in-stack clusters (tenant_router, identity_sidecar) need no edits.
+admin:
+  # Bound to the container for health/inspection. NOT published in compose.
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: edge
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: edge
+                      domains: ["*"]
+                      routes:
+                        # Route by the pool the tenant-router chose. Add a header
+                        # match per pool you serve; default falls through to
+                        # application.
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: x-route-pool, string_match: { exact: "application" } }]
+                          route: { cluster: pool_application }
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: x-route-pool, string_match: { exact: "api" } }]
+                          route: { cluster: pool_api }
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: x-route-pool, string_match: { exact: "checkout" } }]
+                          route: { cluster: pool_checkout }
+                        - match:
+                            prefix: "/"
+                            headers: [{ name: x-route-pool, string_match: { exact: "assets" } }]
+                          route: { cluster: pool_assets }
+                        # Default: no/unknown x-route-pool -> application pool.
+                        - match: { prefix: "/" }
+                          route: { cluster: pool_application }
+                http_filters:
+                  # FIRST: strip every client-supplied trusted header so the
+                  # injected set is authoritative and unforgeable (RFC C3).
+                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        request_mutations:
+                          - remove: "x-tenant-id"
+                          - remove: "x-tenant-plan"
+                          - remove: "x-tenant-features"
+                          - remove: "x-route-pool"
+                          - remove: "x-routed-by"
+                          - remove: "x-geo-source"
+                          - remove: "x-geo-country"
+                          - remove: "x-geo-continent"
+                          - remove: "x-geo-region"
+                          - remove: "x-geo-city"
+                          - remove: "x-geo-postal-code"
+                          - remove: "x-geo-timezone"
+                          - remove: "x-geo-latitude"
+                          - remove: "x-geo-longitude"
+                          - remove: "x-geo-client-ip"
+                          - remove: "x-locale"
+                          - remove: "x-lang"
+                          - remove: "x-currency"
+                          - remove: "x-privacy-gpc"
+                          - remove: "x-privacy-dnt"
+                          - remove: "x-device-type"
+                          - remove: "x-user-id"
+                          - remove: "x-user-org"
+                          - remove: "x-user-roles"
+                          - remove: "x-user-roles-source"
+                          - remove: "x-user-entitlements"
+                          - remove: "x-user-suspended"
+                          - remove: "x-user-enriched-by"
+                          - remove: "x-auth-anonymous"
+                          - remove: "x-auth-method"
+                  # Tenant routing (C14/C15/C18) — BEFORE auth so verification may
+                  # be tenant-scoped (C17). fail-closed: a routing failure must not
+                  # silently default a route.
+                  - name: tenant-router.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc: { cluster_name: tenant_router }
+                      failure_mode_allow: false
+                      message_timeout: 5s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SKIP
+                        request_body_mode: NONE
+                        response_body_mode: NONE
+                        request_trailer_mode: SKIP
+                        response_trailer_mode: SKIP
+                  # Verify the bearer credential against the ZITADEL JWKS (C1).
+                  - name: envoy.filters.http.jwt_authn
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                      providers:
+                        zitadel:
+                          # Must equal the `iss` your ZITADEL mints (RFC §6.6).
+                          issuer: "https://auth.example.com"
+                          remote_jwks:
+                            http_uri:
+                              # The Host header sent on the JWKS fetch must equal
+                              # the issuer authority; the `cluster` is the in-
+                              # cluster ZITADEL upstream (zitadel_jwks below).
+                              uri: "http://auth.example.com/oauth/v2/keys"
+                              cluster: zitadel_jwks
+                              timeout: 5s
+                            cache_duration: { seconds: 600 }
+                          payload_in_metadata: verified
+                          forward: true
+                      rules:
+                        - match: { prefix: "/" }
+                          requires: { provider_name: zitadel }
+                  # Enrich from the verified subject (C2).
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc: { cluster_name: identity_sidecar }
+                      failure_mode_allow: false
+                      message_timeout: 5s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SKIP
+                        request_body_mode: NONE
+                        response_body_mode: NONE
+                        request_trailer_mode: SKIP
+                        response_trailer_mode: SKIP
+                      metadata_options:
+                        forwarding_namespaces:
+                          untyped: ["envoy.filters.http.jwt_authn"]
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # ---- In-stack resolution planes (no edits needed) -----------------------
+    - name: tenant_router
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: tenant_router
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: tenant-router, port_value: 50052 }
+
+    - name: identity_sidecar
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: identity_sidecar
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: identity-sidecar, port_value: 50051 }
+
+    # ---- EXTERNAL upstreams — EDIT to point at YOUR infrastructure ----------
+    # ZITADEL (the IdP) — for the JWKS fetch. Address = the in-cluster/host
+    # endpoint Envoy can reach; the Host header above stays the issuer authority.
+    - name: zitadel_jwks
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: zitadel_jwks
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: auth.example.com, port_value: 80 }
+
+    # Backend pools — the finite set the routing decision selects among (RFC
+    # C15). Point each at your own backend. `application` is the default target.
+    - name: pool_application
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: pool_application
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: app-backend.example.com, port_value: 80 }
+    - name: pool_api
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: pool_api
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: api-backend.example.com, port_value: 80 }
+    - name: pool_checkout
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: pool_checkout
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: checkout-backend.example.com, port_value: 80 }
+    - name: pool_assets
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: pool_assets
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: assets-backend.example.com, port_value: 80 }

@@ -1,0 +1,14 @@
+[package]
+name = "router-core"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "router_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true

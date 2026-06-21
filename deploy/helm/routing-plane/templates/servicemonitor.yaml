@@ -1,0 +1,37 @@
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{- $fullName := include "routing-plane.fullname" . -}}
+{{- $labels := .Values.metrics.serviceMonitor.labels -}}
+{{- $interval := .Values.metrics.serviceMonitor.interval -}}
+# Control-plane metrics are on its admin Service (:9400 /metrics).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullName }}-control-plane
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
+  endpoints:
+    - { port: admin, path: /metrics, interval: {{ $interval | quote }} }
+---
+# The tenant-router latency histogram + cache/ready gauges are on a pod port
+# (:9302) deliberately kept off the edge Service, so they are scraped as pod
+# targets. Envoy admin (:9901) carries the proxy-level stats.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $fullName }}-edge
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  podMetricsEndpoints:
+    - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
+    - { port: admin, path: /stats/prometheus, interval: {{ $interval | quote }} }
+{{- end }}

@@ -1,0 +1,57 @@
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{- $fullName := include "identity-plane.fullname" . -}}
+{{- $labels := .Values.metrics.serviceMonitor.labels -}}
+{{- $interval := .Values.metrics.serviceMonitor.interval -}}
+# One ServiceMonitor per component. NOTE: the sidecar's ext_proc latency is a
+# Prometheus native (exponential) histogram served over protobuf on :9202 — your
+# Prometheus Operator's Prometheus must enable the native-histograms feature and
+# negotiate PrometheusProto for that target (see deploy/README.md). The sidecar
+# metrics port (9202) is not on the edge Service, so it is scraped via pod target
+# by the operator using the port name below.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullName }}-sync-worker
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "sync-worker") | nindent 6 }}
+  endpoints:
+    - { port: http, path: /metrics, interval: {{ $interval | quote }} }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullName }}-reconciler
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 6 }}
+  endpoints:
+    - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
+---
+# Edge metrics live on pod ports that are deliberately off the Service (sidecar
+# :9202, Envoy admin :9901), so they are scraped as pod targets.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $fullName }}-edge
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  podMetricsEndpoints:
+    # Native-histogram latency (protobuf). Needs native-histograms enabled on the
+    # operator's Prometheus to ingest it; classic buckets are the text fallback.
+    - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
+    - { port: admin, path: /stats/prometheus, interval: {{ $interval | quote }} }
+{{- end }}

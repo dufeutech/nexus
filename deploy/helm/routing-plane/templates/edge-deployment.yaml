@@ -1,0 +1,119 @@
+{{- if .Values.edge.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "routing-plane.fullname" . }}-edge
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  {{- if not .Values.edge.autoscaling.enabled }}
+  replicas: {{ .Values.edge.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "routing-plane.labels" . | nindent 8 }}
+        {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 8 }}
+      annotations:
+        # Roll pods when the Envoy config changes.
+        checksum/envoy-config: {{ include (print $.Template.BasePath "/edge-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        # ---- Tenant router (per-pod): ext_proc :50052, debug/health :9300,
+        #      metrics :9302. Reached by Envoy over 127.0.0.1. ----
+        - name: tenant-router
+          image: {{ include "routing-plane.image" (dict "repo" .Values.images.tenantRouter.repository "tag" .Values.images.tenantRouter.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.tenantRouter.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: ROUTING_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "routing-plane.pgSecretName" . }}
+                  key: {{ include "routing-plane.pgSecretKey" . }}
+            {{- if eq (include "routing-plane.hasPgReadUrl" .) "true" }}
+            # OPTIONAL pooled read endpoint (cache-miss reads only). The LISTEN
+            # invalidation feed stays on ROUTING_PG_URL (direct) — see deploy README.
+            - name: ROUTING_PG_READ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "routing-plane.pgReadSecretName" . }}
+                  key: {{ include "routing-plane.pgReadSecretKey" . }}
+            {{- end }}
+            {{- $redis := include "routing-plane.redisUrl" . }}
+            {{- if $redis }}
+            - name: REDIS_URL
+              value: {{ $redis | quote }}
+            {{- end }}
+            - name: ROUTING_CACHE_CAPACITY
+              value: {{ .Values.router.cacheCapacity | quote }}
+            - name: ROUTING_CACHE_TTL
+              value: {{ .Values.router.cacheTtlSeconds | quote }}
+            - name: ROUTING_L2_TTL
+              value: {{ .Values.router.l2TtlSeconds | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.router.rustLog | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.router.logFormat | quote }}
+          ports:
+            - { name: ext-proc, containerPort: 50052 }
+            - { name: debug, containerPort: 9300 }
+            - { name: metrics, containerPort: 9302 }
+          # /healthz returns 503 until the store is reachable + the invalidation
+          # feed is subscribed (RFC C6/C18 fail-closed), gating the pod out of
+          # rotation until the router can serve.
+          readinessProbe:
+            httpGet: { path: /healthz, port: debug }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: ext-proc }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.router | nindent 12 }}
+        # ---- Envoy edge (routing-only) ----
+        - name: envoy
+          image: {{ include "routing-plane.image" (dict "repo" .Values.images.envoy.repository "tag" .Values.images.envoy.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.envoy.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - { name: http, containerPort: 10000 }
+            - { name: admin, containerPort: 9901 }
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.edge.resources.envoy | nindent 12 }}
+          volumeMounts:
+            - { name: envoy-config, mountPath: /etc/envoy, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: {{ include "routing-plane.fullname" . }}-edge-envoy
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

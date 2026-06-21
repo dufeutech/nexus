@@ -1,0 +1,2 @@
+# Fetched dependency tarballs (re-fetch with `helm dependency build`).
+charts/*.tgz

@@ -1,0 +1,206 @@
+# Identity Enrichment Plane — Helm values.
+#
+# This chart deploys the components THIS repo owns: the edge (Envoy + the Rust
+# identity sidecar, co-located for hot-path latency), the sync-worker, the
+# reconciler, and a durable MongoDB store (source of truth + change-stream feed).
+#
+# It treats ZITADEL, its Postgres, and the protected backend as EXTERNAL
+# dependencies you point at via config (see `zitadel:` and `backend:` below).
+# ZITADEL ships its own official Helm chart — run it (or a managed instance)
+# separately and wire its issuer/JWKS/admin-PAT in here.
+
+# -------------------------------------------------------------------------- #
+# Images. The lab builds these from source (`build:` in docker-compose); for
+# k8s you MUST build and push them to a registry you control, then set the refs
+# here. There is no public image for the sidecar/worker/reconciler.
+# -------------------------------------------------------------------------- #
+images:
+  # All three are built from the one ../../identity-rs workspace (shared `core`
+  # crate), selected by Docker build target:
+  #   docker build --target sidecar     -t REGISTRY/identity-sidecar-rs:0.1.0  ../../identity-rs
+  #   docker build --target sync-worker -t REGISTRY/identity-sync-worker:0.1.0 ../../identity-rs
+  #   docker build --target reconciler  -t REGISTRY/identity-reconciler:0.1.0  ../../identity-rs
+  sidecar:
+    repository: REGISTRY/identity-sidecar-rs
+    tag: ""            # defaults to .Chart.AppVersion when empty
+    pullPolicy: IfNotPresent
+  syncWorker:
+    repository: REGISTRY/identity-sync-worker
+    tag: ""
+    pullPolicy: IfNotPresent
+  reconciler:
+    repository: REGISTRY/identity-reconciler
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Stock upstream edge proxy. PIN to a concrete patch version in production.
+  envoy:
+    repository: envoyproxy/envoy
+    tag: v1.34-latest
+    pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -------------------------------------------------------------------------- #
+# ZITADEL (external IdP). The "verify, don't guess" facts (RFC §6.6) were
+# settled against the lab instance; re-confirm issuer/JWKS against YOUR ZITADEL.
+# -------------------------------------------------------------------------- #
+zitadel:
+  # Public issuer exactly as ZITADEL mints it into the `iss` claim. Envoy's
+  # jwt_authn rejects any token whose issuer differs. e.g. https://auth.example.com
+  issuer: "https://auth.example.com"
+  # In-cluster endpoint Envoy/sync-worker/reconciler actually dial. The JWKS is
+  # fetched here while the `Host` header is set to the issuer's authority, so we
+  # avoid egress TLS and ZITADEL's external-domain Host check still passes
+  # (the load-bearing trick from the lab's envoy.yaml).
+  internalUrl: "http://zitadel.zitadel.svc.cluster.local:8080"
+  # Host header value sent on the JWKS fetch — must equal the issuer authority.
+  # Defaults to the issuer's host:port when empty.
+  jwksHost: ""
+  # JWKS path on ZITADEL.
+  jwksPath: "/oauth/v2/keys"
+  jwksCacheSeconds: 600
+  # Admin service-account PAT used by sync-worker (register webhook) and
+  # reconciler (list users/grants). Provide via an existing Secret (recommended)
+  # or inline (discouraged — ends up in the release manifest).
+  patSecret:
+    # Name of a pre-created Secret holding the PAT. Leave empty to have the
+    # chart create one from `patSecret.value`.
+    existingSecret: ""
+    key: "pat"
+    # Inline PAT — used only when existingSecret is empty. PREFER existingSecret.
+    value: ""
+
+# -------------------------------------------------------------------------- #
+# Backend — the protected upstream Envoy routes to after enrichment (your app).
+# -------------------------------------------------------------------------- #
+backend:
+  host: "backend.default.svc.cluster.local"
+  port: 80
+
+# -------------------------------------------------------------------------- #
+# Edge: Envoy + the identity sidecar. Topology (RFC rules §1.4):
+#   perPod  — sidecar is a container in the Envoy pod, reached on 127.0.0.1
+#             (default; lowest latency, per-replica warm cache, isolated blast
+#             radius). Memory cost = profile-population × replicas.
+#   shared  — NOT templated here; for million-scale populations, split the
+#             sidecar into its own Deployment+Service and set
+#             edge.sidecarCluster to that Service. See deploy/README.md.
+# -------------------------------------------------------------------------- #
+edge:
+  # Deploy this chart's identity-only edge. Set false when composing with the
+  # routing plane via the ../edge-platform umbrella, which owns the single
+  # combined tenant-first edge instead (mongo / sync-worker / reconciler still
+  # deploy). Default true: this chart is usable standalone.
+  enabled: true
+  replicas: 2
+  # ext_proc behaviour on the default (protected) route: fail-closed (RFC §6.1).
+  failureModeAllow: false
+  extProcTimeout: "5s"
+  # Sidecar upstream Envoy's ext_proc dials. Per-pod default = loopback.
+  sidecarCluster: "127.0.0.1:50051"
+  resources:
+    envoy:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "256Mi" }
+    sidecar:
+      requests: { cpu: "100m", memory: "256Mi" }
+      # Size memory to the resident profile population (cache is fully resident,
+      # RFC §6.3). Raise for large populations.
+      limits: { cpu: "1", memory: "1Gi" }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: true
+    className: "nginx"          # or "traefik"
+    # TLS is terminated HERE by the ingress controller — that is why this chart
+    # carries no in-app TLS. cert-manager issues the cert via this annotation.
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    host: "api.example.com"
+    tls:
+      enabled: true
+      secretName: "identity-plane-edge-tls"
+
+# Sidecar runtime config (applies wherever the sidecar runs).
+sidecar:
+  # 12h TTL safety net (RFC §6.5) — a backstop, not a freshness mechanism.
+  cacheTtlSeconds: 43200
+  # Readiness fail-closed warm gate (C6). Keep 0 in prod; it is a demo knob.
+  readinessDelaySeconds: 0
+  logFormat: "json"             # json | text
+  rustLog: "info"
+
+# -------------------------------------------------------------------------- #
+# Sync worker (real-time webhook -> KV). Self-registers an Actions v2 webhook
+# on startup, so ZITADEL must be able to reach its Service (selfUrl below).
+# -------------------------------------------------------------------------- #
+syncWorker:
+  replicas: 1                   # webhook target is single-owner; >1 splits the signing key
+  logFormat: "json"
+  logLevel: "INFO"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "128Mi" }
+  # URL ZITADEL calls back. Defaults to the in-cluster Service DNS when empty.
+  selfUrl: ""
+
+# -------------------------------------------------------------------------- #
+# Reconciler (periodic authoritative diff -> KV; closes the no-retry gap, C8).
+# -------------------------------------------------------------------------- #
+reconciler:
+  replicas: 1
+  intervalSeconds: 600          # RFC §6.2
+  pageLimit: 1000
+  logFormat: "json"
+  logLevel: "INFO"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "128Mi" }
+
+# -------------------------------------------------------------------------- #
+# MongoDB — the single Durable State Store AND change feed (RFC §3.5 + C4 via
+# change streams). EXTERNAL by design: this chart does not run a database. Point
+# it at a Mongo you operate — a managed service, or a multi-member replica set
+# via the Mongo Community Operator. Change streams REQUIRE a replica set, so the
+# URI MUST include ?replicaSet=... For credentials, embed them in the URI (or
+# template `mongo.uri` from a Secret via your own values overlay).
+# -------------------------------------------------------------------------- #
+mongo:
+  db: "identity"
+  collection: "profiles"
+  # Required. Full connection URI to your external replica set, e.g.
+  #   mongodb://mongo-0,mongo-1,mongo-2/?replicaSet=rs0
+  uri: ""
+
+# -------------------------------------------------------------------------- #
+# Observability — emit a ServiceMonitor per component if you run the Prometheus
+# Operator. Native-histogram scraping for the sidecar still needs the operator's
+# Prometheus to enable that feature (see deploy/README.md).
+# -------------------------------------------------------------------------- #
+metrics:
+  serviceMonitor:
+    enabled: false
+    # Extra labels so your Prometheus Operator's serviceMonitorSelector matches.
+    labels: {}
+    interval: "15s"
+
+# Common pod hardening defaults, applied to every workload.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

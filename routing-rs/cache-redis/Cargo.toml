@@ -1,0 +1,15 @@
+[package]
+name = "cache-redis"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "cache_redis"
+path = "src/lib.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+redis.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: routing-plane
+description: >-
+  Tenant Routing Plane (see ../../../INFO.md, capabilities C14–C18) — the
+  production Kubernetes topology of the routing hot path (host → tenant → backend
+  pool) and the control plane. The authoritative routing store (Postgres) and the
+  optional Redis L2 are EXTERNAL — operated outside this chart. Topology-
+  independent (../../../INFO.md §4/§7) production deployment.
+type: application
+# Chart version — bump on template changes.
+version: 0.1.0
+# The app this chart deploys has no single version; track the lab it mirrors.
+appVersion: "0.1.0"
+keywords:
+  - routing
+  - tenant
+  - envoy
+  - ext_proc
+  - multitenancy
+maintainers:
+  - name: routing-plane

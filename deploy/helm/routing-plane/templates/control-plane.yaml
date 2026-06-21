@@ -1,0 +1,109 @@
+{{- $fullName := include "routing-plane.fullname" . -}}
+# Control plane (RFC C16, §3.13) — admin API; owns the idempotent `routing` schema
+# bootstrap; NOT on the request hot path. Reachable on an administrative boundary
+# only (no public ingress by default). On every mutation it writes Postgres and
+# publishes the affected domain key on the LISTEN/NOTIFY invalidation feed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-control-plane
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+spec:
+  # Single writer is sufficient (admin path, low volume); scaling it is safe but
+  # unnecessary. Schema bootstrap is idempotent if you do run more than one.
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "routing-plane.labels" . | nindent 8 }}
+        {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: control-plane
+          image: {{ include "routing-plane.image" (dict "repo" .Values.images.controlPlane.repository "tag" .Values.images.controlPlane.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.controlPlane.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: ROUTING_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "routing-plane.pgSecretName" . }}
+                  key: {{ include "routing-plane.pgSecretKey" . }}
+            - name: LOG_FORMAT
+              value: {{ .Values.controlPlane.logFormat | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.controlPlane.logLevel | quote }}
+          ports:
+            - { name: admin, containerPort: 9400 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-control-plane
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+  ports:
+    - { name: admin, port: 9400, targetPort: admin, protocol: TCP }
+{{- if .Values.controlPlane.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-control-plane
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+  {{- with .Values.controlPlane.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.controlPlane.ingress.className }}
+  {{- if .Values.controlPlane.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.controlPlane.ingress.host | quote }}]
+      secretName: {{ .Values.controlPlane.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.controlPlane.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-control-plane
+                port:
+                  number: 9400
+{{- end }}

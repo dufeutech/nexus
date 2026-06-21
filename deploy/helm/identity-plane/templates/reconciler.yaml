@@ -1,0 +1,97 @@
+{{- $fullName := include "identity-plane.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-reconciler
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 4 }}
+spec:
+  replicas: {{ .Values.reconciler.replicas }}
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity-plane.labels" . | nindent 8 }}
+        {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: reconciler
+          image: {{ include "identity-plane.image" (dict "repo" .Values.images.reconciler.repository "tag" .Values.images.reconciler.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.reconciler.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: MONGO_URL
+              value: {{ include "identity-plane.mongoUri" . | quote }}
+            - name: MONGO_DB
+              value: {{ .Values.mongo.db | quote }}
+            - name: MONGO_COLLECTION
+              value: {{ .Values.mongo.collection | quote }}
+            - name: ZITADEL_INTERNAL_URL
+              value: {{ .Values.zitadel.internalUrl | quote }}
+            - name: ZITADEL_HOST
+              value: {{ include "identity-plane.jwksHost" . | quote }}
+            - name: PAT_FILE
+              value: "/secrets/zitadel-admin-sa.pat"
+            - name: RECONCILE_INTERVAL
+              value: {{ .Values.reconciler.intervalSeconds | quote }}
+            - name: RECONCILE_PAGE_LIMIT
+              value: {{ .Values.reconciler.pageLimit | quote }}
+            - name: METRICS_PORT
+              value: "9000"
+            - name: LOG_FORMAT
+              value: {{ .Values.reconciler.logFormat | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.reconciler.logLevel | quote }}
+          ports:
+            - { name: metrics, containerPort: 9000 }
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources: {{- toYaml .Values.reconciler.resources | nindent 12 }}
+          volumeMounts:
+            - { name: pat, mountPath: /secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: pat
+          secret:
+            secretName: {{ include "identity-plane.patSecretName" . }}
+            items:
+              - key: {{ .Values.zitadel.patSecret.key }}
+                path: zitadel-admin-sa.pat
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-reconciler
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9000, targetPort: metrics, protocol: TCP }

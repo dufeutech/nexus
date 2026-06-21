@@ -1,0 +1,119 @@
+# Edge Resolution Platform — composition (umbrella) values.
+#
+# This chart owns the SINGLE combined tenant-first edge (Envoy + tenant-router +
+# identity sidecar). The two subcharts below deploy their DATA planes only — their
+# own edges are turned off here so there is exactly one edge.
+#
+# Configure each plane in its own subchart block (images, stores, ZITADEL, pools,
+# cache sizing). The combined edge reuses those values; the `edge:` block here only
+# sets edge-level concerns (replicas, resources, ingress, autoscaling).
+
+# -------------------------------------------------------------------------- #
+# Routing plane (subchart) — deploys the control plane only (its edge is disabled;
+# this umbrella runs the combined one). The routing store (Postgres) and optional
+# L2 (Redis) are EXTERNAL. Set images.*, postgres.* (external), redis.* (external,
+# optional), pools.* here.
+# -------------------------------------------------------------------------- #
+routing-plane:
+  edge:
+    enabled: false        # umbrella owns the combined edge
+  # postgres:
+  #   existingSecret: routing-pg     # or postgres.url
+  # redis:
+  #   enabled: false                 # optional external L2
+
+# -------------------------------------------------------------------------- #
+# Identity plane (subchart) — deploys sync-worker + reconciler (its edge is
+# disabled; this umbrella runs the combined one). The durable store (MongoDB
+# replica set) is EXTERNAL. Set images.*, zitadel.*, mongo.uri, backend here.
+# -------------------------------------------------------------------------- #
+identity-plane:
+  edge:
+    enabled: false        # umbrella owns the combined edge
+  # mongo:
+  #   uri: mongodb://mongo-0,mongo-1,mongo-2/?replicaSet=rs0
+
+# -------------------------------------------------------------------------- #
+# The combined tenant-first edge (RFC C17). Filter order:
+#   strip client x-tenant-* / x-user-*        (C3)
+#   -> tenant-router ext_proc  (host -> tenant -> x-route-pool; reject unknown C18)
+#   -> jwt_authn               (verify the bearer credential against ZITADEL, C1)
+#   -> identity ext_proc       (inject x-user-* from the verified subject, C2)
+#   -> router                  (forward to the pool the routing decision chose)
+# Images, ZITADEL config, pools and cache sizing are taken from the subchart
+# blocks above; only edge-level concerns live here.
+# -------------------------------------------------------------------------- #
+edge:
+  replicas: 2
+  # ext_proc behaviour for BOTH processors (fail-closed: a routing failure must not
+  # default a route, and enrichment fail-open must never weaken auth — RFC C10/C17).
+  failureModeAllow: false
+  extProcTimeout: "5s"
+  # Routes listed here skip the identity ext_proc (fail-open, no enrichment) but
+  # are STILL tenant-routed and (unless also excluded from jwt rules) authenticated.
+  # Use for public assets that need a tenant but no user. Default: none.
+  publicPaths: []
+  resources:
+    envoy:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "256Mi" }
+    tenantRouter:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "512Mi" }
+    identitySidecar:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits: { cpu: "1", memory: "1Gi" }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Routing keys on the host, so pass through every host you serve (or a wildcard).
+    hosts:
+      - "*.example.com"
+    tls:
+      enabled: true
+      secretName: "edge-platform-tls"
+
+# Store connection overrides for the combined edge. Empty => derived from the
+# subchart release names (the normal case). Set these only if a subchart points at
+# an external store via an existingSecret whose name the umbrella can't derive.
+compose:
+  # Secret + key the tenant-router reads ROUTING_PG_URL from. Default: the routing
+  # subchart's existingSecret, else its chart-managed <release>-routing-plane-pg.
+  routingPgSecret: ""        # default: <release>-routing-plane-pg
+  routingPgSecretKey: ""     # default: url
+  # OPTIONAL pooled read endpoint (ROUTING_PG_READ_URL). Default: derived from the
+  # routing subchart's postgres.read* (empty => router reads over the direct URL).
+  routingPgReadSecret: ""    # default: <release>-routing-plane-pg-read
+  routingPgReadSecretKey: "" # default: url
+  # MONGO_URL the identity sidecar dials. Default: identity-plane.mongo.uri (the
+  # external replica set). Override only to point at a different external URI.
+  mongoUrl: ""
+  # REDIS_URL the tenant-router dials. Default: routing-plane.redis.url when
+  # enabled, else empty (L1-only).
+  redisUrl: ""
+
+# Pod hardening for the combined edge containers.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+imagePullSecrets: []
+nodeSelector: {}
+tolerations: []
+affinity: {}

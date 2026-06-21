@@ -1,0 +1,15 @@
+[package]
+name = "store-postgres"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "store_postgres"
+path = "src/lib.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+sqlx.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true

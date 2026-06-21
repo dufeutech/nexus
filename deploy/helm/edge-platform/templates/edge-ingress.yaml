@@ -1,0 +1,33 @@
+{{- if .Values.edge.ingress.enabled -}}
+{{- $fullName := include "edge-platform.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-edge
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+  {{- with .Values.edge.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.edge.ingress.className }}
+  {{- if .Values.edge.ingress.tls.enabled }}
+  tls:
+    - hosts: {{- toYaml .Values.edge.ingress.hosts | nindent 8 }}
+      secretName: {{ .Values.edge.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    {{- range .Values.edge.ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-edge
+                port:
+                  number: {{ $.Values.edge.service.port }}
+    {{- end }}
+{{- end }}

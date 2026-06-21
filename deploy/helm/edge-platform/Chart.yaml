@@ -1,0 +1,29 @@
+apiVersion: v2
+name: edge-platform
+description: >-
+  Edge Resolution Platform — the tenant-first COMPOSITION of both planes on one
+  static Envoy edge (see ../../../INFO.md C17). An umbrella over the
+  identity-plane and routing-plane charts: each subchart contributes its data
+  plane (stores, control plane, sync/reconcile) with its own edge DISABLED, and
+  THIS chart owns the single combined edge — Envoy + tenant-router + identity
+  sidecar, co-located per-pod — running the ordered chain
+  strip → tenant resolve (C18) → verify credential (C1) → enrich (C2) → forward.
+  Stores (MongoDB, Postgres, optional Redis) and ZITADEL are external.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - identity
+  - routing
+  - envoy
+  - ext_proc
+  - composition
+maintainers:
+  - name: edge-platform
+dependencies:
+  - name: routing-plane
+    version: "0.1.0"
+    repository: "file://../routing-plane"
+  - name: identity-plane
+    version: "0.1.0"
+    repository: "file://../identity-plane"

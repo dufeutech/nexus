@@ -1,0 +1,83 @@
+name: CI
+
+# Lint + test on every push and PR (plus a manual Run workflow button).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The sidecar's native-histogram metrics need protoc to build; the
+          # routing workspace does not (envoy-types ships pre-generated code).
+          - { workspace: identity-rs, protoc: true }
+          - { workspace: routing-rs,  protoc: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        if: ${{ matrix.protoc }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.workspace }}
+
+      - name: Test
+        working-directory: ${{ matrix.workspace }}
+        run: cargo test --workspace --all-targets
+
+  helm-lint:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/helm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      # Each chart is rendered with the minimum required values so lint/template
+      # actually exercises the helpers (mongo.uri, the pg secret, pools, etc.).
+      - name: Lint & render identity-plane
+        run: |
+          ARGS="--set mongo.uri=mongodb://m/?replicaSet=rs0 --set zitadel.patSecret.value=dummy"
+          helm lint identity-plane $ARGS
+          helm template rel identity-plane $ARGS >/dev/null
+
+      - name: Lint & render routing-plane
+        run: |
+          # Render both the plain and the opt-in read-split (ROUTING_PG_READ_URL) paths.
+          BASE="--set postgres.url=postgres://u:p@h:5432/routing"
+          helm lint routing-plane $BASE
+          helm template rel routing-plane $BASE >/dev/null
+          helm template rel routing-plane $BASE --set postgres.readUrl=postgres://u:p@pgbouncer:6432/routing >/dev/null
+
+      - name: Lint & render edge-platform (umbrella)
+        run: |
+          helm dependency update edge-platform
+          ARGS="--set identity-plane.mongo.uri=mongodb://m/?replicaSet=rs0 \
+                --set identity-plane.zitadel.patSecret.value=dummy \
+                --set routing-plane.postgres.url=postgres://u:p@h:5432/routing"
+          helm lint edge-platform $ARGS
+          helm template rel edge-platform $ARGS >/dev/null

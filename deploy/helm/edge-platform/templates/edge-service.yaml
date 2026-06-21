@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-edge
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  type: {{ .Values.edge.service.type }}
+  selector:
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+  ports:
+    # Only the data-plane listener is exposed. Admin (9901), the sidecar/ router
+    # debug + metrics ports are deliberately NOT here (RFC §3.13 / C9 local-only).
+    - name: http
+      port: {{ .Values.edge.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if .Values.edge.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-edge
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "edge-platform.fullname" . }}-edge
+  minReplicas: {{ .Values.edge.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.edge.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.edge.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

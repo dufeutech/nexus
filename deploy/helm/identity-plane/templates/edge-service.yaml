@@ -1,0 +1,44 @@
+{{- if .Values.edge.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-edge
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  type: {{ .Values.edge.service.type }}
+  selector:
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+  ports:
+    # Only the data-plane listener is exposed. Admin (9901), the sidecar profile
+    # API (9200, RFC C9 local-only), and metrics (9202) are deliberately NOT here.
+    - name: http
+      port: {{ .Values.edge.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if .Values.edge.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-edge
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "identity-plane.fullname" . }}-edge
+  minReplicas: {{ .Values.edge.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.edge.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.edge.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

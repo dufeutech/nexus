@@ -1,0 +1,31 @@
+Identity Enrichment Plane deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  - edge        : Envoy + identity sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
+  - sync-worker : {{ .Values.syncWorker.replicas }} replica (single webhook owner)
+  - reconciler  : {{ .Values.reconciler.replicas }} replica, interval {{ .Values.reconciler.intervalSeconds }}s
+  - mongo       : external ({{ .Values.mongo.uri }}) — operated outside this chart
+
+Edge entry point:
+{{- if .Values.edge.ingress.enabled }}
+  https://{{ .Values.edge.ingress.host }}/   (TLS terminated by the "{{ .Values.edge.ingress.className }}" ingress)
+{{- else }}
+  Service {{ include "identity-plane.fullname" . }}-edge:{{ .Values.edge.service.port }} (no ingress; expose it yourself)
+{{- end }}
+
+Verify before trusting in production:
+  1. Token issuer matches:   {{ .Values.zitadel.issuer }}
+     A token whose `iss` differs is rejected by Envoy jwt_authn (fail-closed).
+  2. ZITADEL can reach the sync-worker webhook:
+     {{ .Values.syncWorker.selfUrl | default (printf "http://%s-sync-worker.%s.svc.cluster.local:8080/webhook" (include "identity-plane.fullname" .) .Release.Namespace) }}
+  3. The admin PAT secret "{{ include "identity-plane.patSecretName" . }}" exists and is valid.
+
+Smoke test (from inside the cluster):
+  TOKEN=<a real ZITADEL access token>
+  curl -s -H "Authorization: Bearer $TOKEN" https://{{ .Values.edge.ingress.host }}/ | grep -i '^x-user'
+  # expect x-user-id / x-user-org / x-user-roles / x-user-suspended
+
+External dependencies (operated OUTSIDE this chart): see deploy/README.md
+  - MongoDB replica set (HA = multi-member; the URI must carry ?replicaSet=...)
+  - ZITADEL (the IdP) + its database; re-verify event + claim contracts (RFC §6.6)
+  - The protected backend the edge forwards to (backend.host/port)

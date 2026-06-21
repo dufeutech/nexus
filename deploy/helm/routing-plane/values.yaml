@@ -1,0 +1,227 @@
+# Tenant Routing Plane — Helm values.
+#
+# This chart deploys the components THIS repo owns for the routing plane:
+#   - edge        : Envoy + the Rust tenant-router ext_proc, co-located per-pod
+#                   (loopback). ROUTING-ONLY Envoy: host -> tenant -> x-route-pool
+#                   -> forward to the selected pool, or reject an unknown/unverified
+#                   host at the edge (RFC C18). No jwt_authn here — for the
+#                   tenant-first composition with the identity plane, use the
+#                   ../edge-platform umbrella chart instead.
+#   - control-plane : the admin API (RFC C16) — owns the routing schema; NOT on the
+#                     request hot path; exposed on an administrative boundary only.
+#
+# The authoritative routing store (Postgres) and the OPTIONAL L2 (Redis, RFC
+# decision 9) are EXTERNAL — operated outside this chart and wired in via
+# `postgres:` / `redis:` below.
+#
+# It treats the backend pools as EXTERNAL Services you point at via `pools:` —
+# the routing decision selects ONE of a small, finite set (RFC C15 / decision 13);
+# configuration never introduces a new destination at request time.
+
+# -------------------------------------------------------------------------- #
+# Images. Build the two first-party images from the routing-rs workspace and push
+# them to a registry you control; there is no public image. Both come from the one
+# ../../routing-rs Dockerfile, selected by build target.
+#   docker build --target tenant-router -t REGISTRY/tenant-router:0.1.0  ../../routing-rs
+#   docker build --target control-plane -t REGISTRY/control-plane:0.1.0  ../../routing-rs
+# -------------------------------------------------------------------------- #
+images:
+  tenantRouter:
+    repository: REGISTRY/tenant-router
+    tag: ""            # defaults to .Chart.AppVersion when empty
+    pullPolicy: IfNotPresent
+  controlPlane:
+    repository: REGISTRY/control-plane
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Stock upstream edge proxy. PIN this to a concrete patch version in production
+  # (the rolling tag is for convenience only).
+  envoy:
+    repository: envoyproxy/envoy
+    tag: v1.34-latest
+    pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -------------------------------------------------------------------------- #
+# Backend pools — the small, finite set the routing decision selects among (RFC
+# C15 / decision 13). Each maps to one of the `Pool` values the router emits in
+# `x-route-pool`. In production these are your own Services. The default route
+# (no/unknown x-route-pool) falls through to `application`.
+# -------------------------------------------------------------------------- #
+pools:
+  application:
+    host: "app-backend.default.svc.cluster.local"
+    port: 80
+  api:
+    host: "api-backend.default.svc.cluster.local"
+    port: 80
+  checkout:
+    host: "checkout-backend.default.svc.cluster.local"
+    port: 80
+  assets:
+    host: "assets-backend.default.svc.cluster.local"
+    port: 80
+
+# -------------------------------------------------------------------------- #
+# Edge: Envoy + the tenant-router. Topology (RFC rules §1.4):
+#   perPod (default) — the router is a container in the Envoy pod, reached on
+#                      127.0.0.1:50052. Lowest latency (routing is on EVERY
+#                      request — the heavier read load, RFC §5), per-replica warm
+#                      L1, isolated blast radius. Cost = L1 working set × replicas.
+#   shared           — NOT templated here; for very large domain populations split
+#                      the router into its own Deployment+Service and set
+#                      edge.routerCluster to that Service. See deploy/README.md.
+# -------------------------------------------------------------------------- #
+edge:
+  # Deploy this chart's routing-only edge. Set false when composing with the
+  # identity plane via the ../edge-platform umbrella, which owns the single
+  # combined tenant-first edge instead (the data-plane components below still
+  # deploy). Default true: this chart is usable standalone.
+  enabled: true
+  replicas: 2
+  # ext_proc behaviour: fail-closed (RFC C18 — a routing failure must NOT silently
+  # default a route; the router itself returns 503 until ready / 404 for unknown).
+  failureModeAllow: false
+  extProcTimeout: "5s"
+  # The tenant-router ext_proc address Envoy dials. Per-pod default = loopback.
+  routerCluster: "127.0.0.1:50052"
+  resources:
+    envoy:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "256Mi" }
+    router:
+      requests: { cpu: "100m", memory: "128Mi" }
+      # Size memory to the L1 working set (router.cacheCapacity entries), NOT the
+      # full domain population (RFC §6.3 / decision 3). Raise with the working set.
+      limits: { cpu: "1", memory: "512Mi" }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 20            # routing carries the heavier per-request load (§5)
+    targetCPUUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: true
+    className: "nginx"          # or "traefik"
+    # TLS terminated HERE by the ingress controller — that is why this chart
+    # carries no in-app TLS. cert-manager issues the cert via this annotation.
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Routing keys on the request host, so the ingress must pass through ALL hosts
+    # you serve (or a wildcard). Set the host(s) your tenants resolve under.
+    hosts:
+      - "*.example.com"
+    tls:
+      enabled: true
+      secretName: "routing-plane-edge-tls"
+
+# tenant-router runtime config (RFC C14/C15/C18).
+router:
+  # L1 working-set bound (entries), NOT the full domain population (RFC §6.3).
+  cacheCapacity: 200000
+  # L1 staleness backstop; a missed invalidation self-heals within this (RFC §3.10).
+  cacheTtlSeconds: 600
+  # L2 (shared) TTL when Redis is enabled.
+  l2TtlSeconds: 600
+  logFormat: "json"             # json | text
+  rustLog: "info"
+
+# -------------------------------------------------------------------------- #
+# Control plane (RFC C16) — admin API; owns the idempotent routing schema; NOT on
+# the request hot path. Keep it OFF the public ingress (administrative boundary).
+# -------------------------------------------------------------------------- #
+controlPlane:
+  replicas: 1
+  logFormat: "json"
+  logLevel: "info"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "128Mi" }
+  # Optional Ingress for the admin API. OFF by default — reach it via
+  # `kubectl port-forward` or an internal-only ingress. If you enable it, put an
+  # auth annotation in front; this API mutates the authoritative routing store.
+  ingress:
+    enabled: false
+    className: "nginx"
+    annotations: {}
+    host: "routing-admin.internal.example.com"
+    tls:
+      enabled: false
+      secretName: "routing-plane-admin-tls"
+
+# -------------------------------------------------------------------------- #
+# Postgres — the authoritative routing store (control-plane-written, cache
+# invalidation on change via LISTEN/NOTIFY; RFC decision 14). EXTERNAL by design:
+# this chart does not run a database. Point it at a managed service or an HA
+# operator cluster. The control plane creates its own `routing` schema on start.
+# Routing has no per-second revocation need, so a brief store outage only blocks
+# cold-domain miss-loads; hot domains keep serving from L1 (RFC §3.10).
+#
+# Provide the connection URL one of two ways (existingSecret preferred):
+#   - postgres.existingSecret — name of a Secret you create holding the URL.
+#   - postgres.url            — inline URL the chart wraps in a managed Secret.
+# This is the DIRECT/session URL: the tenant-router's LISTEN/NOTIFY invalidation
+# feed and the control plane use it. It MUST NOT be a transaction-mode pooler
+# (PgBouncer/RDS-Proxy txn mode), which silently swallows LISTEN — see deploy
+# README "External Postgres requirements".
+#
+# OPTIONAL read split: the tenant-router's cache-miss point reads can use a
+# SEPARATE pooled endpoint (e.g. a transaction-mode PgBouncer) via `postgres.read*`
+# below. Leave it empty to read over the direct URL too. The LISTEN feed and the
+# control plane ALWAYS use the direct URL above regardless.
+# -------------------------------------------------------------------------- #
+postgres:
+  db: "routing"
+  # Preferred: a Secret you manage (works with ExternalSecrets / SealedSecrets).
+  existingSecret: ""            # Secret name; key below
+  existingSecretKey: "url"
+  # Inline fallback (discouraged — ends up in a chart-managed Secret). Must reach
+  # a database the control plane can create its `routing` schema in.
+  url: ""                       # e.g. postgres://user:pass@host:5432/routing
+  # OPTIONAL pooled read endpoint for the tenant-router (cache-miss reads only).
+  # Same two-way choice as above; empty => read over the direct URL.
+  readExistingSecret: ""        # Secret name holding the pooled URL; key below
+  readExistingSecretKey: "url"
+  readUrl: ""                   # inline pooled URL, e.g. postgres://user:pass@pgbouncer:6432/routing
+
+# -------------------------------------------------------------------------- #
+# Redis — the OPTIONAL shared L2 cache tier (RFC decision 9). EXTERNAL and
+# OPTIONAL: it MUST remain a performance optimization — a connect/op failure
+# degrades to L1-only, never a correctness dependency. Disabled => the plane is
+# still correct (L1-only). When enabled, point it at a Redis you operate.
+# -------------------------------------------------------------------------- #
+redis:
+  enabled: false
+  # Required when enabled. If it needs auth, embed credentials in the URL
+  # (e.g. redis://:pass@host:6379) — it is a cache, not a source of truth.
+  url: ""                       # e.g. redis://redis.cache.svc.cluster.local:6379
+
+# -------------------------------------------------------------------------- #
+# Observability — emit a ServiceMonitor/PodMonitor per component if you run the
+# Prometheus Operator. The tenant-router latency histogram is classic-bucket
+# (aggregatable across instances), served on :9302.
+# -------------------------------------------------------------------------- #
+metrics:
+  serviceMonitor:
+    enabled: false
+    labels: {}
+    interval: "15s"
+
+# Common pod hardening defaults, applied to the first-party workloads (router,
+# control-plane). All workloads here are stateless; the stores are external.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

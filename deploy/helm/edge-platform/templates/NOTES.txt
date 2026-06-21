@@ -1,0 +1,34 @@
+Edge Resolution Platform (both planes, tenant-first) deployed as release
+"{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Topology:
+  - combined edge : Envoy + tenant-router + identity-sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
+                    chain: strip -> tenant resolve (C18) -> verify (C1) -> enrich (C2) -> forward
+  - routing plane : control-plane              (subchart, edge disabled; Postgres + optional Redis are external)
+  - identity plane: sync-worker + reconciler   (subchart, edge disabled; MongoDB is external)
+
+The combined edge dials:
+  - routing store secret : {{ include "edge-platform.routingPgSecret" . }} (key {{ include "edge-platform.routingPgSecretKey" . }})
+  - mongo                : {{ include "edge-platform.mongoUrl" . }}
+  - redis (L2)           : {{ include "edge-platform.redisUrl" . | default "(disabled — L1-only)" }}
+  - ZITADEL issuer       : {{ (index .Values "identity-plane").zitadel.issuer }}
+
+Edge entry point:
+{{- if .Values.edge.ingress.enabled }}
+  Hosts {{ join ", " .Values.edge.ingress.hosts }} via the "{{ .Values.edge.ingress.className }}" ingress (TLS terminated there)
+{{- else }}
+  Service {{ include "edge-platform.fullname" . }}-edge:{{ .Values.edge.service.port }} (no ingress; expose it yourself)
+{{- end }}
+
+Order matters (RFC C17): an unknown/unverified host is rejected (404) BEFORE auth,
+so even a valid token cannot reach a backend for an unregistered tenant; a known
+host with a missing/invalid token is rejected (401) by jwt_authn.
+
+Before trusting in production:
+  1. Register routing config via the routing control plane (administrative boundary):
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "edge-platform.routingFullname" . }}-control-plane 9400:9400
+     # then POST /tenants and verified /domains (see routing-plane NOTES)
+  2. Confirm the ZITADEL issuer above matches what your ZITADEL mints (RFC §6.6).
+  3. Provide the admin PAT secret for sync-worker/reconciler (identity-plane.zitadel.patSecret).
+
+Open production items: see deploy/README.md and run deploy/load/ (load/soak/failover).

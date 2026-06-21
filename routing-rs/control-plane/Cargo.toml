@@ -1,0 +1,20 @@
+[package]
+name = "control-plane"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "control-plane"
+path = "src/main.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+store-postgres = { path = "../store-postgres" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
