@@ -1,14 +1,15 @@
 //! Identity sidecar (Rust) — the identity-plane resolver.
-//! Stack: tonic + envoy-types + store-mongo (MongoDB) + moka + axum.
+//! Stack: tonic + envoy-types + store-postgres (PostgreSQL) + moka + axum.
 //!
 //! Dual surface over one push-updated Profile cache:
 //!   - ext_proc gRPC (hot path): read the verified `sub` from jwt_authn metadata
 //!     Envoy forwards, resolve the Profile, inject trusted x-user-* (C2).
 //!   - localhost HTTP profile API: GET /profile/{sub} (C9) + /healthz + /metrics.
-//! Cache: the store's resumable change stream pushes updates (C4); moka TTL is the
-//! safety net and `try_get_with` gives a coalesced miss-load (C5); ext_proc fails
-//! CLOSED with a 503 until the store is reachable + the stream is open (lazy warm,
-//! C6 — NOT a full population replay). The token is never parsed here.
+//! Cache: the store's resumable change feed pushes updates (C4 — a `seq`-cursor
+//! over Postgres LISTEN/NOTIFY); moka TTL is the safety net and `try_get_with`
+//! gives a coalesced miss-load (C5); ext_proc fails CLOSED with a 503 until the
+//! store is reachable + the feed is open (lazy warm, C6 — NOT a full population
+//! replay). The token is never parsed here.
 //!
 //! Hardening: structured logging (tracing), Prometheus metrics (C12), and
 //! graceful shutdown on SIGTERM/SIGINT for both servers.
@@ -38,10 +39,10 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
 use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 
 // The Profile shape lives in the shared core crate; the store is reached through
-// the core `ProfileStore` port, implemented by the Mongo adapter.
+// the core `ProfileStore` port, implemented by the Postgres adapter.
 use identity_core::store::{BoxError, Change, ProfileStore, WatchToken};
 use identity_core::Profile;
-use store_mongo::MongoStore;
+use store_postgres::PgProfileStore;
 
 const JWT_NS: &str = "envoy.filters.http.jwt_authn";
 const PAYLOAD_KEY: &str = "verified";
@@ -290,19 +291,19 @@ impl ExternalProcessor for Sidecar {
 }
 
 // --------------------------------------------------------------------------- //
-// Change-stream watcher (RFC C4): push live changes into the cache. Lazy warm —
-// readiness means "store reachable + stream open" (RFC C6 revised), NOT that the
+// Change-feed watcher (RFC C4): push live changes into the cache. Lazy warm —
+// readiness means "store reachable + feed open" (RFC C6 revised), NOT that the
 // whole population is resident; cold subjects load on demand via the miss-load.
 // --------------------------------------------------------------------------- //
 async fn watch_store(state: AppState) {
-    // Resume cursor kept across reconnects so a stream blip replays the gap and
+    // Resume cursor kept across reconnects so a feed blip replays the gap and
     // no change is missed (resumable feed, RFC C4). In-memory is sufficient: a
     // process restart starts with an empty cache, so there is nothing stale to
     // miss — only mid-process reconnects need to resume.
     let mut resume: Option<WatchToken> = None;
     loop {
         match run_watch(&state, &mut resume).await {
-            Ok(()) => warn!("change stream ended; reconnecting"),
+            Ok(()) => warn!("change feed ended; reconnecting"),
             Err(e) => warn!(error = %e, "watch error; retrying"),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -311,8 +312,8 @@ async fn watch_store(state: AppState) {
 
 async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<(), BoxError> {
     let mut stream = state.store.watch(resume.clone()).await?;
-    info!(resuming = resume.is_some(), "watching change stream");
-    // Store reachable + stream open => ready (lazy warm, no full replay).
+    info!(resuming = resume.is_some(), "watching change feed");
+    // Store reachable + feed open => ready (lazy warm, no full replay).
     if !state.ready.swap(true, Ordering::Relaxed) {
         let ms = state.start.elapsed().as_millis() as u64;
         state.warm_ms.store(ms, Ordering::Relaxed);
@@ -452,10 +453,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install()
         .expect("install prometheus exporter");
 
-    let mongo_url = std::env::var("MONGO_URL")
-        .unwrap_or_else(|_| "mongodb://mongo:27017/?replicaSet=rs0".into());
-    let mongo_db = std::env::var("MONGO_DB").unwrap_or_else(|_| "identity".into());
-    let mongo_coll = std::env::var("MONGO_COLLECTION").unwrap_or_else(|_| "profiles".into());
+    // The sidecar only reads + listens, so this URL needs SELECT + LISTEN, never
+    // schema creation. It MUST reach the primary on a session connection — a
+    // transaction-mode pooler silently swallows LISTEN (see deploy/README.md).
+    let pg_url = std::env::var("PROFILE_PG_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@postgres:5432/zitadel".into());
     let ttl: u64 = std::env::var("CACHE_TTL_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -466,10 +468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
 
     let store: Arc<dyn ProfileStore> = loop {
-        match MongoStore::connect(&mongo_url, &mongo_db, &mongo_coll).await {
+        match PgProfileStore::connect(&pg_url).await {
             Ok(s) => break Arc::new(s),
             Err(e) => {
-                warn!(error = %e, "waiting for Mongo");
+                warn!(error = %e, "waiting for Postgres");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }

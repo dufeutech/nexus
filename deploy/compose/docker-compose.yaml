@@ -4,8 +4,7 @@
 # the Envoy edge. Every stateful dependency is EXTERNAL and lives outside this
 # project — you point at it via .env:
 #
-#   MongoDB replica set   (identity store + change feed; ?replicaSet=... required)
-#   PostgreSQL            (authoritative routing store)
+#   PostgreSQL            (routing store; AND identity store + LISTEN/NOTIFY feed)
 #   Redis                 (OPTIONAL routing L2 cache)
 #   ZITADEL               (the IdP) + the protected backend pools
 #
@@ -61,16 +60,14 @@ services:
       - "127.0.0.1:9400:9400"   # bound to loopback: admin boundary only
 
   # --- Identity plane ------------------------------------------------------- #
-  # The enrichment hot path (ext_proc). Reads the EXTERNAL Mongo replica set and
-  # keeps a bounded cache fresh via change streams (C4).
+  # The enrichment hot path (ext_proc). Reads the EXTERNAL Postgres identity store
+  # and keeps a bounded cache fresh via a seq-cursor feed over LISTEN/NOTIFY (C4).
   identity-sidecar:
     image: ${IDENTITY_REPO:-identity}/identity-sidecar-rs:${IMAGE_TAG:-0.1.0}
     build: { context: ../../identity-rs, target: sidecar }
     restart: unless-stopped
     environment:
-      MONGO_URL: ${MONGO_URL:?set MONGO_URL to your external replica set (?replicaSet=...)}
-      MONGO_DB: ${MONGO_DB:-identity}
-      MONGO_COLLECTION: ${MONGO_COLLECTION:-profiles}
+      PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-43200}
       READINESS_DELAY_SECONDS: ${READINESS_DELAY_SECONDS:-0}
       RUST_LOG: ${RUST_LOG:-info}
@@ -89,9 +86,7 @@ services:
     build: { context: ../../identity-rs, target: sync-worker }
     restart: unless-stopped
     environment:
-      MONGO_URL: ${MONGO_URL:?set MONGO_URL}
-      MONGO_DB: ${MONGO_DB:-identity}
-      MONGO_COLLECTION: ${MONGO_COLLECTION:-profiles}
+      PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
       ZITADEL_INTERNAL_URL: ${ZITADEL_INTERNAL_URL:?set ZITADEL_INTERNAL_URL}
       ZITADEL_HOST: ${ZITADEL_HOST:?set ZITADEL_HOST (issuer authority)}
       WEBHOOK_SELF_URL: ${WEBHOOK_SELF_URL:?set WEBHOOK_SELF_URL ZITADEL can reach}
@@ -107,9 +102,7 @@ services:
     build: { context: ../../identity-rs, target: reconciler }
     restart: unless-stopped
     environment:
-      MONGO_URL: ${MONGO_URL:?set MONGO_URL}
-      MONGO_DB: ${MONGO_DB:-identity}
-      MONGO_COLLECTION: ${MONGO_COLLECTION:-profiles}
+      PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
       ZITADEL_INTERNAL_URL: ${ZITADEL_INTERNAL_URL:?set ZITADEL_INTERNAL_URL}
       ZITADEL_HOST: ${ZITADEL_HOST:?set ZITADEL_HOST (issuer authority)}
       PAT_FILE: /secrets/zitadel-admin-sa.pat

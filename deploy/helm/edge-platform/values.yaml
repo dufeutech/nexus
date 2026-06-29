@@ -24,14 +24,14 @@ routing-plane:
 
 # -------------------------------------------------------------------------- #
 # Identity plane (subchart) — deploys sync-worker + reconciler (its edge is
-# disabled; this umbrella runs the combined one). The durable store (MongoDB
-# replica set) is EXTERNAL. Set images.*, zitadel.*, mongo.uri, backend here.
+# disabled; this umbrella runs the combined one). The durable store (PostgreSQL)
+# is EXTERNAL. Set images.*, zitadel.*, postgres.* (external), backend here.
 # -------------------------------------------------------------------------- #
 identity-plane:
   edge:
     enabled: false        # umbrella owns the combined edge
-  # mongo:
-  #   uri: mongodb://mongo-0,mongo-1,mongo-2/?replicaSet=rs0
+  # postgres:
+  #   existingSecret: identity-pg     # or postgres.url
 
 # -------------------------------------------------------------------------- #
 # The combined tenant-first edge (RFC C17). Filter order:
@@ -95,9 +95,11 @@ compose:
   # routing subchart's postgres.read* (empty => router reads over the direct URL).
   routingPgReadSecret: ""    # default: <release>-routing-plane-pg-read
   routingPgReadSecretKey: "" # default: url
-  # MONGO_URL the identity sidecar dials. Default: identity-plane.mongo.uri (the
-  # external replica set). Override only to point at a different external URI.
-  mongoUrl: ""
+  # Secret + key the identity sidecar reads PROFILE_PG_URL from. Default: the
+  # identity subchart's existingSecret, else its chart-managed
+  # <release>-identity-plane-pg.
+  identityPgSecret: ""       # default: <release>-identity-plane-pg
+  identityPgSecretKey: ""    # default: url
   # REDIS_URL the tenant-router dials. Default: routing-plane.redis.url when
   # enabled, else empty (L1-only).
   redisUrl: ""

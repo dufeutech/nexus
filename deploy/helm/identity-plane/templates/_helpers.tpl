@@ -37,13 +37,40 @@ Image ref: ("repo" "tag" ctx) -> repo:tag, defaulting tag to AppVersion.
 {{- end -}}
 
 {{/*
-MongoDB URI every component dials. This project does NOT run a database — the
-store is an EXTERNAL replica set you operate (a managed service or the Mongo
-Community Operator). Change streams (RFC C4) require a replica set, so the URI
-must include ?replicaSet=...
+Postgres is EXTERNAL by design — this chart does not run a database. The sidecar,
+sync-worker and reconciler read PROFILE_PG_URL from a Secret. Either you supply
+your own (postgres.existingSecret — preferred, works with ExternalSecrets/
+SealedSecrets), or the chart wraps an inline postgres.url in a managed Secret.
 */}}
-{{- define "identity-plane.mongoUri" -}}
-{{- required "mongo.uri is required: external MongoDB replica set URI (must include ?replicaSet=...)" .Values.mongo.uri -}}
+{{- define "identity-plane.pgSecretName" -}}
+{{- if .Values.postgres.existingSecret -}}
+{{- .Values.postgres.existingSecret -}}
+{{- else -}}
+{{- printf "%s-pg" (include "identity-plane.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.pgSecretKey" -}}
+{{- if .Values.postgres.existingSecret -}}
+{{- .Values.postgres.existingSecretKey -}}
+{{- else -}}
+url
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chart manages its own pg Secret (true) vs using an existing one.
+*/}}
+{{- define "identity-plane.ownsPgSecret" -}}
+{{- if .Values.postgres.existingSecret -}}false{{- else -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The PROFILE_PG_URL the chart-managed Secret holds (the inline external URL). Not
+used when postgres.existingSecret is supplied.
+*/}}
+{{- define "identity-plane.pgUrl" -}}
+{{- required "postgres.url is required (external Postgres URL) when postgres.existingSecret is not set" .Values.postgres.url -}}
 {{- end -}}
 
 {{/*

@@ -11,7 +11,7 @@ fn str_field(v: &Value, k: &str) -> Option<String> {
 
 /// Build the desired Profile from an authoritative user record (provider v2
 /// shape) plus its resolved role set. `version`/`updated_at` are not
-/// authoritative here (they come from the change stream), so they are left at
+/// authoritative here (they come from the change feed), so they are left at
 /// defaults and excluded from `differs`.
 pub fn build_profile_from_user(user: &Value, mut roles: Vec<String>) -> Profile {
     let null = Value::Null;

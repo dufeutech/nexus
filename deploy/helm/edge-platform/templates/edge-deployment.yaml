@@ -82,12 +82,11 @@ spec:
           imagePullPolicy: {{ $iv.images.sidecar.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
-            - name: MONGO_URL
-              value: {{ include "edge-platform.mongoUrl" . | quote }}
-            - name: MONGO_DB
-              value: {{ $iv.mongo.db | quote }}
-            - name: MONGO_COLLECTION
-              value: {{ $iv.mongo.collection | quote }}
+            - name: PROFILE_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "edge-platform.identityPgSecret" . }}
+                  key: {{ include "edge-platform.identityPgSecretKey" . }}
             - name: CACHE_TTL_SECONDS
               value: {{ $iv.sidecar.cacheTtlSeconds | quote }}
             - name: READINESS_DELAY_SECONDS

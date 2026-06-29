@@ -16,7 +16,7 @@ dependency is **external** and operated outside this project:
 
 | External dependency | Used by            | Why it's external                                  |
 | ------------------- | ------------------ | -------------------------------------------------- |
-| **MongoDB** (replica set) | identity sidecar / sync-worker / reconciler | identity store + change-stream feed (RFC C4); HA is your operator's job |
+| **PostgreSQL**      | identity sidecar / sync-worker / reconciler | identity store + LISTEN/NOTIFY change feed (RFC C4); session connection required; app creates the `identity` schema |
 | **PostgreSQL**      | tenant-router / control-plane | authoritative routing store (RFC decision 14)      |
 | **Redis** (optional) | tenant-router     | OPTIONAL L2 cache (RFC decision 9) — never a correctness dependency |
 | **ZITADEL** (IdP) + its DB | edge jwt_authn / sync-worker / reconciler | credential issuer; run its own chart / a managed instance |
@@ -28,12 +28,12 @@ independence, `../INFO.md` §4/§7):
 ```
 deploy/
   helm/
-    identity-plane/   identity edge + sync-worker + reconciler   (external Mongo)
+    identity-plane/   identity edge + sync-worker + reconciler   (external Postgres)
     routing-plane/    routing edge + control-plane               (external Postgres, optional Redis)
     edge-platform/    umbrella: both planes, one tenant-first edge (RFC C17)
   compose/
     docker-compose.yaml  the same services as a compose stack
-    .env.example         external endpoints (Mongo/Postgres/Redis/ZITADEL)
+    .env.example         external endpoints (Postgres/Redis/ZITADEL)
     envoy/envoy.yaml     the combined tenant-first edge config
     secrets/             mount point for the ZITADEL admin PAT (gitignored)
 ```
@@ -94,7 +94,7 @@ Runs the full first-party stack against your external infrastructure.
 
 ```bash
 cd compose
-cp .env.example .env                      # fill in Mongo / Postgres / Redis / ZITADEL
+cp .env.example .env                      # fill in Postgres / Redis / ZITADEL
 printf '%s' '<zitadel-admin-PAT>' > secrets/zitadel-admin-sa.pat
 $EDITOR envoy/envoy.yaml                   # set zitadel_jwks + pool_* upstreams
 docker compose up -d --build               # builds from ../../identity-rs and ../../routing-rs
@@ -110,12 +110,12 @@ one tenant-first edge. North–south TLS is terminated by your ingress controlle
 (cert-manager), which is why the planes carry no in-app TLS.
 
 ```bash
-# Identity plane (external Mongo replica set required)
+# Identity plane (external Postgres required; session connection)
 helm install identity ./helm/identity-plane -n identity --create-namespace \
   --set images.sidecar.repository=REGISTRY/identity-sidecar-rs \
   --set images.syncWorker.repository=REGISTRY/identity-sync-worker \
   --set images.reconciler.repository=REGISTRY/identity-reconciler \
-  --set mongo.uri='mongodb://mongo-0,mongo-1,mongo-2/?replicaSet=rs0' \
+  --set postgres.existingSecret=identity-pg \
   --set zitadel.issuer=https://auth.example.com \
   --set zitadel.internalUrl=http://zitadel.zitadel.svc.cluster.local:8080 \
   --set zitadel.patSecret.existingSecret=zitadel-pat \
@@ -139,6 +139,7 @@ Create the credential Secrets out-of-band (preferred over inline values):
 
 ```bash
 kubectl -n identity create secret generic zitadel-pat --from-file=pat=./zitadel-admin-sa.pat
+kubectl -n identity create secret generic identity-pg --from-literal=url='postgres://user:pass@host:5432/identitydb'
 kubectl -n routing  create secret generic routing-pg  --from-literal=url='postgres://user:pass@host:5432/routing'
 ```
 
@@ -198,8 +199,13 @@ provide:
   never wrong routing — but in production you want the feed working so changes
   land in seconds, which is exactly why the pooler caveat above matters.
 
-(The identity plane's freshness is a separate mechanism — MongoDB **change
-streams**, which is why that store must be a replica set.)
+(The identity plane now uses the **same `LISTEN/NOTIFY` mechanism** as routing —
+its sidecar holds a listener on channel **`identity_changes`** and advances a
+`seq` cursor to keep its cache fresh (RFC C4). So everything in this section
+applies to the identity store too: `PROFILE_PG_URL` must be a direct/session
+connection to the primary (never a transaction-mode pooler), and the identity
+role needs `CREATE` so the app can run `CREATE SCHEMA IF NOT EXISTS identity` on
+startup. No replica set is required.)
 
 ## The non-negotiables still apply
 

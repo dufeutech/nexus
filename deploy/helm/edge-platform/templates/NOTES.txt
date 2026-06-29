@@ -5,11 +5,11 @@ Topology:
   - combined edge : Envoy + tenant-router + identity-sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
                     chain: strip -> tenant resolve (C18) -> verify (C1) -> enrich (C2) -> forward
   - routing plane : control-plane              (subchart, edge disabled; Postgres + optional Redis are external)
-  - identity plane: sync-worker + reconciler   (subchart, edge disabled; MongoDB is external)
+  - identity plane: sync-worker + reconciler   (subchart, edge disabled; PostgreSQL is external)
 
 The combined edge dials:
   - routing store secret : {{ include "edge-platform.routingPgSecret" . }} (key {{ include "edge-platform.routingPgSecretKey" . }})
-  - mongo                : {{ include "edge-platform.mongoUrl" . }}
+  - identity store secret: {{ include "edge-platform.identityPgSecret" . }} (key {{ include "edge-platform.identityPgSecretKey" . }})
   - redis (L2)           : {{ include "edge-platform.redisUrl" . | default "(disabled — L1-only)" }}
   - ZITADEL issuer       : {{ (index .Values "identity-plane").zitadel.issuer }}
 

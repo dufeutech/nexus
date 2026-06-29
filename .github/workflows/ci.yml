@@ -58,10 +58,10 @@ jobs:
         uses: azure/setup-helm@v4
 
       # Each chart is rendered with the minimum required values so lint/template
-      # actually exercises the helpers (mongo.uri, the pg secret, pools, etc.).
+      # actually exercises the helpers (postgres.url, the pg secret, pools, etc.).
       - name: Lint & render identity-plane
         run: |
-          ARGS="--set mongo.uri=mongodb://m/?replicaSet=rs0 --set zitadel.patSecret.value=dummy"
+          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set zitadel.patSecret.value=dummy"
           helm lint identity-plane $ARGS
           helm template rel identity-plane $ARGS >/dev/null
 
@@ -76,7 +76,7 @@ jobs:
       - name: Lint & render edge-platform (umbrella)
         run: |
           helm dependency update edge-platform
-          ARGS="--set identity-plane.mongo.uri=mongodb://m/?replicaSet=rs0 \
+          ARGS="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity \
                 --set identity-plane.zitadel.patSecret.value=dummy \
                 --set routing-plane.postgres.url=postgres://u:p@h:5432/routing"
           helm lint edge-platform $ARGS

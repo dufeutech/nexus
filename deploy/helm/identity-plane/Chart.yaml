@@ -2,8 +2,8 @@ apiVersion: v2
 name: identity-plane
 description: >-
   Identity Enrichment Plane (see ../../../INFO.md) — the production Kubernetes
-  topology of the edge enrich path and sync pipeline. The durable store (MongoDB
-  replica set) is EXTERNAL — operated outside this chart. Topology-independent
+  topology of the edge enrich path and sync pipeline. The durable store
+  (PostgreSQL) is EXTERNAL — operated outside this chart. Topology-independent
   (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart version — bump on template changes.

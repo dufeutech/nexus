@@ -1,0 +1,25 @@
+[package]
+name = "store-postgres"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "store_postgres"
+path = "src/lib.rs"
+
+[dependencies]
+identity-core = { path = "../core" }
+sqlx.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Integration tests (tests/integration.rs) drive the adapter against a real
+# Postgres (gated on STORE_PG_TEST_URL); they need the test runtime + a direct
+# pool for table cleanup.
+tokio = { workspace = true }
+futures.workspace = true
+sqlx.workspace = true

@@ -1,8 +1,9 @@
 # Identity Enrichment Plane — Helm values.
 #
 # This chart deploys the components THIS repo owns: the edge (Envoy + the Rust
-# identity sidecar, co-located for hot-path latency), the sync-worker, the
-# reconciler, and a durable MongoDB store (source of truth + change-stream feed).
+# identity sidecar, co-located for hot-path latency), the sync-worker, and the
+# reconciler. The durable store (Postgres — source of truth + seq-cursor change
+# feed over LISTEN/NOTIFY, RFC C4) is EXTERNAL, wired in via `postgres:` below.
 #
 # It treats ZITADEL, its Postgres, and the protected backend as EXTERNAL
 # dependencies you point at via config (see `zitadel:` and `backend:` below).
@@ -89,7 +90,7 @@ backend:
 edge:
   # Deploy this chart's identity-only edge. Set false when composing with the
   # routing plane via the ../edge-platform umbrella, which owns the single
-  # combined tenant-first edge instead (mongo / sync-worker / reconciler still
+  # combined tenant-first edge instead (the data-plane components below still
   # deploy). Default true: this chart is usable standalone.
   enabled: true
   replicas: 2
@@ -164,19 +165,27 @@ reconciler:
     limits: { cpu: "500m", memory: "128Mi" }
 
 # -------------------------------------------------------------------------- #
-# MongoDB — the single Durable State Store AND change feed (RFC §3.5 + C4 via
-# change streams). EXTERNAL by design: this chart does not run a database. Point
-# it at a Mongo you operate — a managed service, or a multi-member replica set
-# via the Mongo Community Operator. Change streams REQUIRE a replica set, so the
-# URI MUST include ?replicaSet=... For credentials, embed them in the URI (or
-# template `mongo.uri` from a Secret via your own values overlay).
+# Postgres — the single Durable State Store AND change feed (RFC §3.5 + C4 via a
+# seq-cursor feed over LISTEN/NOTIFY). EXTERNAL by design: this chart does not run
+# a database. Point it at a managed service or an HA operator cluster. The app
+# creates its own `identity` schema inside whatever database the URL points at.
+#
+# Provide the connection URL one of two ways (existingSecret preferred):
+#   - postgres.existingSecret — name of a Secret you create holding the URL.
+#   - postgres.url            — inline URL the chart wraps in a managed Secret.
+# This is the DIRECT/session URL: the sidecar's LISTEN/NOTIFY change feed (channel
+# `identity_changes`) and the writers use it. It MUST NOT be a transaction-mode
+# pooler (PgBouncer/RDS-Proxy txn mode), which silently swallows LISTEN — see the
+# deploy README "External Postgres requirements". No read split: the binaries read
+# only this one URL.
 # -------------------------------------------------------------------------- #
-mongo:
-  db: "identity"
-  collection: "profiles"
-  # Required. Full connection URI to your external replica set, e.g.
-  #   mongodb://mongo-0,mongo-1,mongo-2/?replicaSet=rs0
-  uri: ""
+postgres:
+  # Preferred: a Secret you manage (works with ExternalSecrets / SealedSecrets).
+  existingSecret: ""            # Secret name; key below
+  existingSecretKey: "url"
+  # Inline fallback (discouraged — ends up in a chart-managed Secret). Must reach
+  # a database the app can create its `identity` schema in.
+  url: ""                       # e.g. postgres://user:pass@host:5432/identitydb
 
 # -------------------------------------------------------------------------- #
 # Observability — emit a ServiceMonitor per component if you run the Prometheus

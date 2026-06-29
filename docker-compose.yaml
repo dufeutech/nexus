@@ -67,41 +67,12 @@ services:
       start_period: 20s
 
   # --- identity store + sync pipeline ----------------------------------------
-  # MongoDB is the single source of truth AND the change feed (change streams =
-  # RFC C4 push). Change streams require a replica set, so even this single node
-  # runs as a 1-member RS (rs0), initiated once by mongo-init.
-  mongo:
-    image: mongo:7
-    container_name: zitadel-lab-mongo
-    command: ["--replSet", "rs0", "--bind_ip_all"]
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    volumes:
-      - mongo-data:/data/db
-
-  # One-shot: initiate the replica set (idempotent). Services wait for this to
-  # complete so they connect to an initialized RS.
-  mongo-init:
-    image: mongo:7
-    container_name: zitadel-lab-mongo-init
-    restart: "no"
-    depends_on:
-      mongo:
-        condition: service_healthy
-    entrypoint:
-      - bash
-      - -c
-      - >-
-        mongosh --host mongo:27017 --quiet --eval
-        'try { rs.initiate({_id:"rs0",members:[{_id:0,host:"mongo:27017"}]}); print("rs initiated") }
-        catch (e) { print("rs already initialized: " + e.codeName) }'
+  # The identity store is the SAME Postgres ZITADEL uses (the `postgres` service
+  # below), under a dedicated `identity` schema — the identity-plane twin of the
+  # routing plane's `routing` schema (RFC decision 14). Freshness is the RFC C4
+  # change feed implemented as a `seq`-cursor over Postgres LISTEN/NOTIFY (channel
+  # `identity_changes`); no replica set, no second database technology. The
+  # writers (sync-worker, reconciler) create the schema idempotently on startup.
 
   sync-worker:
     build:
@@ -110,9 +81,7 @@ services:
     container_name: zitadel-lab-sync
     restart: unless-stopped
     environment:
-      MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
-      MONGO_DB: identity
-      MONGO_COLLECTION: profiles
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       ZITADEL_INTERNAL_URL: http://zitadel:8080
       ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8088}
       WEBHOOK_SELF_URL: http://sync-worker:8080/webhook
@@ -122,8 +91,8 @@ services:
     depends_on:
       zitadel:
         condition: service_healthy
-      mongo-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   reconciler:
     build:
@@ -132,9 +101,7 @@ services:
     container_name: zitadel-lab-reconciler
     restart: unless-stopped
     environment:
-      MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
-      MONGO_DB: identity
-      MONGO_COLLECTION: profiles
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       ZITADEL_INTERNAL_URL: http://zitadel:8080
       ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8088}
       PAT_FILE: /machinekey/zitadel-admin-sa.pat
@@ -144,8 +111,8 @@ services:
     depends_on:
       zitadel:
         condition: service_healthy
-      mongo-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   # --- edge path: Envoy (tenant routing -> jwt_authn -> enrichment) -> pools --
   # Backend pools are a SMALL, FINITE set (RFC C15 / decision 13). The routing
@@ -246,10 +213,11 @@ services:
         curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"unverified.test","tenant_id":"acme","verified":false}';
         echo; echo 'routing seed complete'
 
-  # Identity sidecar (Rust: tonic + envoy-types + mongodb + moka). The one Envoy
-  # calls. Built from the identity-rs workspace (shares the core crate with
+  # Identity sidecar (Rust: tonic + envoy-types + sqlx/Postgres + moka). The one
+  # Envoy calls. Built from the identity-rs workspace (shares the core crate with
   # sync-worker + reconciler — one canonical Profile + version guard). Cache is
-  # kept fresh by Mongo change streams (RFC C4).
+  # kept fresh by the seq-cursor LISTEN/NOTIFY change feed (RFC C4). Read + listen
+  # only — never creates schema.
   identity-sidecar-rs:
     build:
       context: ./identity-rs
@@ -257,17 +225,15 @@ services:
     container_name: zitadel-lab-sidecar-rs
     restart: unless-stopped
     environment:
-      MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
-      MONGO_DB: identity
-      MONGO_COLLECTION: profiles
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       CACHE_TTL_SECONDS: ${SIDECAR_CACHE_TTL:-43200}
       READINESS_DELAY_SECONDS: ${SIDECAR_READINESS_DELAY:-0}
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)
     depends_on:
-      mongo-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   envoy:
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.34-latest}
@@ -340,4 +306,3 @@ services:
 
 volumes:
   postgres-data:
-  mongo-data:

@@ -8,7 +8,7 @@ description: >-
   THIS chart owns the single combined edge — Envoy + tenant-router + identity
   sidecar, co-located per-pod — running the ordered chain
   strip → tenant resolve (C18) → verify credential (C1) → enrich (C2) → forward.
-  Stores (MongoDB, Postgres, optional Redis) and ZITADEL are external.
+  Stores (PostgreSQL, optional Redis) and ZITADEL are external.
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

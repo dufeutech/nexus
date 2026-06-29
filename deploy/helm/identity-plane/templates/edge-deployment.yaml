@@ -34,12 +34,11 @@ spec:
           imagePullPolicy: {{ .Values.images.sidecar.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
-            - name: MONGO_URL
-              value: {{ include "identity-plane.mongoUri" . | quote }}
-            - name: MONGO_DB
-              value: {{ .Values.mongo.db | quote }}
-            - name: MONGO_COLLECTION
-              value: {{ .Values.mongo.collection | quote }}
+            - name: PROFILE_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "identity-plane.pgSecretName" . }}
+                  key: {{ include "identity-plane.pgSecretKey" . }}
             - name: CACHE_TTL_SECONDS
               value: {{ .Values.sidecar.cacheTtlSeconds | quote }}
             - name: READINESS_DELAY_SECONDS

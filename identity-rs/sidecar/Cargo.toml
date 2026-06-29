@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 identity-core = { path = "../core" }
-store-mongo = { path = "../store-mongo" }
+store-postgres = { path = "../store-postgres" }
 tonic = "0.14"
 envoy-types = "0.7"
 tokio.workspace = true

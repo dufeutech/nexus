@@ -27,7 +27,7 @@ use tracing::{error, info, warn};
 use identity_core::reconcile::{build_profile_from_user, differs};
 use identity_core::store::{BoxError, ProfileStore};
 use identity_core::Profile;
-use store_mongo::MongoStore;
+use store_postgres::PgProfileStore;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -198,9 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .install()?;
     info!(port = metrics_port, "metrics listener up");
 
-    let mongo_url = env("MONGO_URL", "mongodb://mongo:27017/?replicaSet=rs0");
-    let mongo_db = env("MONGO_DB", "identity");
-    let mongo_coll = env("MONGO_COLLECTION", "profiles");
+    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
     let interval = Duration::from_secs(env_num("RECONCILE_INTERVAL", 600u64));
     let shard = Shard { total: env_num("SHARD_TOTAL", 1u64).max(1), index: env_num("SHARD_INDEX", 0u64) };
 
@@ -213,16 +211,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         page: env_num("RECONCILE_PAGE_LIMIT", 1000u64),
     };
 
-    let store: Arc<dyn ProfileStore> = loop {
-        match MongoStore::connect(&mongo_url, &mongo_db, &mongo_coll).await {
-            Ok(s) => break Arc::new(s),
-            Err(e) => {
-                warn!(error = %e, "waiting for Mongo");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+    // The reconciler is an authoritative writer, so it owns idempotent schema
+    // setup on startup before the first pass backfills profiles from the IdP.
+    let store: Arc<PgProfileStore> = loop {
+        match PgProfileStore::connect(&pg_url).await {
+            Ok(s) => match s.init_schema().await {
+                Ok(()) => break Arc::new(s),
+                Err(e) => warn!(error = %e, "schema init failed; retrying"),
+            },
+            Err(e) => warn!(error = %e, "waiting for Postgres"),
         }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     };
-    info!(interval_s = interval.as_secs(), db = %mongo_db, shard_total = shard.total, shard_index = shard.index, "started");
+    let store: Arc<dyn ProfileStore> = store;
+    info!(interval_s = interval.as_secs(), shard_total = shard.total, shard_index = shard.index, "started");
 
     let (tx, mut rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

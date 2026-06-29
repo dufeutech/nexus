@@ -96,15 +96,30 @@ url
 {{- end -}}
 
 {{/*
-MONGO_URL the combined edge's identity sidecar dials — the identity subchart's
-EXTERNAL replica set URI (or a compose override).
+PROFILE_PG_URL Secret name/key the combined edge's identity sidecar reads. Default
+to the identity subchart's managed Secret; honour an external existingSecret it
+points at, or an explicit compose override. This is the direct/session URL the
+sidecar's LISTEN/NOTIFY change feed (channel `identity_changes`) uses.
 */}}
-{{- define "edge-platform.mongoUrl" -}}
+{{- define "edge-platform.identityPgSecret" -}}
 {{- $iv := index .Values "identity-plane" -}}
-{{- if .Values.compose.mongoUrl -}}
-{{- .Values.compose.mongoUrl -}}
+{{- if .Values.compose.identityPgSecret -}}
+{{- .Values.compose.identityPgSecret -}}
+{{- else if $iv.postgres.existingSecret -}}
+{{- $iv.postgres.existingSecret -}}
 {{- else -}}
-{{- required "identity-plane.mongo.uri is required (external MongoDB replica set URI)" $iv.mongo.uri -}}
+{{- printf "%s-pg" (include "edge-platform.identityFullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "edge-platform.identityPgSecretKey" -}}
+{{- $iv := index .Values "identity-plane" -}}
+{{- if .Values.compose.identityPgSecretKey -}}
+{{- .Values.compose.identityPgSecretKey -}}
+{{- else if $iv.postgres.existingSecret -}}
+{{- $iv.postgres.existingSecretKey -}}
+{{- else -}}
+url
 {{- end -}}
 {{- end -}}
 

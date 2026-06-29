@@ -27,7 +27,7 @@ use tracing::{error, info, warn};
 
 use identity_core::store::ProfileStore;
 use identity_core::sync::{apply, classify, Apply, Classify};
-use store_mongo::MongoStore;
+use store_postgres::PgProfileStore;
 
 type HmacSha256 = Hmac<Sha256>;
 const SIG_HEADER: &str = "zitadel-signature";
@@ -192,9 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
     let handle = PrometheusBuilder::new().install_recorder()?;
 
-    let mongo_url = env("MONGO_URL", "mongodb://mongo:27017/?replicaSet=rs0");
-    let mongo_db = env("MONGO_DB", "identity");
-    let mongo_coll = env("MONGO_COLLECTION", "profiles");
+    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
     let internal_url = env("ZITADEL_INTERNAL_URL", "http://zitadel:8080");
     let host = env("ZITADEL_HOST", "localhost:8088");
     let self_url = env("WEBHOOK_SELF_URL", "http://sync-worker:8080/webhook");
@@ -202,16 +200,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let pat = std::fs::read_to_string(&pat_file)?.trim().to_string();
 
-    // Wait for Mongo, then for the IdP Actions API (mirrors the prior retry).
-    let store: Arc<dyn ProfileStore> = loop {
-        match MongoStore::connect(&mongo_url, &mongo_db, &mongo_coll).await {
-            Ok(s) => break Arc::new(s),
-            Err(e) => {
-                warn!(error = %e, "waiting for Mongo");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+    // Wait for Postgres, then for the IdP Actions API (mirrors the prior retry).
+    // As an authoritative writer, the sync-worker owns idempotent schema setup.
+    let store: Arc<PgProfileStore> = loop {
+        match PgProfileStore::connect(&pg_url).await {
+            Ok(s) => match s.init_schema().await {
+                Ok(()) => break Arc::new(s),
+                Err(e) => warn!(error = %e, "schema init failed; retrying"),
+            },
+            Err(e) => warn!(error = %e, "waiting for Postgres"),
         }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     };
+    let store: Arc<dyn ProfileStore> = store;
     let signing_key = loop {
         match register_webhook(&internal_url, &host, &pat, &self_url).await {
             Ok(k) => break k,

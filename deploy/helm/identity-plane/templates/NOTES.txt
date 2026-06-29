@@ -4,7 +4,7 @@ Components:
   - edge        : Envoy + identity sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
   - sync-worker : {{ .Values.syncWorker.replicas }} replica (single webhook owner)
   - reconciler  : {{ .Values.reconciler.replicas }} replica, interval {{ .Values.reconciler.intervalSeconds }}s
-  - mongo       : external ({{ .Values.mongo.uri }}) — operated outside this chart
+  - postgres    : external (Secret {{ include "identity-plane.pgSecretName" . }}, key {{ include "identity-plane.pgSecretKey" . }}) — operated outside this chart
 
 Edge entry point:
 {{- if .Values.edge.ingress.enabled }}
@@ -26,6 +26,8 @@ Smoke test (from inside the cluster):
   # expect x-user-id / x-user-org / x-user-roles / x-user-suspended
 
 External dependencies (operated OUTSIDE this chart): see deploy/README.md
-  - MongoDB replica set (HA = multi-member; the URI must carry ?replicaSet=...)
+  - PostgreSQL (identity store + LISTEN/NOTIFY change feed on channel
+    `identity_changes`; PROFILE_PG_URL must be a direct/session connection, not a
+    txn-mode pooler; the app creates the `identity` schema. No replica set needed.)
   - ZITADEL (the IdP) + its database; re-verify event + claim contracts (RFC §6.6)
   - The protected backend the edge forwards to (backend.host/port)
