@@ -68,26 +68,44 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
+        // Keyed by (domain, is_wildcard), NOT domain alone: a domain string may
+        // exist as both an apex/exact row (is_wildcard=false) AND a
+        // wildcard-subdomain row (is_wildcard=true) for the same tenant — the
+        // apex+wildcard coexistence the explicit model forbids today but a future
+        // wildcard tier needs (see nexus-upstream-requirements.md §N3). Choosing
+        // the composite key now is free while the table is small; retrofitting it
+        // onto a populated, hot table later is a migration we avoid by deciding it
+        // here. The self-service lifecycle still only ever creates exact rows
+        // (declare forces is_wildcard=false); wildcard rows are admin-seeded.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.domains (\
-                 domain      text PRIMARY KEY, \
+                 domain      text NOT NULL, \
                  tenant_id   text NOT NULL REFERENCES routing.tenants(tenant_id) ON DELETE CASCADE, \
                  is_wildcard boolean NOT NULL DEFAULT false, \
                  verified    boolean NOT NULL DEFAULT false, \
-                 updated_at  timestamptz NOT NULL DEFAULT now())",
+                 updated_at  timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (domain, is_wildcard))",
         )
         .execute(&self.pool)
         .await?;
         // Ownership-proof challenges (RFC C4). Separate from `domains` so the
         // challenge lifecycle never touches the hot read path; cascades away with
-        // its domain. `gen_random_uuid()` is built in (no extension).
+        // its domain. `gen_random_uuid()` is built in (no extension). Carries
+        // is_wildcard so the FK can reference the composite domains key and the
+        // cascade survives; a challenge belongs to the EXACT declared variant
+        // (is_wildcard=false), since only self-service exact declares are ever
+        // challenged (wildcard rows are admin-seeded already-verified).
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.domain_challenges (\
-                 domain     text PRIMARY KEY REFERENCES routing.domains(domain) ON DELETE CASCADE, \
-                 tenant_id  text NOT NULL, \
-                 token      text NOT NULL, \
-                 expires_at timestamptz NOT NULL, \
-                 updated_at timestamptz NOT NULL DEFAULT now())",
+                 domain      text NOT NULL, \
+                 is_wildcard boolean NOT NULL DEFAULT false, \
+                 tenant_id   text NOT NULL, \
+                 token       text NOT NULL, \
+                 expires_at  timestamptz NOT NULL, \
+                 updated_at  timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (domain, is_wildcard), \
+                 FOREIGN KEY (domain, is_wildcard) \
+                     REFERENCES routing.domains(domain, is_wildcard) ON DELETE CASCADE)",
         )
         .execute(&self.pool)
         .await?;
@@ -213,8 +231,8 @@ impl RoutingStore for PgRoutingStore {
         sqlx::query(
             "INSERT INTO routing.domains (domain, tenant_id, is_wildcard, verified, updated_at) \
              VALUES ($1, $2, $3, $4, now()) \
-             ON CONFLICT (domain) DO UPDATE SET \
-                 tenant_id = EXCLUDED.tenant_id, is_wildcard = EXCLUDED.is_wildcard, \
+             ON CONFLICT (domain, is_wildcard) DO UPDATE SET \
+                 tenant_id = EXCLUDED.tenant_id, \
                  verified = EXCLUDED.verified, updated_at = now()",
         )
         .bind(domain)
@@ -310,10 +328,13 @@ impl ChallengeStore for PgRoutingStore {
         // the existing token while it is live and re-issue only once expired
         // (RFC C4: re-issuable). RETURNING reflects the resulting row, so a
         // re-issue returns `expired = false`.
+        // is_wildcard is fixed false: a challenge always proves the EXACT declared
+        // domain (the only thing self-service declares), so it keys to the
+        // (domain, false) row the declare flow created just before this call.
         let row = sqlx::query(
-            "INSERT INTO routing.domain_challenges (domain, tenant_id, token, expires_at, updated_at) \
-             VALUES ($1, $2, replace(gen_random_uuid()::text, '-', ''), now() + make_interval(secs => $3), now()) \
-             ON CONFLICT (domain) DO UPDATE SET \
+            "INSERT INTO routing.domain_challenges (domain, is_wildcard, tenant_id, token, expires_at, updated_at) \
+             VALUES ($1, false, $2, replace(gen_random_uuid()::text, '-', ''), now() + make_interval(secs => $3), now()) \
+             ON CONFLICT (domain, is_wildcard) DO UPDATE SET \
                  token = CASE WHEN routing.domain_challenges.expires_at < now() \
                               THEN replace(gen_random_uuid()::text, '-', '') \
                               ELSE routing.domain_challenges.token END, \
@@ -339,7 +360,7 @@ impl ChallengeStore for PgRoutingStore {
     async fn get_challenge(&self, domain: &str) -> Result<Option<Challenge>, BoxError> {
         let row = sqlx::query(
             "SELECT domain, token, (expires_at < now()) AS expired \
-             FROM routing.domain_challenges WHERE domain = $1",
+             FROM routing.domain_challenges WHERE domain = $1 AND is_wildcard = false",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -352,7 +373,7 @@ impl ChallengeStore for PgRoutingStore {
     }
 
     async fn delete_challenge(&self, domain: &str) -> Result<(), BoxError> {
-        sqlx::query("DELETE FROM routing.domain_challenges WHERE domain = $1")
+        sqlx::query("DELETE FROM routing.domain_challenges WHERE domain = $1 AND is_wildcard = false")
             .bind(domain)
             .execute(&self.pool)
             .await?;
