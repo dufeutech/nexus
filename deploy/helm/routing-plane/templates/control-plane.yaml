@@ -42,6 +42,13 @@ spec:
               value: {{ .Values.controlPlane.logFormat | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.controlPlane.logLevel | quote }}
+            # The pool allow-list (RFC C15) — derived from the SAME .Values.pools
+            # that renders the edge `pool_*` clusters/routes, so the control plane's
+            # validation and the data plane's destinations can never drift. Add a
+            # key to `pools:` and the new pool is accepted AND routable — no
+            # recompile. JSON array, parsed by the control plane's load_pools().
+            - name: ROUTING_POOLS
+              value: {{ keys .Values.pools | sortAlpha | toJson | quote }}
           ports:
             - { name: admin, containerPort: 9400 }
           readinessProbe:

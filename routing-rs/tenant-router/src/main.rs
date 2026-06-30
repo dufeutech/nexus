@@ -134,11 +134,21 @@ impl AppState {
                     Ok(None) => return Err("no_tenant_config".to_string()),
                     Err(e) => return Err(e.to_string()),
                 };
+                // Fold the tenant's per-route auth policy (RFC N4) into the cached
+                // decision: one extra point read on the miss path, then resolved
+                // per-request against the request path with no further lookup. It
+                // rides the same domain-keyed invalidation as the rest of the
+                // decision (a policy change invalidates the tenant's domains).
+                let auth = match store.get_auth_policy(&tenant_id).await {
+                    Ok(p) => p,
+                    Err(e) => return Err(e.to_string()),
+                };
                 let decision = RoutingDecision {
                     tenant_id: cfg.tenant_id,
                     plan: cfg.plan,
                     pool: cfg.target_pool,
                     features: cfg.features,
+                    auth,
                 };
                 if let Some(l2) = &l2 {
                     if let Err(e) = l2.put(&key2, &decision, l2_ttl).await {
@@ -179,6 +189,34 @@ fn extract_host(req: &ProcessingRequest) -> Option<String> {
         }
     }
     authority.or(host)
+}
+
+// --------------------------------------------------------------------------- //
+// Request path extraction (RFC N4): the second half of the auth-policy key. Read
+// the HTTP/2 `:path` pseudo-header and strip the query string + fragment, so the
+// policy matches on the path alone (`/app?x=1` resolves as `/app`). Defaults to
+// `/` when absent so a path-less request still resolves the tenant default.
+// --------------------------------------------------------------------------- //
+fn extract_path(req: &ProcessingRequest) -> String {
+    let headers = match &req.request {
+        Some(processing_request::Request::RequestHeaders(h)) => match h.headers.as_ref() {
+            Some(h) => h,
+            None => return "/".to_string(),
+        },
+        _ => return "/".to_string(),
+    };
+    for hv in &headers.headers {
+        if hv.key.eq_ignore_ascii_case(":path") {
+            let raw = if !hv.raw_value.is_empty() {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
+            } else {
+                hv.value.clone()
+            };
+            let path = raw.split(['?', '#']).next().unwrap_or("/");
+            return if path.is_empty() { "/".to_string() } else { path.to_string() };
+        }
+    }
+    "/".to_string()
 }
 
 // --------------------------------------------------------------------------- //
@@ -382,6 +420,14 @@ impl Router {
                     // standards-based context (locale/currency/privacy/device) is
                     // always evaluated. The normalized geo country feeds currency.
                     let mut extra: Vec<(&'static str, String)> = Vec::new();
+                    // Per-route auth policy (RFC N4): resolve the request path
+                    // against the tenant's cached policy and emit the authoritative
+                    // gate the edge branches on. ALWAYS emitted (true|false) so the
+                    // contract is explicit and the C3 strip makes it unforgeable;
+                    // jwt_authn keys `requires: provider` vs `allow_missing` on it.
+                    let path = extract_path(&req);
+                    let required = d.auth.resolve(&path).required;
+                    extra.push(("x-auth-required", if required { "true" } else { "false" }.to_string()));
                     let geo = extract_geo(&req).map(|g| g.to_headers()).unwrap_or_default();
                     let country = geo
                         .iter()

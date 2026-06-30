@@ -56,6 +56,11 @@ services:
       ROUTING_PG_URL: ${ROUTING_PG_URL:?set ROUTING_PG_URL to your external Postgres}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Pool allow-list (RFC C15). Empty -> the control plane's built-in default
+      # (application, api, checkout, assets), which matches the pool_* clusters in
+      # ./envoy/envoy.yaml. Set ROUTING_POOLS in .env to add a pool WITHOUT a
+      # recompile — and add the matching pool_* cluster + route in envoy.yaml.
+      ROUTING_POOLS: ${ROUTING_POOLS:-}
     ports:
       - "127.0.0.1:9400:9400"   # bound to loopback: admin boundary only
 

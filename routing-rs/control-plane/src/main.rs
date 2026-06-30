@@ -10,7 +10,7 @@
 //! a verify call makes it resolve on protected routes (RFC C16 / §3.13) — an
 //! unverified domain never routes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
-use router_core::domain::{Pool, TenantConfig};
+use router_core::domain::{PoolSet, TenantConfig};
 use router_core::normalize::normalize_host;
 use router_core::plan::{DomainLimit, PlanLimits};
 use router_core::store::{BoxError, ChallengeStore, RoutingStore};
@@ -42,6 +42,9 @@ struct App {
     metrics: PrometheusHandle,
     /// Data-driven plan → domain-limit table for the declare quota gate (RFC C5).
     limits: Arc<PlanLimits>,
+    /// Data-driven allow-list of backend pools (RFC C15). Loaded from config so a
+    /// new pool is a config + edge-cluster change, never a recompile.
+    pools: Arc<PoolSet>,
     /// Ownership-proof resolver for TXT verification (RFC C4).
     verifier: Arc<dyn OwnershipProof>,
     /// Challenge token lifetime, seconds (RFC C4).
@@ -87,6 +90,39 @@ fn load_plan_limits() -> PlanLimits {
     }
 }
 
+/// Load the backend-pool allow-list from configuration (RFC C15). `ROUTING_POOLS`
+/// is a JSON array of pool names (e.g. `["application","api","checkout","assets"]`)
+/// that MUST match the edge data plane's `pool_*` cluster set. Absent/invalid
+/// config falls back to the established four pools the shipped edge configs carry,
+/// so an unconfigured deploy keeps working — always a finite, fail-closed set
+/// (an unknown `target_pool` is rejected), never an open "any destination".
+fn load_pools() -> PoolSet {
+    fn default_pools() -> PoolSet {
+        PoolSet::new(
+            ["application", "api", "checkout", "assets"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+    }
+    let raw = env("ROUTING_POOLS", "");
+    if raw.trim().is_empty() {
+        warn!("ROUTING_POOLS unset; using default pool set (application, api, checkout, assets)");
+        return default_pools();
+    }
+    match serde_json::from_str::<BTreeSet<String>>(&raw) {
+        Ok(set) if !set.is_empty() => PoolSet::new(set),
+        Ok(_) => {
+            error!("ROUTING_POOLS is empty; using default pool set");
+            default_pools()
+        }
+        Err(e) => {
+            error!(error = %e, "invalid ROUTING_POOLS; using default pool set");
+            default_pools()
+        }
+    }
+}
+
 impl App {
     /// Publish the invalidation for a domain key (best-effort; logged on failure
     /// since the cache TTL is the backstop).
@@ -119,10 +155,17 @@ fn default_plan() -> String {
 }
 
 async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> impl IntoResponse {
-    let Some(pool) = Pool::parse(&body.target_pool) else {
+    // Validate against the data-driven allow-list (RFC C15): reject an unknown pool
+    // rather than invent a destination. The error lists the configured pools so a
+    // typo/missing-config is obvious without a redeploy.
+    let Some(pool) = s.pools.parse(&body.target_pool) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid target_pool", "value": body.target_pool })),
+            Json(json!({
+                "error": "invalid target_pool",
+                "value": body.target_pool,
+                "allowed": s.pools.names(),
+            })),
         )
             .into_response();
     };
@@ -463,6 +506,106 @@ async fn delete_domain(State(s): State<App>, Path(domain): Path<String>) -> impl
 }
 
 // --------------------------------------------------------------------------- //
+// Per-route auth policy (RFC N4): CRUD over a tenant's path-prefix rules. A
+// change re-protects live traffic, so every mutation invalidates ALL the tenant's
+// domains (same precise per-domain invalidation as a tenant-config change) so the
+// routers reload the policy promptly over the one invalidation feed (RFC C16).
+// --------------------------------------------------------------------------- //
+#[derive(Deserialize)]
+struct AuthRouteBody {
+    path_prefix: String,
+    auth_required: bool,
+}
+
+#[derive(Deserialize)]
+struct AuthRouteDelete {
+    path_prefix: String,
+}
+
+impl App {
+    /// Invalidate every domain a tenant owns — the precise convergence signal for
+    /// a change that affects all of the tenant's routes (policy or config).
+    async fn invalidate_tenant(&self, tenant_id: &str, op: &'static str) {
+        match self.store.domains_for_tenant(tenant_id).await {
+            Ok(domains) => {
+                for d in &domains {
+                    self.invalidate(d).await;
+                }
+                info!(tenant = %tenant_id, op, invalidated = domains.len(), "tenant invalidated");
+            }
+            Err(e) => warn!(error = %e, "domains_for_tenant failed; relying on TTL"),
+        }
+    }
+
+    /// Reject a path prefix that is not rooted at `/` — the policy matches request
+    /// paths, which always begin with `/`, so a non-rooted prefix can never match.
+    fn valid_prefix(prefix: &str) -> bool {
+        prefix.starts_with('/')
+    }
+}
+
+async fn upsert_auth_route(
+    State(s): State<App>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<AuthRouteBody>,
+) -> Response {
+    if !App::valid_prefix(&body.path_prefix) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_prefix", "path_prefix": body.path_prefix, "hint": "must start with '/'" })),
+        )
+            .into_response();
+    }
+    // The FK would reject an unknown tenant as a 500; check first for a clean 404.
+    match s.store.get_tenant(&tenant_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({ "error": "unknown_tenant", "tenant_id": tenant_id })))
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+    if let Err(e) = s.store.upsert_auth_route(&tenant_id, &body.path_prefix, body.auth_required).await {
+        return internal(e);
+    }
+    s.invalidate_tenant(&tenant_id, "upsert_auth_route").await;
+    counter!("control_mutations_total", "op" => "upsert_auth_route").increment(1);
+    (
+        StatusCode::OK,
+        Json(json!({ "result": "ok", "tenant_id": tenant_id, "path_prefix": body.path_prefix, "auth_required": body.auth_required })),
+    )
+        .into_response()
+}
+
+async fn delete_auth_route(
+    State(s): State<App>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<AuthRouteDelete>,
+) -> Response {
+    if let Err(e) = s.store.delete_auth_route(&tenant_id, &body.path_prefix).await {
+        return internal(e);
+    }
+    s.invalidate_tenant(&tenant_id, "delete_auth_route").await;
+    counter!("control_mutations_total", "op" => "delete_auth_route").increment(1);
+    (StatusCode::OK, Json(json!({ "result": "ok", "tenant_id": tenant_id, "path_prefix": body.path_prefix })))
+        .into_response()
+}
+
+async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -> Response {
+    match s.store.get_auth_policy(&tenant_id).await {
+        Ok(policy) => {
+            let routes: Vec<_> = policy
+                .rules()
+                .iter()
+                .map(|r| json!({ "path_prefix": r.prefix, "auth_required": r.auth.required }))
+                .collect();
+            (StatusCode::OK, Json(json!({ "tenant_id": tenant_id, "routes": routes }))).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 async fn metrics_handler(State(s): State<App>) -> impl IntoResponse {
     s.metrics.render()
 }
@@ -530,6 +673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         store,
         metrics,
         limits: Arc::new(load_plan_limits()),
+        pools: Arc::new(load_pools()),
         verifier: Arc::new(DnsOwnershipProof::public()),
         challenge_ttl,
         pending_ttl,
@@ -551,12 +695,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/domains/declare", post(declare_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
         .route("/domains/{domain}", axum::routing::delete(delete_domain))
+        .route(
+            "/tenants/{id}/auth-routes",
+            get(list_auth_routes)
+                .put(upsert_auth_route)
+                .delete(delete_auth_route),
+        )
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9400").await?;
-    info!("control plane on :9400 (/tenants, /domains, /domains/declare, /metrics, /healthz)");
+    info!("control plane on :9400 (/tenants, /tenants/:id/auth-routes, /domains, /domains/declare, /metrics, /healthz)");
     if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await

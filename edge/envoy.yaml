@@ -137,6 +137,12 @@ static_resources:
                           # client copies so is-anonymous is unforgeable (C3).
                           - remove: "x-auth-anonymous"
                           - remove: "x-auth-method"
+                          # Per-route auth policy (RFC N4): the protection decision
+                          # the tenant-router emits and jwt_authn branches on. Strip
+                          # any client copy so a client can't self-declare a route
+                          # public (C3) — tenant-router runs AFTER this filter, so
+                          # its emit is authoritative.
+                          - remove: "x-auth-required"
                   # TENANT-FIRST (RFC C17): resolve host -> tenant -> pool before
                   # auth/enrichment. Sets x-tenant-* + x-route-pool, or rejects an
                   # unknown/unverified host with an immediate 404 (C18). A distinct
@@ -174,9 +180,28 @@ static_resources:
                             cache_duration: { seconds: 600 }
                           payload_in_metadata: verified
                           forward: true
+                      # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
+                      # tenant-router ext_proc (RFC C17 tenant-first), so it can
+                      # branch on the x-auth-required header that filter just set
+                      # from the resolved (domain, path) policy. First match wins:
+                      #  - x-auth-required: true  -> a verified credential is demanded.
+                      #  - otherwise (false/absent) -> allow_missing: a MISSING token
+                      #    passes through anonymous; a PRESENT-but-invalid/expired one
+                      #    still 401s (NOT allow_missing_or_failed). This is the
+                      #    public+private-on-one-domain default (auth: none).
                       rules:
-                        - match: { prefix: "/" }
+                        - match:
+                            prefix: "/"
+                            headers:
+                              [
+                                {
+                                  name: x-auth-required,
+                                  string_match: { exact: "true" },
+                                },
+                              ]
                           requires: { provider_name: zitadel }
+                        - match: { prefix: "/" }
+                          requires: { allow_missing: {} }
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor

@@ -19,6 +19,7 @@ use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row};
 
+use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
 use router_core::domain::{Pool, TenantConfig};
 use router_core::store::{
     BoxError, Challenge, ChallengeStore, DomainRecord, InvalidationFeed, Invalidations, RoutingStore,
@@ -109,6 +110,21 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
+        // Per-route authentication policy (RFC N4). One row per (tenant, path
+        // prefix); the per-tenant default is the `prefix = '/'` row. Absence of any
+        // row for a tenant is "public" (pass-through) — the read path returns the
+        // default, so no backfill is needed when this table is introduced. Cascades
+        // away with its tenant.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.auth_routes (\
+                 tenant_id     text NOT NULL REFERENCES routing.tenants(tenant_id) ON DELETE CASCADE, \
+                 path_prefix   text NOT NULL, \
+                 auth_required boolean NOT NULL, \
+                 updated_at    timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (tenant_id, path_prefix))",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -185,20 +201,16 @@ impl RoutingStore for PgRoutingStore {
         .fetch_optional(&self.pool)
         .await?;
         let Some(r) = row else { return Ok(None) };
+        // The read path trusts the stored selector: the control plane validated it
+        // against the data-driven allow-list (PoolSet) at write time, so re-checking
+        // here would only couple the store to that config. If a pool is later
+        // removed from the allow-list, the edge route table's default cluster is the
+        // backstop (an unknown x-route-pool falls through to `application`).
         let target: String = r.get("target_pool");
-        let Some(pool) = Pool::parse(&target) else {
-            // Configuration MUST resolve to one of the finite pools (RFC §3.11);
-            // an invalid selector is a config defect, surfaced as an error rather
-            // than silently invented into a destination.
-            return Err(format!(
-                "tenant '{tenant_id}' has invalid target_pool '{target}'"
-            )
-            .into());
-        };
         Ok(Some(TenantConfig {
             tenant_id: r.get("tenant_id"),
             plan: r.get("plan"),
-            target_pool: pool,
+            target_pool: Pool::new(target),
             features: r.get::<Vec<String>, _>("features"),
             updated_at: r.get::<Option<String>, _>("updated_at"),
         }))
@@ -313,6 +325,54 @@ impl RoutingStore for PgRoutingStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("domain")).collect())
+    }
+
+    async fn get_auth_policy(&self, tenant_id: &str) -> Result<AuthPolicy, BoxError> {
+        // Point read of the tenant's rule set. No rows -> the default (pass-through)
+        // falls out of an empty `AuthPolicy`, so a tenant with no policy is public.
+        let rows = sqlx::query(
+            "SELECT path_prefix, auth_required FROM routing.auth_routes WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let rules = rows
+            .into_iter()
+            .map(|r| PathRule {
+                prefix: r.get::<String, _>("path_prefix"),
+                auth: RouteAuth { required: r.get::<bool, _>("auth_required") },
+            })
+            .collect();
+        Ok(AuthPolicy::new(rules))
+    }
+
+    async fn upsert_auth_route(
+        &self,
+        tenant_id: &str,
+        prefix: &str,
+        required: bool,
+    ) -> Result<(), BoxError> {
+        sqlx::query(
+            "INSERT INTO routing.auth_routes (tenant_id, path_prefix, auth_required, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (tenant_id, path_prefix) DO UPDATE SET \
+                 auth_required = EXCLUDED.auth_required, updated_at = now()",
+        )
+        .bind(tenant_id)
+        .bind(prefix)
+        .bind(required)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_auth_route(&self, tenant_id: &str, prefix: &str) -> Result<(), BoxError> {
+        sqlx::query("DELETE FROM routing.auth_routes WHERE tenant_id = $1 AND path_prefix = $2")
+            .bind(tenant_id)
+            .bind(prefix)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

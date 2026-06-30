@@ -11,6 +11,7 @@
 //! No vendor concretion lives here (rules §2): Postgres, Redis, and the edge
 //! transport are adapters that depend on these ports, never the reverse.
 
+pub mod auth;
 pub mod cache;
 pub mod context;
 pub mod domain;
@@ -20,5 +21,6 @@ pub mod plan;
 pub mod store;
 pub mod verify;
 
+pub use auth::{AuthPolicy, PathRule, RouteAuth};
 pub use domain::{Pool, RoutingDecision, TenantConfig};
 pub use plan::{DomainLimit, PlanLimits, QuotaExceeded};

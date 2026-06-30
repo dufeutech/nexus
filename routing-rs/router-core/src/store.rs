@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::auth::AuthPolicy;
 use crate::domain::TenantConfig;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -92,6 +93,27 @@ pub trait RoutingStore: Send + Sync {
     /// never routed, so its removal changes no resolution/authorization outcome
     /// and MUST NOT trigger an invalidation.
     async fn expire_pending_domains(&self, ttl_secs: i64) -> Result<Vec<String>, BoxError>;
+
+    // --- per-route auth policy (RFC N4) ------------------------------------- //
+
+    /// Load a tenant's route-protection policy (RFC N4). A hot-path read folded
+    /// into the router's decision miss-load. Returns the pass-through default
+    /// ([`AuthPolicy::default`]) when the tenant has no rules — absence of a
+    /// policy is "public", never an error, so no row needs to exist for a site to
+    /// work.
+    async fn get_auth_policy(&self, tenant_id: &str) -> Result<AuthPolicy, BoxError>;
+
+    /// Create or update one path-prefix rule for a tenant (control-plane write).
+    /// The per-tenant default is the rule with `prefix = "/"`.
+    async fn upsert_auth_route(
+        &self,
+        tenant_id: &str,
+        prefix: &str,
+        required: bool,
+    ) -> Result<(), BoxError>;
+
+    /// Remove one path-prefix rule (idempotent — missing is not an error).
+    async fn delete_auth_route(&self, tenant_id: &str, prefix: &str) -> Result<(), BoxError>;
 }
 
 /// The ownership-proof challenge store (RFC C4). Kept distinct from the routing
