@@ -10,8 +10,11 @@ description: >-
   strip → tenant resolve (C18) → verify credential (C1) → enrich (C2) → forward.
   Stores (PostgreSQL, optional Redis) and ZITADEL are external.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+# 0.2.0: tracks routing-plane 0.2.0 (control-plane ops-port :9401 split). The
+# combined-edge image tags default to this appVersion, so it moves with the
+# routing-plane app version — rebuild/push the first-party images at this tag.
+version: 0.2.0
+appVersion: "0.2.0"
 keywords:
   - identity
   - routing
@@ -22,7 +25,7 @@ maintainers:
   - name: edge-platform
 dependencies:
   - name: routing-plane
-    version: "0.1.0"
+    version: "0.2.0"
     repository: "file://../routing-plane"
   - name: identity-plane
     version: "0.1.0"
