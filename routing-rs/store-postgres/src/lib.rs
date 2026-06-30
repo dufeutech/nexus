@@ -13,6 +13,8 @@
 //!   (decision 14) — a missed signal self-heals within the cache staleness bound.
 //! - All access is point-read/point-write by key (no request-path scans, §3.10).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::stream::{unfold, StreamExt};
 use sqlx::pool::PoolConnection;
@@ -45,9 +47,15 @@ impl PgRoutingStore {
         // never pooled — see `PgInvalidations`.
         let opts = url
             .parse::<PgConnectOptions>()?
-            .statement_cache_capacity(0);
+            .statement_cache_capacity(0)
+            // Cap any single statement server-side so a slow/stuck query can't
+            // pin a pooled connection (and stall every coalesced waiter) forever.
+            .options([("statement_timeout", "5000")]);
         let pool = PgPoolOptions::new()
             .max_connections(8)
+            // Bound the wait for a free connection so pool exhaustion surfaces as
+            // a fast error instead of an unbounded hang on the request path.
+            .acquire_timeout(Duration::from_secs(5))
             .connect_with(opts)
             .await?;
         Ok(Self { pool })
@@ -256,18 +264,43 @@ impl RoutingStore for PgRoutingStore {
         Ok(())
     }
 
+    async fn create_pending_domain(
+        &self,
+        domain: &str,
+        tenant_id: &str,
+    ) -> Result<bool, BoxError> {
+        // INSERT ... ON CONFLICT DO NOTHING never reassigns an existing row's
+        // tenant_id, so two tenants racing the same new domain can't steal it: the
+        // loser's insert is a no-op (rows_affected == 0) and the caller resolves it
+        // as `domain_taken`. Exact (non-wildcard), unverified by construction.
+        let res = sqlx::query(
+            "INSERT INTO routing.domains (domain, tenant_id, is_wildcard, verified, updated_at) \
+             VALUES ($1, $2, false, false, now()) \
+             ON CONFLICT (domain, is_wildcard) DO NOTHING",
+        )
+        .bind(domain)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn set_domain_verified(&self, domain: &str, verified: bool) -> Result<(), BoxError> {
-        sqlx::query("UPDATE routing.domains SET verified = $2, updated_at = now() WHERE domain = $1")
-            .bind(domain)
-            .bind(verified)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE routing.domains SET verified = $2, updated_at = now() \
+             WHERE domain = $1 AND is_wildcard = false",
+        )
+        .bind(domain)
+        .bind(verified)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    async fn delete_domain(&self, domain: &str) -> Result<(), BoxError> {
-        sqlx::query("DELETE FROM routing.domains WHERE domain = $1")
+    async fn delete_domain(&self, domain: &str, wildcard: bool) -> Result<(), BoxError> {
+        sqlx::query("DELETE FROM routing.domains WHERE domain = $1 AND is_wildcard = $2")
             .bind(domain)
+            .bind(wildcard)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -281,11 +314,17 @@ impl RoutingStore for PgRoutingStore {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("domain")).collect())
     }
 
-    async fn get_domain(&self, domain: &str) -> Result<Option<DomainRecord>, BoxError> {
+    async fn get_domain(
+        &self,
+        domain: &str,
+        wildcard: bool,
+    ) -> Result<Option<DomainRecord>, BoxError> {
         let row = sqlx::query(
-            "SELECT tenant_id, is_wildcard, verified FROM routing.domains WHERE domain = $1",
+            "SELECT tenant_id, is_wildcard, verified FROM routing.domains \
+             WHERE domain = $1 AND is_wildcard = $2",
         )
         .bind(domain)
+        .bind(wildcard)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| DomainRecord {

@@ -9,19 +9,37 @@ COPY . .
 RUN cargo build --release
 
 # --- identity sidecar (hot path: ext_proc 50051, profile 9200, metrics 9202) ---
+# wget is installed for the container HEALTHCHECK (GET /healthz); the slim base
+# ships neither wget nor curl. Runs as a non-root numeric UID so Kubernetes
+# `runAsNonRoot` can verify it without a separate runAsUser.
 FROM debian:bookworm-slim AS sidecar
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 app
 COPY --from=build /app/target/release/identity-sidecar /usr/local/bin/identity-sidecar
+USER 10001
 EXPOSE 50051 9200 9202
 CMD ["identity-sidecar"]
 
 # --- sync-worker (webhook + metrics + healthz on 8080) ---
 FROM debian:bookworm-slim AS sync-worker
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 app
 COPY --from=build /app/target/release/sync-worker /usr/local/bin/sync-worker
+USER 10001
 EXPOSE 8080
 CMD ["sync-worker"]
 
 # --- reconciler (metrics on 9000) ---
 FROM debian:bookworm-slim AS reconciler
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 app
 COPY --from=build /app/target/release/reconciler /usr/local/bin/reconciler
+USER 10001
 EXPOSE 9000
 CMD ["reconciler"]

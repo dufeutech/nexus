@@ -57,7 +57,9 @@ pub trait RoutingStore: Send + Sync {
     /// Create or update a tenant config.
     async fn upsert_tenant(&self, cfg: &TenantConfig) -> Result<(), BoxError>;
 
-    /// Create or update a domain → tenant mapping.
+    /// Create or update a domain → tenant mapping. This is the **admin** write
+    /// (it may reassign ownership); the self-service declare path uses
+    /// [`RoutingStore::create_pending_domain`], which never reassigns.
     async fn upsert_domain(
         &self,
         domain: &str,
@@ -66,20 +68,40 @@ pub trait RoutingStore: Send + Sync {
         verified: bool,
     ) -> Result<(), BoxError>;
 
-    /// Set a domain's ownership-verification flag (RFC C16: verify ownership).
+    /// Atomically claim a NEW exact (non-wildcard), unverified domain for a tenant
+    /// (RFC C3 self-service declare). Returns `true` iff this call inserted the
+    /// row; `false` if a row for the domain already existed (insert was a no-op).
+    /// Crucially it MUST NOT overwrite an existing row's `tenant_id` — that closes
+    /// the declare race where two tenants claim the same domain concurrently (the
+    /// loser gets `false` and is then told `domain_taken`).
+    async fn create_pending_domain(
+        &self,
+        domain: &str,
+        tenant_id: &str,
+    ) -> Result<bool, BoxError>;
+
+    /// Set an exact (non-wildcard) domain's ownership-verification flag (RFC C16:
+    /// verify ownership). Keyed on `(domain, is_wildcard=false)` — the lifecycle
+    /// only ever verifies exact self-service domains, never a wildcard row.
     async fn set_domain_verified(&self, domain: &str, verified: bool) -> Result<(), BoxError>;
 
-    /// Remove a domain mapping (idempotent — missing is not an error).
-    async fn delete_domain(&self, domain: &str) -> Result<(), BoxError>;
+    /// Remove a domain mapping (idempotent — missing is not an error). `wildcard`
+    /// selects which row of the `(domain, is_wildcard)` pair to drop.
+    async fn delete_domain(&self, domain: &str, wildcard: bool) -> Result<(), BoxError>;
 
     /// The domains owned by a tenant — used by the control plane to publish the
     /// precise invalidations for a tenant-config change.
     async fn domains_for_tenant(&self, tenant_id: &str) -> Result<Vec<String>, BoxError>;
 
-    /// Read a domain row regardless of verification state (RFC C3): lets the
-    /// lifecycle detect a cross-tenant claim and an idempotent re-declare. `None`
-    /// if the domain is unknown.
-    async fn get_domain(&self, domain: &str) -> Result<Option<DomainRecord>, BoxError>;
+    /// Read one domain row regardless of verification state (RFC C3): lets the
+    /// lifecycle detect a cross-tenant claim and an idempotent re-declare. Keyed
+    /// on `(domain, is_wildcard)` so a same-name wildcard row can never be read in
+    /// place of the exact self-service row. `None` if that row is unknown.
+    async fn get_domain(
+        &self,
+        domain: &str,
+        wildcard: bool,
+    ) -> Result<Option<DomainRecord>, BoxError>;
 
     /// Count the domains a tenant holds — **verified plus pending** (RFC C3/I6),
     /// the figure the quota gate compares against the plan limit.

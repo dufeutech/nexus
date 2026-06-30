@@ -34,7 +34,7 @@ use tokio::time::sleep;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use envoy_types::pb::envoy::config::core::v3::{
     header_value_option::HeaderAppendAction, HeaderValue, HeaderValueOption,
@@ -248,9 +248,16 @@ impl Sidecar {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             let (sub, token_roles, authenticated) = extract_identity(&req);
-            let profile = self.state.resolve(&sub).await;
+            // Don't touch the store for unauthenticated requests: the subject is
+            // "anonymous" (no credential), which is never a stored profile — so a
+            // lookup is a guaranteed miss that needlessly loads the pool on
+            // high-volume anonymous traffic (and is not negatively cached).
+            let profile = if authenticated { self.state.resolve(&sub).await } else { None };
             let result = if profile.is_some() { "hit" } else { "miss" };
-            info!(sub = %sub, anonymous = !authenticated, hit = profile.is_some(), token_roles = token_roles.len(), "enrich");
+            // `sub` is a user identifier (PII): keep it out of per-request info
+            // logs (enable debug for the subject when diagnosing a specific user).
+            debug!(sub = %sub, "enrich subject");
+            info!(anonymous = !authenticated, hit = profile.is_some(), token_roles = token_roles.len(), "enrich");
             (enrich_response(&sub, &token_roles, profile, authenticated), result)
         } else {
             warn!("not ready -> 503");

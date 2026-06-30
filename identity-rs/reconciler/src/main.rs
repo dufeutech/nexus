@@ -73,6 +73,11 @@ struct Idp {
     host: String,
     pat: String,
     page: u64,
+    /// Safety cap on pages fetched per list (so a runaway/loop can't spin
+    /// forever). Hitting it means the enumeration is INCOMPLETE — callers must
+    /// then suppress deletions/role-downgrades, never treat a short read as
+    /// proof of absence.
+    max_pages: u64,
 }
 
 impl Idp {
@@ -89,21 +94,41 @@ impl Idp {
             .await
     }
 
-    async fn list_users(&self) -> Result<Vec<Value>, reqwest::Error> {
-        let r = self.post("/v2/users", json!({"query": {"limit": self.page}})).await?;
-        Ok(r.get("result").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+    /// Page through a `query: {offset, limit}` list endpoint, accumulating
+    /// `result[]`. Returns `(rows, complete)`; `complete = false` means the
+    /// page cap was hit before the list was exhausted (so absence is unproven).
+    async fn list_paged(&self, path: &str) -> Result<(Vec<Value>, bool), reqwest::Error> {
+        let page = self.page.max(1);
+        let mut all = Vec::new();
+        let mut offset = 0_u64;
+        for _ in 0..self.max_pages {
+            let r = self
+                .post(path, json!({"query": {"offset": offset, "limit": page}}))
+                .await?;
+            let batch = r.get("result").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let n = batch.len() as u64;
+            all.extend(batch);
+            if n < page {
+                return Ok((all, true)); // short page ⇒ list exhausted.
+            }
+            offset += n;
+        }
+        Ok((all, false)) // page cap hit ⇒ incomplete.
     }
 
-    /// userId -> sorted roleKeys. Best-effort: on failure, roles are not
-    /// reconciled this pass (logged), matching the prior behavior.
-    async fn list_grants(&self) -> HashMap<String, Vec<String>> {
+    /// All authoritative users. `(users, complete)` — see [`Idp::list_paged`].
+    async fn list_users(&self) -> Result<(Vec<Value>, bool), reqwest::Error> {
+        self.list_paged("/v2/users").await
+    }
+
+    /// userId -> sorted roleKeys, fully paged. `(grants, complete)`; on request
+    /// failure returns an empty map with `complete = false` so roles are not
+    /// downgraded this pass (preserves the prior best-effort behavior).
+    async fn list_grants(&self) -> (HashMap<String, Vec<String>>, bool) {
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        match self
-            .post("/management/v1/users/grants/_search", json!({"query": {"limit": self.page}}))
-            .await
-        {
-            Ok(r) => {
-                for g in r.get("result").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let complete = match self.list_paged("/management/v1/users/grants/_search").await {
+            Ok((rows, complete)) => {
+                for g in rows {
                     if let Some(uid) = g.get("userId").and_then(|v| v.as_str()) {
                         let roles: Vec<String> = g
                             .get("roleKeys")
@@ -113,20 +138,24 @@ impl Idp {
                         out.entry(uid.to_owned()).or_default().extend(roles);
                     }
                 }
+                complete
             }
-            Err(e) => warn!(error = %e, "grant search failed; roles not reconciled this pass"),
-        }
+            Err(e) => {
+                warn!(error = %e, "grant search failed; roles not reconciled this pass");
+                false
+            }
+        };
         for v in out.values_mut() {
             v.sort();
             v.dedup();
         }
-        out
+        (out, complete)
     }
 }
 
 async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> Result<(), BoxError> {
-    let users = idp.list_users().await?;
-    let grants = idp.list_grants().await;
+    let (users, users_complete) = idp.list_users().await?;
+    let (grants, grants_complete) = idp.list_grants().await;
 
     // One scan of stored profiles (this shard's keyspace at scale); diff against
     // the authoritative list and derive orphans from the same snapshot.
@@ -145,25 +174,36 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
             continue;
         }
         authoritative.insert(uid.to_owned());
-        let desired = build_profile_from_user(u, grants.get(uid).cloned().unwrap_or_default());
+        // Roles: prefer the fetched grants. If the grant enumeration was
+        // INCOMPLETE and this user had no fetched grant, we cannot prove they
+        // have no roles — carry the stored roles forward rather than wiping them
+        // (a user on users-page-1 whose grant fell on an unreached grant-page).
+        let roles = match grants.get(uid) {
+            Some(r) => r.clone(),
+            None if !grants_complete => {
+                stored.get(uid).map(|p| p.roles.clone()).unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        let desired = build_profile_from_user(u, roles);
         if differs(&desired, stored.get(uid)) {
             store.put(&desired).await?;
             upserted += 1;
         }
     }
 
-    // Orphan deletes: only safe when the (sharded) list was complete — a page
-    // shortfall can't prove absence, so deletions are skipped that pass.
+    // Orphan deletes: only safe when the (sharded) user list was complete — a
+    // page-cap shortfall can't prove absence, so deletions are skipped that pass.
     let mut deleted = 0_u64;
-    if users.len() as u64 >= idp.page {
-        warn!(page = idp.page, "user list hit page limit; skipping deletions this pass");
-    } else {
+    if users_complete {
         for k in stored.keys() {
             if shard.owns(k) && !authoritative.contains(k) {
                 store.delete(k).await?;
                 deleted += 1;
             }
         }
+    } else {
+        warn!(page = idp.page, max_pages = idp.max_pages, "user list incomplete (page cap); skipping deletions this pass");
     }
 
     gauge!("reconcile_scanned").set(users.len() as f64);
@@ -220,6 +260,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         host: env("ZITADEL_HOST", "localhost:8088"),
         pat,
         page: env_num("RECONCILE_PAGE_LIMIT", 1000_u64),
+        // Cap pages/list so a misbehaving feed can't spin forever; default
+        // 1000 pages × 1000/page = 1M identities before a pass declares itself
+        // incomplete (and conservatively skips deletions). Raise for >1M tenants.
+        max_pages: env_num("RECONCILE_MAX_PAGES", 1000_u64).max(1),
     };
 
     // The reconciler is an authoritative writer, so it owns idempotent schema

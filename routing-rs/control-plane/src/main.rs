@@ -18,7 +18,7 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -268,7 +268,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
             .into_response();
     }
 
-    match s.store.get_domain(&domain).await {
+    match s.store.get_domain(&domain, false).await {
         // Owned (verified or pending) by another tenant — never grant a second claim.
         Ok(Some(rec)) if rec.tenant_id != body.tenant_id => {
             return (StatusCode::CONFLICT, Json(json!({ "error": "domain_taken", "domain": domain })))
@@ -316,11 +316,32 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
                 )
                     .into_response();
             }
-            // Create the PENDING (unverified) row. A pending domain never routes,
-            // so NO invalidation is published (RFC C6: only outcome-changing
-            // mutations announce on the feed).
-            if let Err(e) = s.store.upsert_domain(&domain, &body.tenant_id, false, false).await {
-                return internal(e);
+            // Create the PENDING (unverified) row atomically. A pending domain
+            // never routes, so NO invalidation is published (RFC C6: only
+            // outcome-changing mutations announce on the feed). `create_pending_domain`
+            // is INSERT ... ON CONFLICT DO NOTHING, so it never reassigns ownership:
+            // if a concurrent declare for the same domain won the race between our
+            // ownership check above and here, our insert is a no-op and we resolve
+            // the conflict by re-reading the current owner (closes the declare TOCTOU).
+            match s.store.create_pending_domain(&domain, &body.tenant_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    match s.store.get_domain(&domain, false).await {
+                        // Another tenant claimed it first — never a second claim.
+                        Ok(Some(rec)) if rec.tenant_id != body.tenant_id => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(json!({ "error": "domain_taken", "domain": domain })),
+                            )
+                                .into_response();
+                        }
+                        // Ours now (idempotent concurrent re-declare) — fall through
+                        // to the shared challenge mint below.
+                        Ok(_) => {}
+                        Err(e) => return internal(e),
+                    }
+                }
+                Err(e) => return internal(e),
             }
         }
         Err(e) => return internal(e),
@@ -365,7 +386,7 @@ async fn verify_one(s: &App, domain: &str) -> VerifyOutcome {
         Ok(None) => {
             // No live challenge: either already verified (challenge retired) or
             // never declared.
-            return match s.store.get_domain(domain).await {
+            return match s.store.get_domain(domain, false).await {
                 Ok(Some(rec)) if rec.verified => VerifyOutcome::AlreadyVerified,
                 Ok(_) => VerifyOutcome::NoChallenge,
                 Err(e) => VerifyOutcome::Error(e),
@@ -499,9 +520,21 @@ async fn verification_poll(app: App, interval_secs: u64) {
     }
 }
 
-async fn delete_domain(State(s): State<App>, Path(domain): Path<String>) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct DeleteDomainQuery {
+    /// Which row of the `(domain, is_wildcard)` pair to drop. Defaults to the
+    /// exact (non-wildcard) row, which is what self-service domains always are.
+    #[serde(default)]
+    wildcard: bool,
+}
+
+async fn delete_domain(
+    State(s): State<App>,
+    Path(domain): Path<String>,
+    Query(q): Query<DeleteDomainQuery>,
+) -> impl IntoResponse {
     let domain = normalize_host(&domain);
-    if let Err(e) = s.store.delete_domain(&domain).await {
+    if let Err(e) = s.store.delete_domain(&domain, q.wildcard).await {
         error!(error = %e, "delete failed");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
             .into_response();

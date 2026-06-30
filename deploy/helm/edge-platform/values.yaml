@@ -107,6 +107,10 @@ compose:
 # Pod hardening for the combined edge containers.
 podSecurityContext:
   runAsNonRoot: true
+  # Matches the non-root UID baked into the first-party images (Dockerfile
+  # `USER 10001`); the Envoy image also runs fine as an arbitrary non-root UID.
+  runAsUser: 10001
+  runAsGroup: 10001
   seccompProfile:
     type: RuntimeDefault
 securityContext:

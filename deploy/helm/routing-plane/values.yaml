@@ -214,6 +214,10 @@ metrics:
 # control-plane). All workloads here are stateless; the stores are external.
 podSecurityContext:
   runAsNonRoot: true
+  # Matches the non-root UID baked into the images (Dockerfile `USER 10001`), so
+  # the kubelet can verify runAsNonRoot and the pod is admitted.
+  runAsUser: 10001
+  runAsGroup: 10001
   seccompProfile:
     type: RuntimeDefault
 securityContext:

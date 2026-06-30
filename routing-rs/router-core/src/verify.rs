@@ -18,9 +18,27 @@ pub fn challenge_name(domain: &str) -> String {
 /// Whether any published proof record carries the expected token. Pure, total,
 /// deterministic: trims surrounding whitespace, requires an exact value match —
 /// no substring or prefix acceptance (RFC C4: the proof must be the token).
+/// The per-record comparison is constant-time in the token bytes (defense in
+/// depth — the token is a server-minted secret, even though it is compared
+/// against attacker-published DNS).
 #[must_use]
 pub fn token_matches(records: &[String], token: &str) -> bool {
-    !token.is_empty() && records.iter().any(|r| r.trim() == token)
+    !token.is_empty() && records.iter().any(|r| ct_eq(r.trim(), token))
+}
+
+/// Constant-time byte-equality (no early return on first mismatch). Length is
+/// not secret here (the token length is fixed and known), so an early
+/// length-mismatch return is fine.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Resolve the ownership-proof records published at a name (RFC C4). Implemented

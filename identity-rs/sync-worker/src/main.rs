@@ -95,33 +95,43 @@ async fn webhook(State(s): State<App>, headers: HeaderMap, body: Bytes) -> impl 
         Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
     };
 
-    let result = match classify(&event) {
-        Classify::Ignore => "ignore-non-user",
-        Classify::NoSubject => "no-user-id",
-        Classify::Event(ev) => {
-            // Fetch existing under the version guard, then apply (shared logic).
-            let existing = s.store.get(&ev.sub).await.ok().flatten();
-            match apply(existing, &ev) {
-                Apply::SkipStale => "skip-stale",
-                Apply::Delete => {
-                    let _ = s.store.delete(&ev.sub).await;
-                    "delete"
-                }
-                Apply::Upsert(profile) => match s.store.put(&profile).await {
-                    Ok(()) => "upsert",
+    let (status, result) = match classify(&event) {
+        Classify::Ignore => (StatusCode::OK, "ignore-non-user"),
+        Classify::NoSubject => (StatusCode::OK, "no-user-id"),
+        Classify::Event(ev) => match s.store.get(&ev.sub).await {
+            // A read ERROR is NOT "absent": collapsing it to None would skip the
+            // stale-write guard and let an older event clobber a newer stored
+            // profile. Fail the delivery (503) so the write is not applied blind.
+            Err(e) => {
+                warn!(error = %e, sub = %ev.sub, "store get failed");
+                (StatusCode::SERVICE_UNAVAILABLE, "error-read")
+            }
+            Ok(existing) => match apply(existing, &ev) {
+                Apply::SkipStale => (StatusCode::OK, "skip-stale"),
+                // Store write failures return 503 (the IdP does not retry, but a
+                // 5xx is honest and the reconciler heals the gap).
+                Apply::Delete => match s.store.delete(&ev.sub).await {
+                    Ok(()) => (StatusCode::OK, "delete"),
                     Err(e) => {
-                        warn!(error = %e, sub = %ev.sub, "store put failed");
-                        "error"
+                        warn!(error = %e, sub = %ev.sub, "store delete failed");
+                        (StatusCode::SERVICE_UNAVAILABLE, "error-delete")
                     }
                 },
-            }
-        }
+                Apply::Upsert(profile) => match s.store.put(&profile).await {
+                    Ok(()) => (StatusCode::OK, "upsert"),
+                    Err(e) => {
+                        warn!(error = %e, sub = %ev.sub, "store put failed");
+                        (StatusCode::SERVICE_UNAVAILABLE, "error-upsert")
+                    }
+                },
+            },
+        },
     };
 
     counter!("sync_events_total", "result" => result).increment(1);
     gauge!("sync_last_event_timestamp_seconds").set(now_secs());
     info!(event_type = %event.get("event_type").and_then(|v| v.as_str()).unwrap_or(""), result, "handled");
-    axum::Json(json!({ "result": result })).into_response()
+    (status, axum::Json(json!({ "result": result }))).into_response()
 }
 
 async fn metrics_handler(State(s): State<App>) -> impl IntoResponse {

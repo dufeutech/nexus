@@ -4,8 +4,23 @@
 //! key, with NO I/O — so the resolver, the control plane, and the tests all
 //! agree on "what the cache/store key is."
 
-/// Canonicalize a request host to its store/cache key: lowercased, trailing dot
-/// removed, port removed. Total and deterministic (RFC §3.9 invariant).
+/// Canonicalize a request host to its store/cache key: lowercased, a single
+/// trailing dot removed, port removed. Total and deterministic (RFC §3.9
+/// invariant).
+///
+/// Returns the **empty string** for any host that is not a valid, canonical
+/// routing key — which the resolver and the cert-authorization gate both treat
+/// as "no match" (fail closed). This is the load-bearing security property of
+/// this function: the gate and the router share one key, so a host that cannot
+/// be reduced to a single canonical form must not be reduced to *a* form (a
+/// mismatch is exactly the "cert issued, then 404 / look-alike routes" failure).
+///
+/// Rejected (→ ""): embedded control characters or whitespace, empty labels
+/// (`.x.com`, `a..b`, multiple trailing dots), and any non-ASCII byte. Internet
+/// hostnames reach us as ASCII A-labels (TLS SNI is always an A-label, and Hosts
+/// for IDNs are punycode), so a raw-Unicode host has no single canonical key
+/// here and is refused rather than guessed at — callers that need IDN must
+/// present the already-encoded `xn--…` form.
 #[must_use]
 pub fn normalize_host(raw: &str) -> String {
     let h = raw.trim();
@@ -31,7 +46,36 @@ pub fn normalize_host(raw: &str) -> String {
         // Bracketed IPv6: `[::1]` or `[::1]:8080` → the address inside the brackets.
         |rest| rest.split_once(']').map_or(h, |(addr, _)| addr),
     );
-    host.trim_end_matches('.').to_ascii_lowercase()
+    // Strip at most ONE trailing (root-indicating) dot — a second one would leave
+    // an empty final label, which `is_valid_host_key` then rejects.
+    let key = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if is_valid_host_key(&key) {
+        key
+    } else {
+        String::new()
+    }
+}
+
+/// Whether a lowercased, port-stripped key is a valid canonical routing key.
+/// LDH-plus-dot for DNS names (no empty labels), or a hex/colon IPv6 literal;
+/// never any control char, whitespace, or non-ASCII byte.
+fn is_valid_host_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    // No control chars, no whitespace, no non-ASCII (DEL/0x7f and up rejected).
+    if key.bytes().any(|b| b <= 0x20 || b >= 0x7f) {
+        return false;
+    }
+    // IPv6 literal (the only key that legitimately contains a colon): hex + colon.
+    if key.contains(':') {
+        return key.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+    }
+    // DNS name: no empty labels, and every char is letter/digit/hyphen/dot.
+    if key.split('.').any(str::is_empty) {
+        return false;
+    }
+    key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 /// The parent domain used for the single wildcard fallback lookup (RFC C14 /
@@ -73,5 +117,44 @@ mod tests {
     fn normalize_is_idempotent() {
         let once = normalize_host("Shop.Acme.Example.:8080");
         assert_eq!(once, normalize_host(&once));
+    }
+
+    #[test]
+    fn rejects_control_chars_and_whitespace() {
+        // Interior whitespace/control bytes must not survive into a routing key.
+        assert_eq!(normalize_host("exa\tmple.com"), "");
+        assert_eq!(normalize_host("acme\n.example.com"), "");
+        assert_eq!(normalize_host("ex ample.com"), "");
+        assert_eq!(normalize_host("nul\0.com"), "");
+    }
+
+    #[test]
+    fn rejects_non_ascii_unicode_hosts() {
+        // Raw Unicode has no single canonical key here — only the encoded
+        // A-label (`xn--…`) routes, which passes the LDH check.
+        assert_eq!(normalize_host("examplé.com"), "");
+        assert_eq!(normalize_host("EXAMPLÉ.com"), "");
+        assert_eq!(normalize_host("xn--exampl-gva.com"), "xn--exampl-gva.com");
+    }
+
+    #[test]
+    fn rejects_empty_labels_and_extra_trailing_dots() {
+        assert_eq!(normalize_host(".example.com"), ""); // leading empty label
+        assert_eq!(normalize_host("a..b.com"), ""); // interior empty label
+        assert_eq!(normalize_host("example.com.."), ""); // 2nd trailing dot → empty label
+        assert_eq!(normalize_host("example.com."), "example.com"); // single root dot ok
+    }
+
+    #[test]
+    fn rejects_userinfo_and_stray_at() {
+        // `user:pass@host` and any `@` are not valid hosts.
+        assert_eq!(normalize_host("user:pass@host.com"), "");
+        assert_eq!(normalize_host("foo@example.com"), "");
+    }
+
+    #[test]
+    fn ipv6_literal_still_valid() {
+        assert_eq!(normalize_host("[2001:db8::1]:8443"), "2001:db8::1");
+        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
     }
 }

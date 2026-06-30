@@ -71,9 +71,17 @@ impl PgProfileStore {
         // Disable sqlx's prepared-statement cache so the pool is safe through a
         // transaction-mode pooler; every query here is a trivial point read/write,
         // so the cache buys nothing (same rationale as the routing store).
-        let opts = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
+        let opts = url
+            .parse::<PgConnectOptions>()?
+            .statement_cache_capacity(0)
+            // Cap any single statement server-side so a slow/stuck query can't
+            // pin a pooled connection (and stall coalesced waiters) forever.
+            .options([("statement_timeout", "5000")]);
         let pool = PgPoolOptions::new()
             .max_connections(8)
+            // Bound the wait for a free connection so pool exhaustion surfaces as
+            // a fast error instead of an unbounded hang on the request path.
+            .acquire_timeout(Duration::from_secs(5))
             .connect_with(opts)
             .await?;
         Ok(Self {

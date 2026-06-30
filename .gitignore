@@ -126,9 +126,8 @@ target/
 debug/
 **/*.rs.bk
 *.pdb
-Cargo.lock
-# NOTE: keep Cargo.lock for binary crates (remove line above)
-# only gitignore Cargo.lock for library crates
+# Cargo.lock IS committed: these workspaces ship binaries/services, so a pinned
+# lockfile is required for reproducible builds and a meaningful `cargo deny`.
 
 # ============================================
 # Python

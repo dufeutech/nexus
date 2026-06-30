@@ -41,9 +41,67 @@ jobs:
         with:
           workspaces: ${{ matrix.workspace }}
 
+      # --locked: build/test against the committed Cargo.lock so CI is
+      # reproducible and fails if the lockfile is stale (it is committed).
       - name: Test
         working-directory: ${{ matrix.workspace }}
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
+
+  clippy:
+    name: clippy (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workspace: identity-rs, protoc: true }
+          - { workspace: routing-rs,  protoc: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        if: ${{ matrix.protoc }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.workspace }}
+
+      # The workspaces set lint levels to `deny` in [workspace.lints], with a
+      # deliberate "burn-down" subset held at `warn`. Plain clippy therefore
+      # already fails on any deny-level violation. We intentionally do NOT pass
+      # `-D warnings` — that would promote the burn-down warnings to errors and
+      # defeat the staged cleanup.
+      - name: Clippy
+        working-directory: ${{ matrix.workspace }}
+        run: cargo clippy --all-targets --locked
+
+  cargo-deny:
+    name: cargo-deny (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [identity-rs, routing-rs]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Enforces the root deny.toml: advisories (RUSTSEC), license allow-list,
+      # banned crates, and source allow-list. --locked checks the committed lock.
+      - name: Deny check
+        working-directory: ${{ matrix.workspace }}
+        run: cargo deny --locked check
 
   helm-lint:
     name: helm lint + template
