@@ -20,7 +20,9 @@ USER 10001
 EXPOSE 50052 9300 9302
 CMD ["tenant-router"]
 
-# --- control-plane (admin API + metrics on 9400) ---
+# --- control-plane (admin API on 9400; ops /metrics + /healthz on 9401) ---
+# /metrics is on a SEPARATE port from the admin API so a NetworkPolicy can allow
+# scrapers/kubelet to ops WITHOUT granting them the broker-only admin API (RFC C16).
 FROM debian:bookworm-slim AS control-plane
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
@@ -28,5 +30,5 @@ RUN apt-get update \
     && useradd -r -u 10001 app
 COPY --from=build /app/target/release/control-plane /usr/local/bin/control-plane
 USER 10001
-EXPOSE 9400
+EXPOSE 9400 9401
 CMD ["control-plane"]

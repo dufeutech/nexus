@@ -63,13 +63,20 @@ spec:
               value: "true"
             {{- end }}
           ports:
+            # admin: the broker-only data API (RFC C16). ops: /metrics + /healthz,
+            # on a SEPARATE port so the NetworkPolicy can open scraping/probes
+            # without exposing the admin API.
             - { name: admin, containerPort: 9400 }
+            - { name: ops, containerPort: 9401 }
+          # Probe the ops port, NOT admin: the broker-only policy on :9400 can block
+          # node-sourced kubelet traffic on stricter CNIs, which would CrashLoop the
+          # pod. The ops port is independently opened to probes (allowProbesFrom).
           readinessProbe:
-            httpGet: { path: /healthz, port: admin }
+            httpGet: { path: /healthz, port: ops }
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
-            httpGet: { path: /healthz, port: admin }
+            httpGet: { path: /healthz, port: ops }
             initialDelaySeconds: 10
             periodSeconds: 10
           resources: {{- toYaml .Values.controlPlane.resources | nindent 12 }}
@@ -96,6 +103,7 @@ spec:
     {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
   ports:
     - { name: admin, port: 9400, targetPort: admin, protocol: TCP }
+    - { name: ops, port: 9401, targetPort: ops, protocol: TCP }
 {{- if .Values.controlPlane.ingress.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

@@ -169,20 +169,41 @@ controlPlane:
   # this and set allowFrom to your broker's peer selector to ENFORCE that at the
   # network layer, so a leaked token alone can't reach the port. Ingress-only —
   # egress (Postgres / DNS) is unaffected. Requires a CNI that enforces
-  # NetworkPolicy. NOTE: kubelet health probes come from the node and are not
-  # subject to NetworkPolicy on common CNIs, so liveness/readiness keep working.
+  # NetworkPolicy.
+  #
+  # /metrics and /healthz are served on a SEPARATE ops port (:9401), NOT :9400, so
+  # scrapers and kubelet probes are allowed onto ops WITHOUT being granted the
+  # broker-only admin API. The chart fails closed: if you enable a ServiceMonitor
+  # or the admin Ingress without the matching allow-list below, render is refused
+  # rather than silently dropping scrapes / locking out the admin Ingress.
   networkPolicy:
     enabled: false
     # REQUIRED when enabled: standard NetworkPolicyPeer entries (podSelector /
-    # namespaceSelector / ipBlock) identifying the broker(s) allowed to reach :9400.
-    # Empty while enabled => the chart refuses to render (so you can't silently lock
-    # the broker out). Example:
+    # namespaceSelector / ipBlock) identifying the broker(s) allowed to reach the
+    # admin API on :9400. Empty while enabled => the chart refuses to render (so you
+    # can't silently lock the broker out). Example:
     #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: brokers } }
     #     podSelector: { matchLabels: { app: domain-broker } }
     allowFrom: []
-    # OPTIONAL: peers allowed to scrape /metrics on :9400 (e.g. your Prometheus).
-    # Empty => the policy blocks scraping; add your monitoring peer to keep it.
+    # REQUIRED when metrics.serviceMonitor.enabled: peers allowed to scrape /metrics
+    # on the ops port :9401 (e.g. your Prometheus). Empty WHILE a ServiceMonitor is
+    # enabled => the chart refuses to render (so scrapes can't be silently dropped).
+    # Leaving the ServiceMonitor disabled keeps this optional.
     allowMetricsFrom: []
+    # REQUIRED when controlPlane.ingress.enabled: the ingress-controller peer
+    # allowed to reach the admin API on :9400 (it proxies the admin Ingress through
+    # to the pod). Empty WHILE the admin Ingress is enabled => the chart refuses to
+    # render (so the broker-only rule can't silently deny the Ingress). Example:
+    #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+    #     podSelector: { matchLabels: { app.kubernetes.io/name: ingress-nginx } }
+    allowIngressControllerFrom: []
+    # OPTIONAL: node/kubelet source allowed to reach health probes on the ops port
+    # :9401. Most CNIs exempt node-origin traffic from NetworkPolicy, so this is
+    # empty by default. On CNIs that DO police node traffic (e.g. Cilium host
+    # firewall, some Calico configs) probes would be dropped — set your node CIDR to
+    # keep liveness/readiness working. Example:
+    #   - ipBlock: { cidr: 10.0.0.0/16 }
+    allowProbesFrom: []
 
 # -------------------------------------------------------------------------- #
 # Postgres — the authoritative routing store (control-plane-written, cache

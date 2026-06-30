@@ -160,7 +160,8 @@ services:
     environment:
       ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
     ports:
-      - "9400:9400"   # admin API (domains/tenants) + metrics + healthz
+      - "9400:9400"   # admin API (domains/tenants) + healthz
+      - "9401:9401"   # ops: /metrics + /healthz (scraped by Prometheus)
     depends_on:
       postgres:
         condition: service_healthy

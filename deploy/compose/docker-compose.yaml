@@ -69,6 +69,9 @@ services:
       CONTROL_AUTH_DISABLED: ${CONTROL_AUTH_DISABLED:-}
     ports:
       - "127.0.0.1:9400:9400"   # bound to loopback: admin boundary only
+      # Ops (/metrics + /healthz) is on :9401 — kept OFF the admin port so a scraper
+      # can't reach the admin API. Reach it in-network; publish only if you scrape
+      # from the host, e.g.:  - "127.0.0.1:9401:9401"
 
   # --- Identity plane ------------------------------------------------------- #
   # The enrichment hot path (ext_proc). Reads the EXTERNAL Postgres identity store

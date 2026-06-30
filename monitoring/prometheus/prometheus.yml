@@ -31,8 +31,9 @@ scrape_configs:
 
   - job_name: control-plane
     metrics_path: /metrics
+    # Metrics are on the ops port :9401, kept off the admin API port :9400.
     static_configs:
-      - targets: ["control-plane:9400"]
+      - targets: ["control-plane:9401"]
 
   - job_name: prometheus
     static_configs:

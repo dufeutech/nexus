@@ -2,7 +2,8 @@
 {{- $fullName := include "routing-plane.fullname" . -}}
 {{- $labels := .Values.metrics.serviceMonitor.labels -}}
 {{- $interval := .Values.metrics.serviceMonitor.interval -}}
-# Control-plane metrics are on its admin Service (:9400 /metrics).
+# Control-plane metrics are on the dedicated ops port (:9401 /metrics), kept OFF
+# the broker-only admin port (:9400) so a scrape peer can't reach the admin API.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -15,7 +16,7 @@ spec:
     matchLabels:
       {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
   endpoints:
-    - { port: admin, path: /metrics, interval: {{ $interval | quote }} }
+    - { port: ops, path: /metrics, interval: {{ $interval | quote }} }
 ---
 # The tenant-router latency histogram + cache/ready gauges are on a pod port
 # (:9302) deliberately kept off the edge Service, so they are scraped as pod

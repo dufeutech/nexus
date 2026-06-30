@@ -799,21 +799,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
-    let router = data
-        // Liveness + scrape stay open (no token).
-        .route("/metrics", get(metrics_handler))
+    // Admin API (:9400) — the data endpoints behind the token gate, plus /healthz
+    // for liveness. /metrics is deliberately NOT served here: it would share the
+    // port with the admin API, and an L4 NetworkPolicy cannot allow a scrape peer
+    // to reach /metrics WITHOUT also granting it the admin endpoints — punching a
+    // hole in the broker-only guarantee (RFC C16) for every metrics peer. /metrics
+    // moves to the separate ops port below so the policy can gate the two
+    // independently (admin = broker-only; ops = scrapers + kubelet).
+    let admin = data
+        // Liveness stays open (no token), kept on the admin port so existing
+        // tooling/healthchecks that target :9400 keep working.
         .route("/healthz", get(healthz))
         // These are small JSON admin bodies; cap the request body so a malformed
         // or hostile caller can't force an unbounded buffer (defense-in-depth).
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(app.clone());
+
+    // Ops surface (:9401) — /metrics for scrapers and /healthz for kubelet probes.
+    // Carries nothing sensitive and no mutation, so the NetworkPolicy can open it
+    // to Prometheus (and the node, for probes) without exposing the admin API.
+    let ops = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(healthz))
         .with_state(app);
 
-    let listener = TcpListener::bind("0.0.0.0:9400").await?;
-    info!("control plane on :9400 (/tenants, /tenants/:id/auth-routes, /domains, /domains/declare, /metrics, /healthz)");
-    if let Err(e) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
+    let admin_listener = TcpListener::bind("0.0.0.0:9400").await?;
+    let ops_listener = TcpListener::bind("0.0.0.0:9401").await?;
+    info!(
+        "control plane: admin on :9400 (/tenants, /tenants/:id/auth-routes, /domains, /domains/declare, /healthz); \
+         ops on :9401 (/metrics, /healthz)"
+    );
+    // Serve both concurrently; either erroring (or a shutdown signal) brings the
+    // process down so the kubelet restarts it cleanly.
+    let admin_srv = axum::serve(admin_listener, admin).with_graceful_shutdown(shutdown_signal());
+    let ops_srv = axum::serve(ops_listener, ops).with_graceful_shutdown(shutdown_signal());
+    if let Err(e) = tokio::try_join!(admin_srv, ops_srv) {
         error!(error = %e, "server error");
     }
     info!("stopped");

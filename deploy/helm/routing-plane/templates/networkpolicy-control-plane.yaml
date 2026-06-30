@@ -1,11 +1,21 @@
 {{- if .Values.controlPlane.networkPolicy.enabled }}
-{{- if not .Values.controlPlane.networkPolicy.allowFrom }}
-{{- fail "controlPlane.networkPolicy.enabled but controlPlane.networkPolicy.allowFrom is empty — specify the broker peer(s) allowed to reach :9400 (or set controlPlane.networkPolicy.enabled=false)" }}
+{{- $np := .Values.controlPlane.networkPolicy }}
+{{- if not $np.allowFrom }}
+{{- fail "controlPlane.networkPolicy.enabled but controlPlane.networkPolicy.allowFrom is empty — specify the broker peer(s) allowed to reach the admin API on :9400 (or set controlPlane.networkPolicy.enabled=false)" }}
+{{- end }}
+{{- if and .Values.metrics.serviceMonitor.enabled (not $np.allowMetricsFrom) }}
+{{- fail "controlPlane.networkPolicy.enabled with metrics.serviceMonitor.enabled but controlPlane.networkPolicy.allowMetricsFrom is empty — specify the scrape peer(s) allowed to reach /metrics on the ops port :9401, or the policy would silently drop Prometheus (set allowMetricsFrom, or disable metrics.serviceMonitor)" }}
+{{- end }}
+{{- if and .Values.controlPlane.ingress.enabled (not $np.allowIngressControllerFrom) }}
+{{- fail "controlPlane.networkPolicy.enabled with controlPlane.ingress.enabled but controlPlane.networkPolicy.allowIngressControllerFrom is empty — specify the ingress-controller peer allowed to reach the admin API on :9400, or the broker-only rule would deny the admin Ingress (set allowIngressControllerFrom, or disable controlPlane.ingress)" }}
 {{- end }}
 # Broker-only reachability for the control-plane admin API (RFC C16). Default-deny
-# ingress to :9400; only the configured broker peer(s) (and optional metrics
-# scrapers) may connect. This enforces, at the network layer, the rule the
-# shared-token auth assumes: tenants never reach the control plane directly.
+# ingress; only the configured broker peer(s) may reach the admin API on :9400.
+# This enforces, at the network layer, the rule the shared-token auth assumes:
+# tenants never reach the control plane directly. /metrics + /healthz live on a
+# SEPARATE ops port (:9401), so scrapers and kubelet can be allowed there WITHOUT
+# being granted the admin API — closing the metrics-shaped hole a single shared
+# port could not (a scrape peer on :9400 could also POST the admin endpoints).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -18,16 +28,35 @@ spec:
       {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
   policyTypes: [Ingress]
   ingress:
-    # The broker(s) allowed to use the admin API.
+    # The broker(s) allowed to use the admin API on :9400.
     - from:
-        {{- toYaml .Values.controlPlane.networkPolicy.allowFrom | nindent 8 }}
+        {{- toYaml $np.allowFrom | nindent 8 }}
       ports:
         - { protocol: TCP, port: 9400 }
-    {{- with .Values.controlPlane.networkPolicy.allowMetricsFrom }}
-    # Metrics scrapers (Prometheus) — /metrics is served on the same :9400 port.
+    {{- with $np.allowIngressControllerFrom }}
+    # The ingress controller fronting the OPTIONAL admin Ingress also needs the
+    # admin API on :9400 (it proxies admin requests through to the pod).
     - from:
         {{- toYaml . | nindent 8 }}
       ports:
         - { protocol: TCP, port: 9400 }
+    {{- end }}
+    {{- with $np.allowMetricsFrom }}
+    # Metrics scrapers (Prometheus) — /metrics is on the ops port :9401, NOT :9400,
+    # so a scrape peer can never reach the admin API.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 9401 }
+    {{- end }}
+    {{- with $np.allowProbesFrom }}
+    # Kubelet/node-sourced health probes to the ops port :9401. Only needed on CNIs
+    # that subject node-origin traffic to NetworkPolicy (e.g. Cilium host firewall);
+    # most CNIs exempt node traffic, so this is empty by default. Set it to your
+    # node CIDR (ipBlock) if liveness/readiness probes are being dropped.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 9401 }
     {{- end }}
 {{- end }}
