@@ -82,6 +82,10 @@ data:
                               # client copies so is-anonymous is unforgeable (C3).
                               - remove: "x-auth-anonymous"
                               - remove: "x-auth-method"
+                              # Per-route auth gate (RFC N4): tenant-router emits it,
+                              # jwt_authn branches on it — a client copy must never
+                              # survive to forge the gate (C3).
+                              - remove: "x-auth-required"
                       - name: envoy.filters.http.jwt_authn
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication

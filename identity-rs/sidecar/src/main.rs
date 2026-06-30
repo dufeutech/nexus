@@ -70,21 +70,42 @@ struct AppState {
     last_apply_ms: Arc<AtomicU64>, // epoch millis of the last applied change
     warm_ms: Arc<AtomicU64>,       // time-to-warm in ms (0 until ready)
     start: Instant,
+    /// Security/availability trade for the case where an authenticated request's
+    /// profile CANNOT be read (store down / never connected). `false` (default)
+    /// fails CLOSED — block with 503 rather than serve a request whose
+    /// revocation-sensitive state (`is_suspended`) is unknown, which would let a
+    /// suspended user back in during a Postgres outage. `true` restores the prior
+    /// availability-first behavior (enrich without a profile). A genuinely absent
+    /// profile (no row) is NOT this case and never fails closed.
+    fail_open: bool,
+}
+
+/// The outcome of resolving a subject's profile — distinguishes "no row" (a
+/// legitimate authenticated-but-unprofiled user) from "could not read" (store
+/// unavailable), which the fail-closed rule depends on.
+enum Resolved {
+    Found(Arc<Profile>),
+    Absent,
+    Unavailable,
 }
 
 impl AppState {
     /// Cache-first resolve; on miss/expiry, a single coalesced store read (C5).
     /// At 1B scale this miss-load is a normal steady-state path, not a rare
     /// fallback — the cache holds only the hot working set.
-    async fn resolve(&self, sub: &str) -> Option<Arc<Profile>> {
+    async fn resolve(&self, sub: &str) -> Resolved {
         if let Some(p) = self.cache.get(sub).await {
             counter!("sidecar_cache_hits_total").increment(1);
-            return Some(p);
+            return Resolved::Found(p);
         }
         counter!("sidecar_cache_misses_total").increment(1);
         let store = self.store.clone();
         let key = sub.to_owned();
-        self.cache
+        // try_get_with does not cache the error, so a transient store failure is
+        // retried on the next request rather than negatively cached. The
+        // "not_found" sentinel is the only non-error "absent" signal.
+        match self
+            .cache
             .try_get_with(key.clone(), async move {
                 match store.get(&key).await {
                     Ok(Some(p)) => Ok(Arc::new(p)),
@@ -93,8 +114,23 @@ impl AppState {
                 }
             })
             .await
-            .ok()
+        {
+            Ok(p) => Resolved::Found(p),
+            Err(e) if e.as_str() == "not_found" => Resolved::Absent,
+            Err(e) => {
+                warn!(error = %e, "profile store read failed");
+                Resolved::Unavailable
+            }
+        }
     }
+}
+
+/// The fail-closed rule, isolated so it is unit-testable without a store: an
+/// authenticated request whose profile is store-UNAVAILABLE must be blocked
+/// unless fail-open is configured. Anonymous requests, found profiles, and
+/// genuinely absent profiles never fail closed.
+fn must_fail_closed(authenticated: bool, unavailable: bool, fail_open: bool) -> bool {
+    authenticated && unavailable && !fail_open
 }
 
 // --------------------------------------------------------------------------- //
@@ -216,17 +252,28 @@ fn enrich_response(
     }
 }
 
-fn warming_503() -> ProcessingResponse {
+fn immediate_503(body: &'static str) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(processing_response::Response::ImmediateResponse(
             ImmediateResponse {
                 status: Some(HttpStatus { code: 503 }),
-                body: b"identity plane warming up".to_vec(),
+                body: body.as_bytes().to_vec(),
                 ..Default::default()
             },
         )),
         ..Default::default()
     }
+}
+
+fn warming_503() -> ProcessingResponse {
+    immediate_503("identity plane warming up")
+}
+
+/// Fail-closed block: the request is authenticated but the subject's profile
+/// (incl. its revocation-sensitive `is_suspended`) could not be read. Refuse
+/// rather than serve a trust decision we cannot make (see `AppState::fail_open`).
+fn unavailable_503() -> ProcessingResponse {
+    immediate_503("identity store unavailable")
 }
 
 // --------------------------------------------------------------------------- //
@@ -248,17 +295,42 @@ impl Sidecar {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             let (sub, token_roles, authenticated) = extract_identity(&req);
+            // `sub` is a user identifier (PII): keep it out of per-request info
+            // logs (enable debug for the subject when diagnosing a specific user).
+            debug!(sub = %sub, "enrich subject");
             // Don't touch the store for unauthenticated requests: the subject is
             // "anonymous" (no credential), which is never a stored profile — so a
             // lookup is a guaranteed miss that needlessly loads the pool on
             // high-volume anonymous traffic (and is not negatively cached).
-            let profile = if authenticated { self.state.resolve(&sub).await } else { None };
-            let result = if profile.is_some() { "hit" } else { "miss" };
-            // `sub` is a user identifier (PII): keep it out of per-request info
-            // logs (enable debug for the subject when diagnosing a specific user).
-            debug!(sub = %sub, "enrich subject");
-            info!(anonymous = !authenticated, hit = profile.is_some(), token_roles = token_roles.len(), "enrich");
-            (enrich_response(&sub, &token_roles, profile, authenticated), result)
+            if !authenticated {
+                info!(anonymous = true, token_roles = token_roles.len(), "enrich");
+                (enrich_response(&sub, &token_roles, None, false), "anonymous")
+            } else {
+                match self.state.resolve(&sub).await {
+                    Resolved::Found(p) => {
+                        info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
+                        (enrich_response(&sub, &token_roles, Some(p), true), "hit")
+                    }
+                    // Authenticated but no profile row yet — a legitimate state
+                    // (e.g. not-yet-synced user); enrich without profile fields.
+                    Resolved::Absent => {
+                        info!(anonymous = false, hit = false, token_roles = token_roles.len(), "enrich");
+                        (enrich_response(&sub, &token_roles, None, true), "miss")
+                    }
+                    // Store unreadable → suspension state is UNKNOWN. Fail closed
+                    // by default so a suspended user can't slip through during a
+                    // store outage; SIDECAR_FAIL_OPEN trades back to availability.
+                    Resolved::Unavailable => {
+                        if must_fail_closed(true, true, self.state.fail_open) {
+                            warn!("store unavailable for authenticated request -> 503 (fail-closed)");
+                            (unavailable_503(), "unavailable_closed")
+                        } else {
+                            warn!("store unavailable for authenticated request -> enrich without profile (fail-open)");
+                            (enrich_response(&sub, &token_roles, None, true), "unavailable_open")
+                        }
+                    }
+                }
+            }
         } else {
             warn!("not ready -> 503");
             (warming_503(), "not_ready")
@@ -364,8 +436,8 @@ async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<
 // localhost API: profile (C9), health, metrics (C12).
 // --------------------------------------------------------------------------- //
 mod api {
-    use super::{AppState, Ordering};
-    use axum::extract::{Path, State};
+    use super::{AppState, Ordering, Resolved};
+    use axum::extract::{DefaultBodyLimit, Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
@@ -378,6 +450,8 @@ mod api {
         Router::new()
             .route("/healthz", get(healthz))
             .route("/profile/{sub}", get(profile))
+            // GET-only localhost API; cap any request body as defense-in-depth.
+            .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(state)
     }
 
@@ -396,10 +470,14 @@ mod api {
 
     async fn profile(State(s): State<AppState>, Path(sub): Path<String>) -> impl IntoResponse {
         match s.resolve(&sub).await {
-            Some(p) => (StatusCode::OK, Json(serde_json::to_value(&*p).unwrap())),
-            None => (
+            Resolved::Found(p) => (StatusCode::OK, Json(serde_json::to_value(&*p).unwrap())),
+            Resolved::Absent => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "not found", "sub": sub })),
+            ),
+            Resolved::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "store unavailable", "sub": sub })),
             ),
         }
     }
@@ -481,6 +559,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Default fail-CLOSED: when an authenticated request's profile can't be read,
+    // block rather than serve it without its suspension state (see AppState).
+    let fail_open = env::var("SIDECAR_FAIL_OPEN")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     let store: Arc<dyn ProfileStore> = loop {
         match PgProfileStore::connect(&pg_url).await {
@@ -504,6 +587,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         last_apply_ms: Arc::new(AtomicU64::new(0)),
         warm_ms: Arc::new(AtomicU64::new(0)),
         start: Instant::now(),
+        fail_open,
     };
 
     // Periodically publish the gauge-style snapshots (the exporter's own listener
@@ -525,7 +609,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         })
     };
-    info!(ttl_s = ttl, readiness_delay_s = readiness_delay, "starting identity-sidecar-rs");
+    info!(ttl_s = ttl, readiness_delay_s = readiness_delay, fail_open, "starting identity-sidecar-rs");
 
     // Readiness fallback so we can never hang fail-closed forever.
     {
@@ -589,4 +673,75 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = http.await;
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Collect the response's set headers into a map for assertions.
+    fn set_headers(resp: &ProcessingResponse) -> HashMap<String, String> {
+        let Some(processing_response::Response::RequestHeaders(h)) = &resp.response else {
+            panic!("expected RequestHeaders response");
+        };
+        h.response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .map(|m| {
+                m.set_headers
+                    .iter()
+                    .filter_map(|opt| opt.header.as_ref())
+                    .map(|hv| {
+                        (hv.key.clone(), String::from_utf8_lossy(&hv.raw_value).into_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_immediate_503(resp: &ProcessingResponse) -> bool {
+        matches!(
+            &resp.response,
+            Some(processing_response::Response::ImmediateResponse(r))
+                if r.status.as_ref().map(|s| s.code) == Some(503)
+        )
+    }
+
+    #[test]
+    fn fail_closed_only_for_authenticated_unavailable_when_not_open() {
+        // The one and only case that blocks: authenticated + store unavailable +
+        // fail-open disabled.
+        assert!(must_fail_closed(true, true, false));
+        // Fail-open configured → never block.
+        assert!(!must_fail_closed(true, true, true));
+        // Anonymous never blocks (it never touches the store).
+        assert!(!must_fail_closed(false, true, false));
+        // Store readable (found/absent) never blocks.
+        assert!(!must_fail_closed(true, false, false));
+    }
+
+    #[test]
+    fn enrich_emits_live_suspension_only_from_profile() {
+        let suspended = Arc::new(Profile {
+            sub: "u1".into(),
+            is_suspended: true,
+            ..Default::default()
+        });
+        let h = set_headers(&enrich_response("u1", &[], Some(suspended), true));
+        assert_eq!(h.get("x-user-suspended").map(String::as_str), Some("true"));
+        assert_eq!(h.get("x-auth-anonymous").map(String::as_str), Some("false"));
+
+        // A profile MISS (no row) must NOT assert a suspension either way — the
+        // header is simply absent, which is exactly why a store outage that
+        // collapses to "miss" is dangerous and must instead fail closed.
+        let h = set_headers(&enrich_response("u1", &[], None, true));
+        assert!(!h.contains_key("x-user-suspended"));
+    }
+
+    #[test]
+    fn unavailable_503_is_a_blocking_503() {
+        assert!(is_immediate_503(&unavailable_503()));
+        assert!(is_immediate_503(&warming_503()));
+    }
 }

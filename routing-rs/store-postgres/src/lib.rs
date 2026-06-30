@@ -17,9 +17,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::{unfold, StreamExt};
-use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
 use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
 use router_core::domain::{Pool, TenantConfig};
@@ -161,22 +160,33 @@ impl PgRoutingStore {
             .bind(key)
             .fetch_one(&mut *conn)
             .await?;
-        Ok(got.then(|| LeaderLease { conn }))
+        if !got {
+            return Ok(None);
+        }
+        // Detach from the pool so the lease OWNS its connection. A session-level
+        // advisory lock is released only when its session ends — so if a lease
+        // dropped while still pooled, the connection would return to the pool
+        // STILL holding the lock, and leadership would stay claimed (blocking
+        // failover) until that physical connection happened to be recycled.
+        // Owning the connection means dropping the lease closes the session,
+        // which releases the lock promptly.
+        Ok(Some(LeaderLease { conn: conn.detach() }))
     }
 }
 
 /// A held verification-poll leadership lease. Holding it keeps the advisory lock;
 /// dropping it (or losing the connection) releases leadership so another instance
-/// can take over.
+/// can take over — the lease owns its connection, so a drop ends the session and
+/// Postgres releases the session-level advisory lock.
 pub struct LeaderLease {
-    conn: PoolConnection<Postgres>,
+    conn: PgConnection,
 }
 
 impl LeaderLease {
     /// Cheap liveness ping. `false` means the lease's connection — and thus the
     /// lock — was lost; the caller MUST drop this lease and re-acquire.
     pub async fn alive(&mut self) -> bool {
-        sqlx::query("SELECT 1").execute(&mut *self.conn).await.is_ok()
+        sqlx::query("SELECT 1").execute(&mut self.conn).await.is_ok()
     }
 }
 

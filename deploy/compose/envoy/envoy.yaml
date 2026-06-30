@@ -96,6 +96,10 @@ static_resources:
                           - remove: "x-user-enriched-by"
                           - remove: "x-auth-anonymous"
                           - remove: "x-auth-method"
+                          # The per-route auth gate (RFC N4): the tenant-router
+                          # emits it and jwt_authn branches on it, so a client
+                          # copy must never survive to forge the gate (C3).
+                          - remove: "x-auth-required"
                   # Tenant routing (C14/C15/C18) — BEFORE auth so verification may
                   # be tenant-scoped (C17). fail-closed: a routing failure must not
                   # silently default a route.

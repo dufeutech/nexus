@@ -18,7 +18,7 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -61,10 +61,12 @@ struct App {
     pending_ttl: i64,
 }
 
-/// Uniform 500 for an unexpected store/adapter error.
+/// Uniform 500 for an unexpected store/adapter error. The underlying error is
+/// LOGGED (with full detail for operators) but NEVER returned to the client — a
+/// raw `e.to_string()` can leak connection strings, SQL, or internal topology.
 fn internal<E: fmt::Display>(e: E) -> Response {
     error!(error = %e, "control-plane error");
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "internal_error" }))).into_response()
 }
 
 /// Load the plan → limit table from configuration (RFC C5). `ROUTING_PLAN_LIMITS`
@@ -184,9 +186,7 @@ async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> im
         updated_at: None,
     };
     if let Err(e) = s.store.upsert_tenant(&cfg).await {
-        error!(error = %e, "upsert_tenant failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal(e);
     }
     // A tenant change affects all of its domains — invalidate each precisely so
     // both the L1 (per-edge) and L2 (shared) tiers converge by domain key.
@@ -208,8 +208,7 @@ async fn get_tenant(State(s): State<App>, Path(id): Path<String>) -> impl IntoRe
         Ok(Some(cfg)) => (StatusCode::OK, Json(serde_json::to_value(cfg).unwrap())).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "tenant_id": id })))
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response(),
+        Err(e) => internal(e),
     }
 }
 
@@ -222,28 +221,30 @@ struct DomainBody {
     tenant_id: String,
     #[serde(default)]
     wildcard: bool,
-    #[serde(default)]
-    verified: bool,
 }
 
 async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainBody>) -> impl IntoResponse {
     // Normalize at the boundary so the stored key matches the resolver's key.
     let domain = normalize_host(&body.domain);
+    // A domain is ALWAYS created unverified here: routing-affecting verification
+    // is granted only by the DNS ownership-proof path (declare → verify, RFC C4).
+    // A client-supplied `verified:true` is NOT honored — accepting it would let
+    // any caller make an unproven domain route, defeating the proof system. To
+    // mark a domain verified, publish the TXT proof and call /verify.
+    const VERIFIED: bool = false;
     if let Err(e) = s
         .store
-        .upsert_domain(&domain, &body.tenant_id, body.wildcard, body.verified)
+        .upsert_domain(&domain, &body.tenant_id, body.wildcard, VERIFIED)
         .await
     {
-        error!(error = %e, "upsert_domain failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal(e);
     }
     s.invalidate(&domain).await;
     counter!("control_mutations_total", "op" => "upsert_domain").increment(1);
-    info!(domain = %domain, tenant = %body.tenant_id, wildcard = body.wildcard, verified = body.verified, "domain upserted");
+    info!(domain = %domain, tenant = %body.tenant_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
     (
         StatusCode::OK,
-        Json(json!({ "result": "ok", "domain": domain, "verified": body.verified })),
+        Json(json!({ "result": "ok", "domain": domain, "verified": VERIFIED })),
     )
         .into_response()
 }
@@ -535,9 +536,7 @@ async fn delete_domain(
 ) -> impl IntoResponse {
     let domain = normalize_host(&domain);
     if let Err(e) = s.store.delete_domain(&domain, q.wildcard).await {
-        error!(error = %e, "delete failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal(e);
     }
     s.invalidate(&domain).await;
     counter!("control_mutations_total", "op" => "delete_domain").increment(1);
@@ -743,6 +742,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
+        // These are small JSON admin bodies; cap the request body so a malformed
+        // or hostile caller can't force an unbounded buffer (defense-in-depth).
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(app);
 
     let listener = TcpListener::bind("0.0.0.0:9400").await?;
