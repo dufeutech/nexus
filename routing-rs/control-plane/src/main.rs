@@ -164,11 +164,18 @@ async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Respons
     let Some(expected) = s.auth_token.as_deref() else {
         return next.run(req).await;
     };
+    // The `Bearer` auth scheme is case-insensitive (RFC 7235: auth-scheme is a
+    // token), so fold the SCHEME with ASCII case-insensitivity — but only the
+    // scheme. The token itself stays an exact, constant-time byte compare below.
+    // ASCII (not Unicode) folding is correct here: the scheme is ASCII by spec, and
+    // Unicode case folding would invite locale/homoglyph surprises (e.g. Kelvin-sign
+    // `K` U+212A) on what is a fixed protocol keyword.
     let presented = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.split_once(' '))
+        .and_then(|(scheme, tok)| scheme.eq_ignore_ascii_case("Bearer").then_some(tok));
     match presented {
         Some(tok) if ct_eq(tok, expected) => next.run(req).await,
         _ => {

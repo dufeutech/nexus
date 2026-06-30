@@ -8,9 +8,15 @@ description: >-
   independent (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart version — bump on template changes.
-version: 0.1.0
+# 0.2.0: control-plane /metrics + /healthz moved to a dedicated ops port :9401
+# (off the broker-only admin :9400); probes retargeted to :9401; NetworkPolicy
+# gains allowIngressControllerFrom / allowProbesFrom + fail-closed guards.
+version: 0.2.0
 # The app this chart deploys has no single version; track the lab it mirrors.
-appVersion: "0.1.0"
+# Bumped with the chart so the default image tag (values images.*.tag) moves to a
+# NEW tag — deploying 0.2.0 against an old :0.1.0 image (no :9401 listener) would
+# CrashLoop on the ops probe. Rebuild & push the first-party images at this tag.
+appVersion: "0.2.0"
 keywords:
   - routing
   - tenant

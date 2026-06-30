@@ -39,3 +39,12 @@ External dependencies (operated OUTSIDE this chart): see deploy/README.md
   - Postgres (the authoritative routing store; HA is your operator's concern)
   - Redis (optional L2; the plane is correct without it)
   - The backend pools the routing decision selects among (pools.*)
+
+UPGRADE NOTE (chart 0.2.0) — control-plane metrics moved port:
+  * /metrics + /healthz are now on a dedicated ops port :9401 (off the broker-only
+    admin :9400). The bundled ServiceMonitor already targets :9401, but any
+    EXTERNAL Prometheus / scrape config pointed at :9400/metrics will silently go
+    dark — retarget it to :9401.
+  * This needs the rebuilt control-plane image (it now listens on :9401). The
+    chart's default image tag tracks appVersion (0.2.0), so build & push the
+    first-party images at that tag before upgrading, or the ops probe CrashLoops.
