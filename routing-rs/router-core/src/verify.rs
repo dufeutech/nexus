@@ -10,6 +10,7 @@ use crate::store::BoxError;
 /// The label under which a tenant publishes the ownership-proof record. A
 /// *subdomain* label so it coexists with an apex alias record (RFC C4). Pure and
 /// deterministic — the same domain always yields the same challenge name.
+#[must_use]
 pub fn challenge_name(domain: &str) -> String {
     format!("_nexus-challenge.{domain}")
 }
@@ -17,6 +18,7 @@ pub fn challenge_name(domain: &str) -> String {
 /// Whether any published proof record carries the expected token. Pure, total,
 /// deterministic: trims surrounding whitespace, requires an exact value match —
 /// no substring or prefix acceptance (RFC C4: the proof must be the token).
+#[must_use]
 pub fn token_matches(records: &[String], token: &str) -> bool {
     !token.is_empty() && records.iter().any(|r| r.trim() == token)
 }
@@ -44,7 +46,7 @@ mod tests {
 
     #[test]
     fn matches_exact_token_only() {
-        let recs = vec!["  tok123  ".to_string(), "other".to_string()];
+        let recs = vec!["  tok123  ".to_owned(), "other".to_owned()];
         assert!(token_matches(&recs, "tok123")); // trimmed exact match
         assert!(!token_matches(&recs, "tok")); // no prefix acceptance
         assert!(!token_matches(&recs, "")); // empty token never matches

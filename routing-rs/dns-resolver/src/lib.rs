@@ -22,6 +22,7 @@ pub struct DnsOwnershipProof {
 impl DnsOwnershipProof {
     /// Resolve against a public recursive resolver (the authoritative public
     /// view of the tenant's DNS).
+    #[must_use] 
     pub fn public() -> Self {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());

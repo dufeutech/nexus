@@ -22,11 +22,12 @@ impl Pool {
     /// Wrap a pool name. This does NOT validate membership — go through
     /// [`PoolSet::parse`] for admin/stored input; use this only for a name the
     /// store previously wrote (already validated) or a test fixture.
-    pub fn new(name: impl Into<String>) -> Self {
-        Pool(name.into())
+    pub fn new<N: Into<String>>(name: N) -> Self {
+        Self(name.into())
     }
 
     /// The stable wire identifier.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,11 +47,13 @@ pub struct PoolSet {
 }
 
 impl PoolSet {
-    pub fn new(allowed: BTreeSet<String>) -> Self {
+    #[must_use]
+    pub const fn new(allowed: BTreeSet<String>) -> Self {
         Self { allowed }
     }
 
     /// Whether a name is in the allow-list.
+    #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.allowed.contains(name)
     }
@@ -58,12 +61,9 @@ impl PoolSet {
     /// Validate a stored/admin-supplied selector against the allow-list. `None`
     /// for an unknown pool — the caller MUST reject rather than invent a
     /// destination (the same fail-closed contract the old compiled `parse` had).
+    #[must_use]
     pub fn parse(&self, s: &str) -> Option<Pool> {
-        if self.allowed.contains(s) {
-            Some(Pool::new(s))
-        } else {
-            None
-        }
+        self.allowed.contains(s).then(|| Pool::new(s))
     }
 
     /// The allowed names, sorted — for diagnostics and error messages.
@@ -74,7 +74,7 @@ impl PoolSet {
 
 /// The routing store's value, keyed by tenant identifier (RFC §3.11): the target
 /// backend selector (from the finite pool set), a plan, and feature flags.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantConfig {
     pub tenant_id: String,
     pub plan: String,
@@ -88,7 +88,7 @@ pub struct TenantConfig {
 /// The resolved selection the edge data plane enacts (RFC §3.12): one backend
 /// pool plus the trusted tenant annotations attached as request metadata. The
 /// plane only resolves and annotates — the data plane does the forwarding.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingDecision {
     pub tenant_id: String,
     pub plan: String,
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn parse_accepts_allowed_and_rejects_unknown() {
         let pools = sample();
-        assert_eq!(pools.parse("api").map(|p| p.as_str().to_string()), Some("api".into()));
+        assert_eq!(pools.parse("api").map(|p| p.as_str().to_owned()), Some("api".into()));
         assert!(pools.parse("checkout").is_none()); // not in this set -> rejected
         assert!(pools.parse("").is_none());
     }
@@ -139,12 +139,13 @@ mod tests {
     }
 
     #[test]
-    fn pool_serializes_as_a_bare_string() {
+    fn pool_serializes_as_a_bare_string() -> Result<(), serde_json::Error> {
         // #[serde(transparent)] — the wire form is the plain name, matching the
         // x-route-pool header and the target_pool column.
         let p = Pool::new("api");
-        assert_eq!(serde_json::to_string(&p).unwrap(), "\"api\"");
-        let back: Pool = serde_json::from_str("\"api\"").unwrap();
+        assert_eq!(serde_json::to_string(&p)?, "\"api\"");
+        let back: Pool = serde_json::from_str("\"api\"")?;
         assert_eq!(back, p);
+        Ok(())
     }
 }

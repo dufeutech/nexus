@@ -2,6 +2,12 @@
 name = "store-postgres"
 edition.workspace = true
 version.workspace = true
+description = "PostgreSQL store adapter for the Nexus identity plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [lib]
 name = "store_postgres"
@@ -23,3 +29,6 @@ tracing.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 sqlx.workspace = true
+
+[lints]
+workspace = true

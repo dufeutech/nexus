@@ -10,30 +10,33 @@
 //! a THROWAWAY Postgres (the tests create the `identity` schema and TRUNCATE the
 //! table), e.g.:
 //!
-//!   docker run --rm -d -p 5433:5432 -e POSTGRES_PASSWORD=postgres --name pgtest postgres:16-alpine
-//!   STORE_PG_TEST_URL=postgres://postgres:postgres@localhost:5433/postgres \
+//!   docker run --rm -d -p 5433:5432 -e `POSTGRES_PASSWORD=postgres` --name pgtest postgres:16-alpine
+//!   `STORE_PG_TEST_URL=postgres://postgres:postgres@localhost:5433/postgres` \
 //!     cargo test -p store-postgres --test integration -- --test-threads=1
 //!
 //! Run single-threaded (`--test-threads=1`): all tests share the one `identity`
 //! schema and each begins by truncating it, so they must not interleave.
 
+use std::env;
 use std::time::Duration;
 
 use futures::StreamExt;
 use identity_core::store::{Change, ProfileStore};
 use identity_core::Profile;
+use sqlx::postgres::PgPoolOptions;
 use store_postgres::PgProfileStore;
+use tokio::time::{sleep, timeout};
 
 /// Connect + clean the shared table, or `None` if the test DB isn't configured.
 async fn setup() -> Option<PgProfileStore> {
-    let url = std::env::var("STORE_PG_TEST_URL").ok()?;
+    let url = env::var("STORE_PG_TEST_URL").ok()?;
     let store = PgProfileStore::connect(&url)
         .await
         .expect("connect to STORE_PG_TEST_URL");
     store.init_schema().await.expect("init_schema");
     // Start every test from a clean slate (and reset the sequence so token math
     // is predictable across runs).
-    let pool = sqlx::postgres::PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
         .await
@@ -51,7 +54,7 @@ async fn setup() -> Option<PgProfileStore> {
 
 fn profile(sub: &str, suspended: bool) -> Profile {
     Profile {
-        sub: sub.to_string(),
+        sub: sub.to_owned(),
         is_suspended: suspended,
         roles: vec!["viewer".into()],
         ..Default::default()
@@ -79,7 +82,7 @@ async fn put_get_roundtrip() {
     store.put(&p).await.unwrap();
     let got = store.get("u1").await.unwrap().expect("present after put");
     assert_eq!(got.sub, "u1");
-    assert_eq!(got.roles, vec!["viewer".to_string()]);
+    assert_eq!(got.roles, vec!["viewer".to_owned()]);
     assert!(!got.is_suspended);
 }
 
@@ -116,7 +119,7 @@ async fn scan_all_returns_live_only() {
     store.delete("b").await.unwrap();
     let mut subs: Vec<String> = store.scan_all().await.unwrap().into_iter().map(|p| p.sub).collect();
     subs.sort();
-    assert_eq!(subs, vec!["a".to_string(), "c".to_string()]);
+    assert_eq!(subs, vec!["a".to_owned(), "c".to_owned()]);
 }
 
 #[tokio::test]
@@ -127,12 +130,12 @@ async fn watch_catches_up_on_existing_changes() {
     store.put(&profile("u1", false)).await.unwrap();
     store.put(&profile("u2", false)).await.unwrap();
 
-    let zero = 0i64.to_le_bytes().to_vec();
+    let zero = 0_i64.to_le_bytes().to_vec();
     let mut feed = store.watch(Some(zero)).await.unwrap();
 
     let mut seen = Vec::new();
     for _ in 0..2 {
-        let ev = tokio::time::timeout(Duration::from_secs(5), feed.next())
+        let ev = timeout(Duration::from_secs(5), feed.next())
             .await
             .expect("feed yields within 5s")
             .expect("stream not ended")
@@ -154,10 +157,10 @@ async fn watch_catchup_is_compacted_per_key() {
     store.put(&profile("u1", false)).await.unwrap(); // seq 1
     store.delete("u1").await.unwrap(); // seq 2 — same row, now a tombstone
 
-    let zero = 0i64.to_le_bytes().to_vec();
+    let zero = 0_i64.to_le_bytes().to_vec();
     let mut feed = store.watch(Some(zero)).await.unwrap();
 
-    let ev = tokio::time::timeout(Duration::from_secs(5), feed.next())
+    let ev = timeout(Duration::from_secs(5), feed.next())
         .await
         .expect("feed yields within 5s")
         .expect("stream not ended")
@@ -165,7 +168,7 @@ async fn watch_catchup_is_compacted_per_key() {
     assert!(matches!(&ev.change, Change::Delete(sub) if sub == "u1"));
 
     // No second event for u1 — the seq-1 upsert was compacted away by the tombstone.
-    let second = tokio::time::timeout(Duration::from_millis(800), feed.next()).await;
+    let second = timeout(Duration::from_millis(800), feed.next()).await;
     assert!(second.is_err(), "only one (compacted) event for the key");
 }
 
@@ -176,7 +179,7 @@ async fn watch_delivers_live_changes_after_open() {
     let mut feed = store.watch(None).await.unwrap();
 
     // Give the listener a moment to be established, then write.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
     let writer = store.clone();
     tokio::spawn(async move {
         writer.put(&profile("live1", false)).await.unwrap();
@@ -186,7 +189,7 @@ async fn watch_delivers_live_changes_after_open() {
 
     let mut kinds = Vec::new();
     for _ in 0..3 {
-        let ev = tokio::time::timeout(Duration::from_secs(5), feed.next())
+        let ev = timeout(Duration::from_secs(5), feed.next())
             .await
             .expect("live feed yields within 5s")
             .expect("stream not ended")
@@ -205,9 +208,9 @@ async fn watch_token_resumes_without_duplicates() {
     store.put(&profile("u2", false)).await.unwrap();
 
     // First pass from the beginning: read exactly one event, remember its token.
-    let zero = 0i64.to_le_bytes().to_vec();
+    let zero = 0_i64.to_le_bytes().to_vec();
     let mut feed = store.watch(Some(zero)).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(5), feed.next())
+    let first = timeout(Duration::from_secs(5), feed.next())
         .await
         .expect("yields")
         .unwrap()
@@ -218,7 +221,7 @@ async fn watch_token_resumes_without_duplicates() {
 
     // Resume strictly AFTER the first event: must see u2 next, never u1 again.
     let mut feed2 = store.watch(Some(resume_token)).await.unwrap();
-    let next = tokio::time::timeout(Duration::from_secs(5), feed2.next())
+    let next = timeout(Duration::from_secs(5), feed2.next())
         .await
         .expect("yields")
         .unwrap()

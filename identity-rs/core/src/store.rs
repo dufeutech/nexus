@@ -2,24 +2,27 @@
 //! with NO vendor concretion (rules §2). An adapter crate implements this against
 //! a concrete database; core and the services depend only on this trait.
 
+use std::error::Error;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::profile::Profile;
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxError = Box<dyn Error + Send + Sync>;
 
 /// A live change observed from the store (RFC C4). The watch feed delivers these
 /// so caches stay fresh and revocations take effect within seconds.
 #[derive(Debug, Clone)]
 pub enum Change {
     /// A profile was created or updated.
-    Upsert(Profile),
+    Upsert(Box<Profile>),
     /// The profile for this subject was removed.
     Delete(String),
 }
 
 /// Opaque resume cursor for the change feed — encoding is the adapter's business.
+///
 /// The caller persists the most recent token and passes it back on reconnect so a
 /// watch disconnect misses NOTHING (a resumable feed; RFC C4 / §3.5).
 pub type WatchToken = Vec<u8>;

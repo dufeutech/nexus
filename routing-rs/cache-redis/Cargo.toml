@@ -2,6 +2,12 @@
 name = "cache-redis"
 edition.workspace = true
 version.workspace = true
+description = "Redis L2 cache tier for the Nexus routing plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [lib]
 name = "cache_redis"
@@ -13,3 +19,6 @@ redis.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

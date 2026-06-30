@@ -34,7 +34,8 @@ pub struct PlanLimits {
 }
 
 impl PlanLimits {
-    pub fn new(limits: BTreeMap<String, DomainLimit>) -> Self {
+    #[must_use]
+    pub const fn new(limits: BTreeMap<String, DomainLimit>) -> Self {
         Self { limits }
     }
 
@@ -49,12 +50,12 @@ impl PlanLimits {
                 DomainLimit::Unbounded => None,
             })
             .min()
-            .map(DomainLimit::Finite)
-            .unwrap_or(DomainLimit::Finite(0))
+            .map_or(DomainLimit::Finite(0), DomainLimit::Finite)
     }
 
     /// The limit for a plan. An absent plan resolves to [`Self::most_restrictive`]
     /// — never unbounded (RFC C5).
+    #[must_use]
     pub fn limit_for(&self, plan: &str) -> DomainLimit {
         self.limits
             .get(plan)
@@ -71,7 +72,7 @@ impl PlanLimits {
             DomainLimit::Finite(limit) => {
                 if used >= limit {
                     Err(QuotaExceeded {
-                        plan: plan.to_string(),
+                        plan: plan.to_owned(),
                         limit,
                         used,
                     })
@@ -89,9 +90,9 @@ mod tests {
 
     fn sample() -> PlanLimits {
         let mut m = BTreeMap::new();
-        m.insert("free".into(), DomainLimit::Finite(1));
-        m.insert("pro".into(), DomainLimit::Finite(10));
-        m.insert("enterprise".into(), DomainLimit::Unbounded);
+        let _ = m.insert("free".into(), DomainLimit::Finite(1));
+        let _ = m.insert("pro".into(), DomainLimit::Finite(10));
+        let _ = m.insert("enterprise".into(), DomainLimit::Unbounded);
         PlanLimits::new(m)
     }
 
@@ -101,8 +102,8 @@ mod tests {
         assert!(p.check("free", 0).is_ok());
         assert!(p.check("free", 1).is_err()); // at the limit -> refused
         assert_eq!(
-            p.check("free", 1).unwrap_err(),
-            QuotaExceeded { plan: "free".into(), limit: 1, used: 1 }
+            p.check("free", 1),
+            Err(QuotaExceeded { plan: "free".into(), limit: 1, used: 1 })
         );
         assert!(p.check("pro", 9).is_ok());
         assert!(p.check("pro", 10).is_err());

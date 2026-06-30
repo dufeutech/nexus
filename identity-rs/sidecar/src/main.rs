@@ -1,28 +1,36 @@
 //! Identity sidecar (Rust) — the identity-plane resolver.
-//! Stack: tonic + envoy-types + store-postgres (PostgreSQL) + moka + axum.
+//! Stack: tonic + envoy-types + store-postgres (`PostgreSQL`) + moka + axum.
 //!
 //! Dual surface over one push-updated Profile cache:
-//!   - ext_proc gRPC (hot path): read the verified `sub` from jwt_authn metadata
+//!   - `ext_proc` gRPC (hot path): read the verified `sub` from `jwt_authn` metadata
 //!     Envoy forwards, resolve the Profile, inject trusted x-user-* (C2).
 //!   - localhost HTTP profile API: GET /profile/{sub} (C9) + /healthz + /metrics.
 //! Cache: the store's resumable change feed pushes updates (C4 — a `seq`-cursor
 //! over Postgres LISTEN/NOTIFY); moka TTL is the safety net and `try_get_with`
-//! gives a coalesced miss-load (C5); ext_proc fails CLOSED with a 503 until the
+//! gives a coalesced miss-load (C5); `ext_proc` fails CLOSED with a 503 until the
 //! store is reachable + the feed is open (lazy warm, C6 — NOT a full population
 //! replay). The token is never parsed here.
 //!
 //! Hardening: structured logging (tracing), Prometheus metrics (C12), and
 //! graceful shutdown on SIGTERM/SIGINT for both servers.
 
+use std::env;
+use std::error::Error;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(unix))]
+use std::future::pending;
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, NativeHistogramConfig, PrometheusBuilder};
 use moka::future::Cache;
+use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
@@ -75,12 +83,12 @@ impl AppState {
         }
         counter!("sidecar_cache_misses_total").increment(1);
         let store = self.store.clone();
-        let key = sub.to_string();
+        let key = sub.to_owned();
         self.cache
             .try_get_with(key.clone(), async move {
                 match store.get(&key).await {
                     Ok(Some(p)) => Ok(Arc::new(p)),
-                    Ok(None) => Err("not_found".to_string()),
+                    Ok(None) => Err("not_found".to_owned()),
                     Err(e) => Err(e.to_string()),
                 }
             })
@@ -107,13 +115,13 @@ fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
             Some(Kind::StructValue(s)) => &s.fields,
             _ => &ns.fields,
         },
-        None => return ("anonymous".to_string(), Vec::new(), true),
+        None => return ("anonymous".to_owned(), Vec::new(), true),
     };
     // A verified `sub` is the authority for "authenticated": its presence flips
     // is-anonymous to false. Absence (no sub claim) stays anonymous.
     let (sub, authenticated) = match fields.get("sub").and_then(|v| v.kind.as_ref()) {
         Some(Kind::StringValue(s)) if !s.is_empty() => (s.clone(), true),
-        _ => ("anonymous".to_string(), false),
+        _ => ("anonymous".to_owned(), false),
     };
     let mut roles = Vec::new();
     // A plain `roles` array claim, if present...
@@ -127,7 +135,7 @@ fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
     // ...or the provider's nested project-roles claim (key ends ":roles", a
     // struct whose field names are the role keys).
     if roles.is_empty() {
-        for (k, v) in fields.iter() {
+        for (k, v) in fields {
             if k.ends_with(":roles") {
                 if let Some(Kind::StructValue(s)) = v.kind.as_ref() {
                     roles.extend(s.fields.keys().cloned());
@@ -144,7 +152,7 @@ fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
 fn header(key: &str, value: &str) -> HeaderValueOption {
     HeaderValueOption {
         header: Some(HeaderValue {
-            key: key.to_string(),
+            key: key.to_owned(),
             raw_value: value.as_bytes().to_vec(),
             ..Default::default()
         }),
@@ -238,15 +246,15 @@ impl Sidecar {
             return None;
         }
         let started = Instant::now();
-        let (resp, result) = if !self.state.ready.load(Ordering::Relaxed) {
-            warn!("not ready -> 503");
-            (warming_503(), "not_ready")
-        } else {
+        let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             let (sub, token_roles, authenticated) = extract_identity(&req);
             let profile = self.state.resolve(&sub).await;
             let result = if profile.is_some() { "hit" } else { "miss" };
             info!(sub = %sub, anonymous = !authenticated, hit = profile.is_some(), token_roles = token_roles.len(), "enrich");
             (enrich_response(&sub, &token_roles, profile, authenticated), result)
+        } else {
+            warn!("not ready -> 503");
+            (warming_503(), "not_ready")
         };
         histogram!("sidecar_ext_proc_duration_seconds")
             .record(started.elapsed().as_secs_f64());
@@ -306,7 +314,7 @@ async fn watch_store(state: AppState) {
             Ok(()) => warn!("change feed ended; reconnecting"),
             Err(e) => warn!(error = %e, "watch error; retrying"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -329,7 +337,7 @@ async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<
                 // without pulling the whole population into memory.
                 let key = p.sub.clone();
                 if state.cache.contains_key(&key) {
-                    state.cache.insert(key, Arc::new(p)).await;
+                    state.cache.insert(key, Arc::new(*p)).await;
                 }
                 counter!("sidecar_kv_updates_total", "op" => "upsert").increment(1);
             }
@@ -349,14 +357,14 @@ async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<
 // localhost API: profile (C9), health, metrics (C12).
 // --------------------------------------------------------------------------- //
 mod api {
-    use super::*;
+    use super::{AppState, Ordering};
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router};
 
-    pub fn router(state: AppState) -> Router {
+    pub(crate) fn router(state: AppState) -> Router {
         // Metrics are served by the exporter's own listener (:9202) so the
         // protobuf/native-histogram content negotiation works; this axum server
         // only carries the profile + health surfaces.
@@ -393,7 +401,7 @@ mod api {
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let json = std::env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
+    let json = env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
     if json {
         tracing_subscriber::fmt().with_env_filter(filter).json().init();
     } else {
@@ -404,7 +412,7 @@ fn init_tracing() {
 /// Resolves when the process receives SIGINT or (on unix) SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
     let term = async {
@@ -415,16 +423,16 @@ async fn shutdown_signal() {
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
+    let term = pending::<()>();
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = term => {},
+        () = ctrl_c => {},
+        () = term => {},
     }
     info!("shutdown signal received");
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
     // Explicit-bucket histogram (not a summary) so latency is aggregatable across
     // instances: histogram_quantile(0.99, sum by (le)(rate(..._bucket[5m]))).
@@ -446,23 +454,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_buckets(LATENCY_BUCKETS)
         .expect("set histogram buckets")
         .set_native_histogram_for_metric(
-            Matcher::Full("sidecar_ext_proc_duration_seconds".to_string()),
+            Matcher::Full("sidecar_ext_proc_duration_seconds".to_owned()),
             native,
         )
-        .with_http_listener("0.0.0.0:9202".parse::<std::net::SocketAddr>().unwrap())
+        .with_http_listener("0.0.0.0:9202".parse::<SocketAddr>().unwrap())
         .install()
         .expect("install prometheus exporter");
 
     // The sidecar only reads + listens, so this URL needs SELECT + LISTEN, never
     // schema creation. It MUST reach the primary on a session connection — a
     // transaction-mode pooler silently swallows LISTEN (see deploy/README.md).
-    let pg_url = std::env::var("PROFILE_PG_URL")
+    let pg_url = env::var("PROFILE_PG_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@postgres:5432/zitadel".into());
-    let ttl: u64 = std::env::var("CACHE_TTL_SECONDS")
+    let ttl: u64 = env::var("CACHE_TTL_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(43_200);
-    let readiness_delay: u64 = std::env::var("READINESS_DELAY_SECONDS")
+    let readiness_delay: u64 = env::var("READINESS_DELAY_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -472,7 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(s) => break Arc::new(s),
             Err(e) => {
                 warn!(error = %e, "waiting for Postgres");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(2)).await;
             }
         }
     };
@@ -506,34 +514,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if wm > 0 {
                     gauge!("sidecar_time_to_warm_seconds").set(wm as f64 / 1000.0);
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(5)).await;
             }
-        });
-    }
+        })
+    };
     info!(ttl_s = ttl, readiness_delay_s = readiness_delay, "starting identity-sidecar-rs");
 
     // Readiness fallback so we can never hang fail-closed forever.
     {
         let st = state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(readiness_delay + 15)).await;
+            sleep(Duration::from_secs(readiness_delay + 15)).await;
             if !st.ready.swap(true, Ordering::Relaxed) {
                 st.warm_ms
                     .store(st.start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 warn!("readiness fallback fired");
             }
-        });
-    }
+        })
+    };
     // KV watcher (optionally held to demo the C6 fail-closed window).
     {
         let st = state.clone();
         tokio::spawn(async move {
             if readiness_delay > 0 {
-                tokio::time::sleep(Duration::from_secs(readiness_delay)).await;
+                sleep(Duration::from_secs(readiness_delay)).await;
             }
             watch_store(st).await;
-        });
-    }
+        })
+    };
 
     // Shared shutdown fan-out for both servers.
     let (tx, _r) = watch::channel(false);
@@ -548,7 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = {
         let app = api::router(state.clone());
         tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:9200").await.unwrap();
+            let listener = TcpListener::bind("0.0.0.0:9200").await.unwrap();
             info!("profile/metrics API on :9200");
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {

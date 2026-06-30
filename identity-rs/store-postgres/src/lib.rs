@@ -1,4 +1,4 @@
-//! PostgreSQL adapter for the `ProfileStore` port (RFC §3.5 + C4).
+//! `PostgreSQL` adapter for the `ProfileStore` port (RFC §3.5 + C4).
 //!
 //! This is the identity-plane twin of `routing-rs/store-postgres`: it reuses the
 //! Postgres that ZITADEL already runs, under a dedicated `identity` schema (the
@@ -33,9 +33,10 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
+use futures::stream::{unfold, StreamExt};
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
+use tokio::time::timeout;
 use tracing::warn;
 
 use identity_core::store::{
@@ -77,13 +78,14 @@ impl PgProfileStore {
             .await?;
         Ok(Self {
             pool,
-            url: url.to_string(),
+            url: url.to_owned(),
             poll_interval: DEFAULT_POLL_INTERVAL,
         })
     }
 
     /// Override the change-feed poll fallback (default 30s).
-    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+    #[must_use] 
+    pub const fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
@@ -195,14 +197,11 @@ impl ProfileStore for PgProfileStore {
     async fn watch(&self, after: Option<WatchToken>) -> Result<ChangeFeed, BoxError> {
         // Resume strictly after the caller's last token; `None` means "from now",
         // i.e. start at the current high-water mark and stream only newer changes.
-        let last: i64 = match after {
-            Some(tok) => decode_token(&tok)?,
-            None => {
-                let row = sqlx::query("SELECT coalesce(max(seq), 0) AS hw FROM identity.profiles")
-                    .fetch_one(&self.pool)
-                    .await?;
-                row.get::<i64, _>("hw")
-            }
+        let last: i64 = if let Some(tok) = after { decode_token(&tok)? } else {
+            let row = sqlx::query("SELECT coalesce(max(seq), 0) AS hw FROM identity.profiles")
+                .fetch_one(&self.pool)
+                .await?;
+            row.get::<i64, _>("hw")
         };
 
         let mut listener = PgListener::connect(&self.url).await?;
@@ -216,7 +215,7 @@ impl ProfileStore for PgProfileStore {
             poll: self.poll_interval,
         };
 
-        let stream = futures::stream::unfold(init, |mut st| async move {
+        let stream = unfold(init, |mut st| async move {
             loop {
                 // Drain buffered catch-up events first.
                 if let Some(ev) = st.buf.pop_front() {
@@ -226,7 +225,7 @@ impl ProfileStore for PgProfileStore {
                     Ok(rows) if rows.is_empty() => {
                         // Nothing new — block on a NOTIFY, with a poll fallback so a
                         // missed signal still heals within `poll`.
-                        match tokio::time::timeout(st.poll, st.listener.recv()).await {
+                        match timeout(st.poll, st.listener.recv()).await {
                             Ok(Ok(_notif)) => continue, // re-drain
                             Ok(Err(e)) => {
                                 return Some((Err(Box::new(e) as BoxError), st));
@@ -241,7 +240,7 @@ impl ProfileStore for PgProfileStore {
                                 Change::Delete(sub)
                             } else {
                                 match serde_json::from_str::<Profile>(&doc) {
-                                    Ok(p) => Change::Upsert(p),
+                                    Ok(p) => Change::Upsert(Box::new(p)),
                                     Err(e) => {
                                         warn!(error = %e, "skipping undecodable change doc");
                                         continue;
@@ -315,7 +314,7 @@ mod tests {
 
     #[test]
     fn token_round_trips() {
-        for seq in [0i64, 1, 42, i64::MAX, 9_876_543_210] {
+        for seq in [0_i64, 1, 42, i64::MAX, 9_876_543_210] {
             assert_eq!(decode_token(&encode_token(seq)).unwrap(), seq);
         }
     }
@@ -324,6 +323,6 @@ mod tests {
     fn token_rejects_wrong_length() {
         assert!(decode_token(&[1, 2, 3]).is_err());
         assert!(decode_token(&[]).is_err());
-        assert!(decode_token(&[0u8; 9]).is_err());
+        assert!(decode_token(&[0_u8; 9]).is_err());
     }
 }

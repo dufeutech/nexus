@@ -6,7 +6,7 @@
 //! request host and the value is a Routing Decision.
 //!
 //! Surface over one invalidation-updated decision cache:
-//!   - ext_proc gRPC (hot path): read the request host, normalize it, resolve the
+//!   - `ext_proc` gRPC (hot path): read the request host, normalize it, resolve the
 //!     owning tenant + config, and inject trusted `x-tenant-*` + `x-route-pool`
 //!     (C14/C15) which the edge data plane uses to forward. An unknown/unverified
 //!     host is REJECTED at the edge (immediate 404) before any backend is
@@ -17,9 +17,14 @@
 //! (C16); moka TTL is the staleness backstop and `try_get_with` gives a coalesced
 //! miss-load (C14 "concurrent misses coalesced"). A "no tenant" result is an Err
 //! in the loader, so negatives are never cached as positive mappings (§3.10).
-//! ext_proc fails CLOSED with a 503 until the store is reachable + the feed is
+//! `ext_proc` fails CLOSED with a 503 until the store is reachable + the feed is
 //! subscribed — a routing failure must not silently become a default route.
 
+use std::collections::HashMap;
+use std::env::var;
+use std::error::Error;
+use std::future::pending;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -29,7 +34,10 @@ use futures::StreamExt;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use moka::future::Cache;
+use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
@@ -127,11 +135,11 @@ impl AppState {
                 let Some(tenant_id) = tenant else {
                     // Unknown/unverified host → not cached, surfaced as a miss the
                     // caller rejects (C18).
-                    return Err("no_tenant".to_string());
+                    return Err("no_tenant".to_owned());
                 };
                 let cfg = match store.get_tenant(&tenant_id).await {
                     Ok(Some(c)) => c,
-                    Ok(None) => return Err("no_tenant_config".to_string()),
+                    Ok(None) => return Err("no_tenant_config".to_owned()),
                     Err(e) => return Err(e.to_string()),
                 };
                 // Fold the tenant's per-route auth policy (RFC N4) into the cached
@@ -176,10 +184,10 @@ fn extract_host(req: &ProcessingRequest) -> Option<String> {
     for hv in &headers.headers {
         let key = hv.key.to_ascii_lowercase();
         if key == ":authority" || key == "host" {
-            let val = if !hv.raw_value.is_empty() {
-                String::from_utf8_lossy(&hv.raw_value).into_owned()
-            } else {
+            let val = if hv.raw_value.is_empty() {
                 hv.value.clone()
+            } else {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
             };
             if key == ":authority" {
                 authority = Some(val);
@@ -201,22 +209,22 @@ fn extract_path(req: &ProcessingRequest) -> String {
     let headers = match &req.request {
         Some(processing_request::Request::RequestHeaders(h)) => match h.headers.as_ref() {
             Some(h) => h,
-            None => return "/".to_string(),
+            None => return "/".to_owned(),
         },
-        _ => return "/".to_string(),
+        _ => return "/".to_owned(),
     };
     for hv in &headers.headers {
         if hv.key.eq_ignore_ascii_case(":path") {
-            let raw = if !hv.raw_value.is_empty() {
-                String::from_utf8_lossy(&hv.raw_value).into_owned()
-            } else {
+            let raw = if hv.raw_value.is_empty() {
                 hv.value.clone()
+            } else {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
             };
             let path = raw.split(['?', '#']).next().unwrap_or("/");
-            return if path.is_empty() { "/".to_string() } else { path.to_string() };
+            return if path.is_empty() { "/".to_owned() } else { path.to_owned() };
         }
     }
-    "/".to_string()
+    "/".to_owned()
 }
 
 // --------------------------------------------------------------------------- //
@@ -245,16 +253,16 @@ fn extract_geo(req: &ProcessingRequest) -> Option<GeoContext> {
         _ => return None,
     };
     // Collect the `cf-*` headers (lowercased, prefix dropped) in a single pass.
-    let mut cf: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut cf: HashMap<String, String> = HashMap::new();
     for hv in &headers.headers {
         let key = hv.key.to_ascii_lowercase();
         if let Some(name) = key.strip_prefix("cf-") {
-            let val = if !hv.raw_value.is_empty() {
-                String::from_utf8_lossy(&hv.raw_value).into_owned()
-            } else {
+            let val = if hv.raw_value.is_empty() {
                 hv.value.clone()
+            } else {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
             };
-            cf.insert(name.to_string(), val);
+            cf.insert(name.to_owned(), val);
         }
     }
     // Only act when Cloudflare actually fronted this request.
@@ -277,7 +285,7 @@ fn extract_geo(req: &ProcessingRequest) -> Option<GeoContext> {
 
 /// Normalize the standards-based request-context signals into the trusted
 /// `x-locale` / `x-lang` / `x-currency` / `x-privacy-*` / `x-device-type` set
-/// (router_core::context). Source header names are an adapter concern and live
+/// (`router_core::context`). Source header names are an adapter concern and live
 /// here; `country` (already-normalized geo country) feeds the ISO-4217 currency
 /// derivation. Always present (at least `x-device-type: unknown`).
 fn extract_client_context(req: &ProcessingRequest, country: Option<&str>) -> Vec<(&'static str, String)> {
@@ -290,19 +298,19 @@ fn extract_client_context(req: &ProcessingRequest, country: Option<&str>) -> Vec
     };
     // Collect only the headers we consume (lowercased keys), in one pass.
     const WANTED: &[&str] = &["accept-language", "sec-gpc", "dnt", "sec-ch-ua-mobile", "user-agent"];
-    let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut found: HashMap<String, String> = HashMap::new();
     for hv in &headers.headers {
         let key = hv.key.to_ascii_lowercase();
         if WANTED.contains(&key.as_str()) {
-            let val = if !hv.raw_value.is_empty() {
-                String::from_utf8_lossy(&hv.raw_value).into_owned()
-            } else {
+            let val = if hv.raw_value.is_empty() {
                 hv.value.clone()
+            } else {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
             };
             found.insert(key, val);
         }
     }
-    let g = |k: &str| found.get(k).map(|s| s.as_str());
+    let g = |k: &str| found.get(k).map(String::as_str);
     ClientContext {
         accept_language: g("accept-language"),
         sec_gpc: g("sec-gpc"),
@@ -320,7 +328,7 @@ fn extract_client_context(req: &ProcessingRequest, country: Option<&str>) -> Vec
 fn header(key: &str, value: &str) -> HeaderValueOption {
     HeaderValueOption {
         header: Some(HeaderValue {
-            key: key.to_string(),
+            key: key.to_owned(),
             raw_value: value.as_bytes().to_vec(),
             ..Default::default()
         }),
@@ -408,44 +416,41 @@ impl Router {
             return None;
         }
         let started = Instant::now();
-        let (resp, result) = if !self.state.ready.load(Ordering::Relaxed) {
+        let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
+            let host = extract_host(&req).unwrap_or_default();
+            if let Some(d) = self.state.resolve(&host).await {
+                // Assemble trusted request-context annotations. Edge geo
+                // (Cloudflare) is presence-gated (no-op off Cloudflare); the
+                // standards-based context (locale/currency/privacy/device) is
+                // always evaluated. The normalized geo country feeds currency.
+                let mut extra: Vec<(&'static str, String)> = Vec::new();
+                // Per-route auth policy (RFC N4): resolve the request path
+                // against the tenant's cached policy and emit the authoritative
+                // gate the edge branches on. ALWAYS emitted (true|false) so the
+                // contract is explicit and the C3 strip makes it unforgeable;
+                // jwt_authn keys `requires: provider` vs `allow_missing` on it.
+                let path = extract_path(&req);
+                let required = d.auth.resolve(&path).required;
+                extra.push(("x-auth-required", if required { "true" } else { "false" }.to_owned()));
+                let geo = extract_geo(&req).map(|g| g.to_headers()).unwrap_or_default();
+                let country = geo
+                    .iter()
+                    .find(|(k, _)| *k == "x-geo-country")
+                    .map(|(_, v)| v.clone());
+                if !geo.is_empty() {
+                    extra.push(("x-geo-source", "cloudflare".to_owned()));
+                    extra.extend(geo);
+                }
+                extra.extend(extract_client_context(&req, country.as_deref()));
+                info!(host = %host, tenant = %d.tenant_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
+                (route_response(&d, &extra), "hit")
+            } else {
+                info!(host = %host, "reject: no tenant");
+                (reject_unknown_host(), "reject")
+            }
+        } else {
             warn!("not ready -> 503");
             (warming_503(), "not_ready")
-        } else {
-            let host = extract_host(&req).unwrap_or_default();
-            match self.state.resolve(&host).await {
-                Some(d) => {
-                    // Assemble trusted request-context annotations. Edge geo
-                    // (Cloudflare) is presence-gated (no-op off Cloudflare); the
-                    // standards-based context (locale/currency/privacy/device) is
-                    // always evaluated. The normalized geo country feeds currency.
-                    let mut extra: Vec<(&'static str, String)> = Vec::new();
-                    // Per-route auth policy (RFC N4): resolve the request path
-                    // against the tenant's cached policy and emit the authoritative
-                    // gate the edge branches on. ALWAYS emitted (true|false) so the
-                    // contract is explicit and the C3 strip makes it unforgeable;
-                    // jwt_authn keys `requires: provider` vs `allow_missing` on it.
-                    let path = extract_path(&req);
-                    let required = d.auth.resolve(&path).required;
-                    extra.push(("x-auth-required", if required { "true" } else { "false" }.to_string()));
-                    let geo = extract_geo(&req).map(|g| g.to_headers()).unwrap_or_default();
-                    let country = geo
-                        .iter()
-                        .find(|(k, _)| *k == "x-geo-country")
-                        .map(|(_, v)| v.clone());
-                    if !geo.is_empty() {
-                        extra.push(("x-geo-source", "cloudflare".to_string()));
-                        extra.extend(geo);
-                    }
-                    extra.extend(extract_client_context(&req, country.as_deref()));
-                    info!(host = %host, tenant = %d.tenant_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
-                    (route_response(&d, &extra), "hit")
-                }
-                None => {
-                    info!(host = %host, "reject: no tenant");
-                    (reject_unknown_host(), "reject")
-                }
-            }
         };
         histogram!("router_ext_proc_duration_seconds").record(started.elapsed().as_secs_f64());
         counter!("router_ext_proc_requests_total", "result" => result).increment(1);
@@ -499,7 +504,7 @@ async fn watch_invalidations(state: AppState, invs: Arc<dyn Invalidations>) {
             Ok(()) => warn!("invalidation feed ended; reconnecting"),
             Err(e) => warn!(error = %e, "invalidation feed error; retrying"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -533,14 +538,14 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
 // localhost API: resolve debug (admin), health, metrics.
 // --------------------------------------------------------------------------- //
 mod api {
-    use super::*;
+    use super::{counter, AppState, Ordering};
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router as AxumRouter};
 
-    pub fn router(state: AppState) -> AxumRouter {
+    pub(crate) fn router(state: AppState) -> AxumRouter {
         AxumRouter::new()
             .route("/healthz", get(healthz))
             .route("/resolve/{host}", get(resolve))
@@ -567,15 +572,12 @@ mod api {
             counter!("router_authorize_total", "result" => "deny").increment(1);
             return StatusCode::FORBIDDEN;
         }
-        match s.resolve(&domain).await {
-            Some(_) => {
-                counter!("router_authorize_total", "result" => "allow").increment(1);
-                StatusCode::OK
-            }
-            None => {
-                counter!("router_authorize_total", "result" => "deny").increment(1);
-                StatusCode::FORBIDDEN
-            }
+        if s.resolve(&domain).await.is_some() {
+            counter!("router_authorize_total", "result" => "allow").increment(1);
+            StatusCode::OK
+        } else {
+            counter!("router_authorize_total", "result" => "deny").increment(1);
+            StatusCode::FORBIDDEN
         }
     }
 
@@ -604,7 +606,7 @@ mod api {
 }
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    var(key).unwrap_or_else(|_| default.to_owned())
 }
 
 fn init_tracing() {
@@ -619,7 +621,7 @@ fn init_tracing() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
     let term = async {
@@ -630,16 +632,16 @@ async fn shutdown_signal() {
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
+    let term = pending::<()>();
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = term => {},
+        () = ctrl_c => {},
+        () = term => {},
     }
     info!("shutdown signal received");
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
 
     // Classic-bucket latency histogram on the exporter's own listener (:9302),
@@ -651,11 +653,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use metrics_exporter_prometheus::Matcher;
     PrometheusBuilder::new()
         .set_buckets_for_metric(
-            Matcher::Full("router_ext_proc_duration_seconds".to_string()),
+            Matcher::Full("router_ext_proc_duration_seconds".to_owned()),
             LATENCY_BUCKETS,
         )
         .expect("set histogram buckets")
-        .with_http_listener("0.0.0.0:9302".parse::<std::net::SocketAddr>().unwrap())
+        .with_http_listener("0.0.0.0:9302".parse::<SocketAddr>().unwrap())
         .install()
         .expect("install prometheus exporter");
 
@@ -683,14 +685,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(s) => break Arc::new(s),
             Err(e) => {
                 warn!(error = %e, "waiting for Postgres");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(2)).await;
             }
         }
     };
 
     // L2 is opt-in: enabled only when REDIS_URL is set, and a connect failure
     // degrades to L1-only rather than failing the plane (decision 9).
-    let l2: Option<Arc<dyn SharedCache>> = match std::env::var("REDIS_URL") {
+    let l2: Option<Arc<dyn SharedCache>> = match var("REDIS_URL") {
         Ok(url) if !url.is_empty() => match RedisCache::connect(&url).await {
             Ok(c) => {
                 info!("L2 (Redis) shared cache enabled");
@@ -737,24 +739,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if wm > 0 {
                     gauge!("router_time_to_warm_seconds").set(wm as f64 / 1000.0);
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(5)).await;
             }
-        });
-    }
+        })
+    };
     info!(ttl_s = ttl, capacity, "starting tenant-router");
 
     // Readiness fallback so a feed that never opens can't wedge us fail-closed.
     {
         let st = state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            sleep(Duration::from_secs(15)).await;
             if !st.ready.swap(true, Ordering::Relaxed) {
                 st.warm_ms
                     .store(st.start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 warn!("readiness fallback fired");
             }
-        });
-    }
+        })
+    };
 
     // Invalidation feed watcher.
     {
@@ -762,8 +764,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let invs: Arc<dyn Invalidations> = Arc::new(PgInvalidations::new(pg_url.clone()));
         tokio::spawn(async move {
             watch_invalidations(st, invs).await;
-        });
-    }
+        })
+    };
 
     // Shared shutdown fan-out for both servers.
     let (tx, _r) = watch::channel(false);
@@ -778,7 +780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = {
         let app = api::router(state.clone());
         tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:9300").await.unwrap();
+            let listener = TcpListener::bind("0.0.0.0:9300").await.unwrap();
             info!("resolve/health API on :9300");
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {

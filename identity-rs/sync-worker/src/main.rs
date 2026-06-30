@@ -1,16 +1,21 @@
 //! Sync Worker (Rust) — the real-time half of the sync pipeline (RFC C7, §3.4).
 //!
 //! On startup it self-registers an Actions v2 webhook target + an all-events
-//! execution against the IdP (owning its own signing key), then for every
+//! execution against the `IdP` (owning its own signing key), then for every
 //! delivery it: verifies the HMAC signature, maps the event to a Profile via
 //! `identity_core::sync` (the SHARED guard — same logic as the reconciler), and
 //! applies an idempotent, version-guarded upsert/delete into the KV bucket.
 //!
-//! No webhook retry exists at the IdP, so a dropped delivery leaves KV stale;
+//! No webhook retry exists at the `IdP`, so a dropped delivery leaves KV stale;
 //! the Reconciler closes that gap. This worker is the real-time path only.
 
+use std::env::var;
+use std::error::Error;
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(not(unix))]
+use std::future::pending;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -21,8 +26,12 @@ use axum::Router;
 use hmac::{Hmac, Mac};
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use reqwest::header::HOST;
 use serde_json::{json, Value};
 use sha2::Sha256;
+use tokio::net::TcpListener;
+use tokio::signal;
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use identity_core::store::ProfileStore;
@@ -40,7 +49,7 @@ struct App {
 }
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    var(key).unwrap_or_else(|_| default.to_owned())
 }
 
 fn now_secs() -> f64 {
@@ -59,8 +68,8 @@ fn verify_signature(headers: &HeaderMap, body: &[u8], signing_key: &str) -> bool
     for part in sig.split(',') {
         if let Some((k, v)) = part.split_once('=') {
             match k.trim() {
-                "t" => t = Some(v.trim().to_string()),
-                "v1" => v1 = Some(v.trim().to_string()),
+                "t" => t = Some(v.trim().to_owned()),
+                "v1" => v1 = Some(v.trim().to_owned()),
                 _ => {}
             }
         }
@@ -99,7 +108,7 @@ async fn webhook(State(s): State<App>, headers: HeaderMap, body: Bytes) -> impl 
                     "delete"
                 }
                 Apply::Upsert(profile) => match s.store.put(&profile).await {
-                    Ok(_) => "upsert",
+                    Ok(()) => "upsert",
                     Err(e) => {
                         warn!(error = %e, sub = %ev.sub, "store put failed");
                         "error"
@@ -131,13 +140,13 @@ async fn register_webhook(
     host: &str,
     pat: &str,
     self_url: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
     let name = format!("sync-worker-{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
     let target: Value = client
         .post(format!("{internal_url}/v2/actions/targets"))
         .bearer_auth(pat)
-        .header(reqwest::header::HOST, host)
+        .header(HOST, host)
         .json(&json!({
             "name": name, "endpoint": self_url, "timeout": "10s",
             "restWebhook": {"interruptOnError": false}
@@ -147,12 +156,12 @@ async fn register_webhook(
         .error_for_status()?
         .json()
         .await?;
-    let target_id = target["id"].as_str().ok_or("no target id")?.to_string();
-    let signing_key = target["signingKey"].as_str().ok_or("no signing key")?.to_string();
+    let target_id = target["id"].as_str().ok_or("no target id")?.to_owned();
+    let signing_key = target["signingKey"].as_str().ok_or("no signing key")?.to_owned();
     client
         .put(format!("{internal_url}/v2/actions/executions"))
         .bearer_auth(pat)
-        .header(reqwest::header::HOST, host)
+        .header(HOST, host)
         .json(&json!({ "condition": {"event": {"all": true}}, "targets": [target_id] }))
         .send()
         .await?
@@ -162,7 +171,7 @@ async fn register_webhook(
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
     let term = async {
@@ -171,8 +180,8 @@ async fn shutdown_signal() {
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    let term = pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = term => {} }
     info!("shutdown signal received");
 }
 
@@ -188,7 +197,7 @@ fn init_tracing() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
     let handle = PrometheusBuilder::new().install_recorder()?;
 
@@ -198,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let self_url = env("WEBHOOK_SELF_URL", "http://sync-worker:8080/webhook");
     let pat_file = env("PAT_FILE", "/secrets/zitadel-admin-sa.pat");
 
-    let pat = std::fs::read_to_string(&pat_file)?.trim().to_string();
+    let pat = fs::read_to_string(&pat_file)?.trim().to_owned();
 
     // Wait for Postgres, then for the IdP Actions API (mirrors the prior retry).
     // As an authoritative writer, the sync-worker owns idempotent schema setup.
@@ -210,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             Err(e) => warn!(error = %e, "waiting for Postgres"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
     };
     let store: Arc<dyn ProfileStore> = store;
     let signing_key = loop {
@@ -218,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(k) => break k,
             Err(e) => {
                 warn!(error = %e, "waiting for IdP Actions API");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(2)).await;
             }
         }
     };
@@ -231,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/healthz", get(healthz))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let listener = TcpListener::bind("0.0.0.0:8080").await?;
     info!("listening on :8080 (/webhook, /metrics, /healthz)");
     if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

@@ -11,18 +11,25 @@
 //! unverified domain never routes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env::var;
+use std::error::Error;
+use std::fmt;
+use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use metrics::counter;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::net::TcpListener;
+use tokio::signal;
+use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
@@ -55,7 +62,7 @@ struct App {
 }
 
 /// Uniform 500 for an unexpected store/adapter error.
-fn internal<E: std::fmt::Display>(e: E) -> Response {
+fn internal<E: fmt::Display>(e: E) -> Response {
     error!(error = %e, "control-plane error");
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response()
 }
@@ -67,7 +74,7 @@ fn internal<E: std::fmt::Display>(e: E) -> Response {
 fn load_plan_limits() -> PlanLimits {
     fn conservative() -> PlanLimits {
         let mut m = BTreeMap::new();
-        m.insert("free".to_string(), DomainLimit::Finite(1));
+        m.insert("free".to_owned(), DomainLimit::Finite(1));
         PlanLimits::new(m)
     }
     let raw = env("ROUTING_PLAN_LIMITS", "");
@@ -79,7 +86,7 @@ fn load_plan_limits() -> PlanLimits {
         Ok(map) => {
             let limits = map
                 .into_iter()
-                .map(|(k, v)| (k, v.map(DomainLimit::Finite).unwrap_or(DomainLimit::Unbounded)))
+                .map(|(k, v)| (k, v.map_or(DomainLimit::Unbounded, DomainLimit::Finite)))
                 .collect();
             PlanLimits::new(limits)
         }
@@ -134,7 +141,7 @@ impl App {
 }
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    var(key).unwrap_or_else(|_| default.to_owned())
 }
 
 // --------------------------------------------------------------------------- //
@@ -151,7 +158,7 @@ struct TenantBody {
 }
 
 fn default_plan() -> String {
-    "free".to_string()
+    "free".to_owned()
 }
 
 async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> impl IntoResponse {
@@ -435,7 +442,7 @@ async fn verify_domain(State(s): State<App>, Path(domain): Path<String>) -> Resp
 /// owners have published the proof without a manual "check now". Best-effort —
 /// failures leave the domain pending for the next pass.
 async fn verification_poll(app: App, interval_secs: u64) {
-    let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut tick = interval(Duration::from_secs(interval_secs));
     let mut lease: Option<LeaderLease> = None;
     loop {
         tick.tick().await;
@@ -485,7 +492,7 @@ async fn verification_poll(app: App, interval_secs: u64) {
             }
         };
         for domain in pending {
-            if let VerifyOutcome::Verified = verify_one(&app, &domain).await {
+            if matches!(verify_one(&app, &domain).await, VerifyOutcome::Verified) {
                 info!(domain = %domain, "verification poll: domain converged");
             }
         }
@@ -627,7 +634,7 @@ fn init_tracing() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
     let term = async {
@@ -638,13 +645,13 @@ async fn shutdown_signal() {
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    let term = pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = term => {} }
     info!("shutdown signal received");
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
     let metrics = PrometheusBuilder::new().install_recorder()?;
 
@@ -662,7 +669,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             Err(e) => warn!(error = %e, "waiting for Postgres"),
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
     };
     info!("routing schema ready");
 
@@ -694,7 +701,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/domains", post(upsert_domain))
         .route("/domains/declare", post(declare_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
-        .route("/domains/{domain}", axum::routing::delete(delete_domain))
+        .route("/domains/{domain}", delete(delete_domain))
         .route(
             "/tenants/{id}/auth-routes",
             get(list_auth_routes)
@@ -705,7 +712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/healthz", get(healthz))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9400").await?;
+    let listener = TcpListener::bind("0.0.0.0:9400").await?;
     info!("control plane on :9400 (/tenants, /tenants/:id/auth-routes, /domains, /domains/declare, /metrics, /healthz)");
     if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

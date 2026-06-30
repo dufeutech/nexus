@@ -2,6 +2,12 @@
 name = "reconciler"
 edition.workspace = true
 version.workspace = true
+description = "Reconciliation worker for the Nexus identity plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "reconciler"
@@ -15,6 +21,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
-futures = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
+
+[lints]
+workspace = true

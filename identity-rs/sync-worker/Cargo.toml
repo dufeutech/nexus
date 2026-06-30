@@ -2,6 +2,12 @@
 name = "sync-worker"
 edition.workspace = true
 version.workspace = true
+description = "Worker that syncs identity profile changes for the Nexus identity plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "sync-worker"
@@ -21,3 +27,6 @@ sha2.workspace = true
 hex.workspace = true
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+[lints]
+workspace = true

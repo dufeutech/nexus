@@ -2,6 +2,12 @@
 name = "tenant-router"
 edition.workspace = true
 version.workspace = true
+description = "Per-tenant routing sidecar for the Nexus routing plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "tenant-router"
@@ -24,3 +30,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+
+[lints]
+workspace = true

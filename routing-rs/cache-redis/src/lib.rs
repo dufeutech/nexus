@@ -16,6 +16,8 @@
 //! and only the hot L1 working set is unaffected. A degraded optimization MUST
 //! NOT become a hot-path outage.
 
+use std::env;
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,13 +42,13 @@ impl RedisCache {
     pub async fn connect(url: &str) -> Result<Self, BoxError> {
         let client = redis::Client::open(url)?;
         let conn = ConnectionManager::new(client).await?;
-        let ms = std::env::var("REDIS_OP_TIMEOUT_MS")
+        let ms = env::var("REDIS_OP_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_OP_TIMEOUT_MS);
         Ok(Self {
             conn,
-            prefix: "routing:".to_string(),
+            prefix: "routing:".to_owned(),
             op_timeout: Duration::from_millis(ms),
         })
     }
@@ -60,7 +62,7 @@ impl RedisCache {
     /// path on a slow/dead Redis.
     async fn bounded<F, T>(&self, what: &str, fut: F) -> Result<T, BoxError>
     where
-        F: std::future::Future<Output = Result<T, BoxError>>,
+        F: Future<Output = Result<T, BoxError>>,
     {
         match timeout(self.op_timeout, fut).await {
             Ok(res) => res,

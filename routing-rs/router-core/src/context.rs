@@ -57,7 +57,7 @@ impl ClientContext<'_> {
         }
         // Currency (ISO 4217) from the resolved country.
         if let Some(cur) = self.country.and_then(country_to_currency) {
-            out.push(("x-currency", cur.to_string()));
+            out.push(("x-currency", cur.to_owned()));
         }
         // Privacy booleans (omitted when the client sent no signal).
         if let Some(b) = self.sec_gpc.and_then(parse_flag) {
@@ -67,7 +67,7 @@ impl ClientContext<'_> {
             out.push(("x-privacy-dnt", b.to_string()));
         }
         // Device class: emitted always (mobile / desktop / unknown).
-        out.push(("x-device-type", device_type(self.sec_ch_ua_mobile, self.user_agent).to_string()));
+        out.push(("x-device-type", device_type(self.sec_ch_ua_mobile, self.user_agent).to_owned()));
         out
     }
 }
@@ -113,17 +113,17 @@ fn normalize_tag(tag: &str) -> Option<(String, String)> {
         return None;
     }
     let mut subs = tag.split('-');
-    let lang = subs.next().unwrap_or("");
-    if lang.len() < 2 || lang.len() > 3 || !lang.bytes().all(|b| b.is_ascii_alphabetic()) {
+    let primary = subs.next().unwrap_or("");
+    if primary.len() < 2 || primary.len() > 3 || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
         return None;
     }
-    let lang = lang.to_ascii_lowercase();
+    let lang = primary.to_ascii_lowercase();
     // First following 2-letter alpha subtag is the region (skip 4-letter scripts).
     let region = subs.find(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_alphabetic()));
-    let locale = match region {
-        Some(r) => format!("{lang}-{}", r.to_ascii_uppercase()),
-        None => lang.clone(),
-    };
+    let locale = region.map_or_else(
+        || lang.clone(),
+        |r| format!("{lang}-{}", r.to_ascii_uppercase()),
+    );
     Some((locale, lang))
 }
 
@@ -152,22 +152,19 @@ fn device_type(sec_ch_ua_mobile: Option<&str>, user_agent: Option<&str>) -> &'st
             _ => {}
         }
     }
-    match user_agent {
-        Some(ua) => {
-            // RFC/convention: mobile browsers carry the "Mobi" token; phones/tablets
-            // also identify by platform. These markers are reliable positives.
-            let mobile = ["Mobi", "Android", "iPhone", "iPad", "iPod"];
-            if mobile.iter().any(|m| ua.contains(m)) {
-                "mobile"
-            } else if ["Windows NT", "Macintosh", "X11", "CrOS"].iter().any(|d| ua.contains(d)) {
-                "desktop"
-            } else {
-                // Bots, scripts, unknown clients: be honest.
-                "unknown"
-            }
+    user_agent.map_or("unknown", |ua| {
+        // RFC/convention: mobile browsers carry the "Mobi" token; phones/tablets
+        // also identify by platform. These markers are reliable positives.
+        let mobile = ["Mobi", "Android", "iPhone", "iPad", "iPod"];
+        if mobile.iter().any(|m| ua.contains(m)) {
+            "mobile"
+        } else if ["Windows NT", "Macintosh", "X11", "CrOS"].iter().any(|d| ua.contains(d)) {
+            "desktop"
+        } else {
+            // Bots, scripts, unknown clients: be honest.
+            "unknown"
         }
-        None => "unknown",
-    }
+    })
 }
 
 /// Map an ISO 3166-1 alpha-2 country to its primary ISO 4217 currency. A compact
@@ -225,24 +222,24 @@ mod tests {
         }
         .to_headers();
         // fr-CH has the implicit q=1.0, so it wins; normalized lang/locale.
-        assert!(h.contains(&("x-locale", "fr-CH".to_string())));
-        assert!(h.contains(&("x-lang", "fr".to_string())));
+        assert!(h.contains(&("x-locale", "fr-CH".to_owned())));
+        assert!(h.contains(&("x-lang", "fr".to_owned())));
     }
 
     #[test]
     fn language_q_zero_and_wildcard_are_skipped() {
         let (loc, lang) = best_locale("*, en-US;q=0").map_or((String::new(), String::new()), |x| x);
         assert!(loc.is_empty() && lang.is_empty(), "q=0 and * must yield nothing");
-        assert_eq!(best_locale("en-US"), Some(("en-US".to_string(), "en".to_string())));
-        assert_eq!(best_locale("pt-br"), Some(("pt-BR".to_string(), "pt".to_string())));
+        assert_eq!(best_locale("en-US"), Some(("en-US".to_owned(), "en".to_owned())));
+        assert_eq!(best_locale("pt-br"), Some(("pt-BR".to_owned(), "pt".to_owned())));
     }
 
     #[test]
     fn currency_from_country_iso4217() {
         let cur = |c: &str| ClientContext { country: Some(c), ..Default::default() }.to_headers();
-        assert!(cur("US").contains(&("x-currency", "USD".to_string())));
-        assert!(cur("de").contains(&("x-currency", "EUR".to_string()))); // Eurozone, lowercased in
-        assert!(cur("JP").contains(&("x-currency", "JPY".to_string())));
+        assert!(cur("US").contains(&("x-currency", "USD".to_owned())));
+        assert!(cur("de").contains(&("x-currency", "EUR".to_owned()))); // Eurozone, lowercased in
+        assert!(cur("JP").contains(&("x-currency", "JPY".to_owned())));
         // Unmapped country → no currency header (honest omission).
         assert!(!cur("ZZ").iter().any(|(k, _)| *k == "x-currency"));
     }
@@ -250,8 +247,8 @@ mod tests {
     #[test]
     fn privacy_flags_normalize_and_omit_when_absent() {
         let h = ClientContext { sec_gpc: Some("1"), dnt: Some("0"), ..Default::default() }.to_headers();
-        assert!(h.contains(&("x-privacy-gpc", "true".to_string())));
-        assert!(h.contains(&("x-privacy-dnt", "false".to_string())));
+        assert!(h.contains(&("x-privacy-gpc", "true".to_owned())));
+        assert!(h.contains(&("x-privacy-dnt", "false".to_owned())));
         // No signals → neither privacy header present.
         let none = ClientContext::default().to_headers();
         assert!(!none.iter().any(|(k, _)| k.starts_with("x-privacy")));
@@ -264,8 +261,7 @@ mod tests {
                 .to_headers()
                 .into_iter()
                 .find(|(k, _)| *k == "x-device-type")
-                .unwrap()
-                .1
+                .map_or_else(String::new, |(_, v)| v)
         };
         // Client hint wins even if the UA text disagrees.
         assert_eq!(dt(Some("?1"), Some("Mozilla/5.0 (Windows NT 10.0)")), "mobile");
@@ -279,8 +275,7 @@ mod tests {
                 .to_headers()
                 .into_iter()
                 .find(|(k, _)| *k == "x-device-type")
-                .unwrap()
-                .1
+                .map_or_else(String::new, |(_, v)| v)
         };
         assert_eq!(dt("Mozilla/5.0 (Linux; Android 13) Mobile"), "mobile");
         assert_eq!(dt("Mozilla/5.0 (Macintosh; Intel Mac OS X)"), "desktop");
@@ -292,8 +287,7 @@ mod tests {
                 .to_headers()
                 .into_iter()
                 .find(|(k, _)| *k == "x-device-type")
-                .unwrap()
-                .1,
+                .map_or_else(String::new, |(_, v)| v),
             "unknown"
         );
     }

@@ -109,7 +109,7 @@ fn norm_text(raw: &str) -> Option<String> {
     if v.is_empty() || v.len() > MAX_TEXT_LEN {
         return None;
     }
-    Some(v.to_string())
+    Some(v.to_owned())
 }
 
 /// Coordinate: must parse as a finite floating-point number; re-emit the canonical
@@ -128,7 +128,7 @@ fn norm_ip(raw: &str) -> Option<String> {
     if v.is_empty() || v.len() > 64 || v.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
         return None;
     }
-    Some(v.to_string())
+    Some(v.to_owned())
 }
 
 #[cfg(test)]
@@ -143,8 +143,8 @@ mod tests {
             ..Default::default()
         };
         let h = g.to_headers();
-        assert!(h.contains(&("x-geo-country", "US".to_string())));
-        assert!(h.contains(&("x-geo-continent", "NA".to_string())));
+        assert!(h.contains(&("x-geo-country", "US".to_owned())));
+        assert!(h.contains(&("x-geo-continent", "NA".to_owned())));
 
         // Overlong / non-alphanumeric codes are dropped, not forwarded raw.
         let bad = GeoContext {
@@ -159,7 +159,7 @@ mod tests {
     fn upstream_sentinels_are_preserved() {
         // `XX` (unknown) and `T1` (Tor) are valid 2-char codes and must survive.
         let g = GeoContext { country: Some("t1".into()), ..Default::default() };
-        assert_eq!(g.to_headers(), vec![("x-geo-country", "T1".to_string())]);
+        assert_eq!(g.to_headers(), vec![("x-geo-country", "T1".to_owned())]);
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
             ..Default::default()
         };
         let h = g.to_headers();
-        assert!(h.contains(&("x-geo-city", "New York".to_string())));
+        assert!(h.contains(&("x-geo-city", "New York".to_owned())));
         assert!(!h.iter().any(|(k, _)| *k == "x-geo-region"));
         assert!(!h.iter().any(|(k, _)| *k == "x-geo-postal-code"));
     }
@@ -184,14 +184,14 @@ mod tests {
             ..Default::default()
         };
         let h = g.to_headers();
-        assert!(h.contains(&("x-geo-latitude", "37.77".to_string())));
+        assert!(h.contains(&("x-geo-latitude", "37.77".to_owned())));
         assert!(!h.iter().any(|(k, _)| *k == "x-geo-longitude"));
     }
 
     #[test]
     fn client_ip_rejects_whitespace() {
         let ok = GeoContext { client_ip: Some(" 2001:db8::1 ".into()), ..Default::default() };
-        assert_eq!(ok.to_headers(), vec![("x-geo-client-ip", "2001:db8::1".to_string())]);
+        assert_eq!(ok.to_headers(), vec![("x-geo-client-ip", "2001:db8::1".to_owned())]);
 
         let bad = GeoContext { client_ip: Some("1.2.3.4 5.6.7.8".into()), ..Default::default() };
         assert!(bad.to_headers().is_empty());

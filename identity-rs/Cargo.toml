@@ -5,6 +5,11 @@ members = ["core", "store-postgres", "sidecar", "sync-worker", "reconciler"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/dufeutech/nexus"
+keywords = ["identity", "authz", "multi-tenant"]
+categories = ["network-programming"]
+readme = "README.md"
 
 [workspace.dependencies]
 # Domain + shared
@@ -28,5 +33,185 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# ──────────────────────────────────────────────────────────────
+# Rustc lints — deny everything allowed-by-default that matters
+# ──────────────────────────────────────────────────────────────
+[workspace.lints.rust]
+# `deny` (not `forbid`) so an audited exception could carry an
+# `#[expect(unsafe_code, reason = …)]` if it ever becomes necessary. The
+# workspace currently contains zero unsafe blocks, so this is effectively a
+# hard ban today.
+unsafe_code = "deny"
+unused = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+# Migration lint (crates are edition 2021); warn now, resolve before an edition bump.
+rust_2024_compatibility = { level = "warn", priority = -1 }
+elided_lifetimes_in_paths = "deny"
+explicit_outlives_requirements = "deny"
+macro_use_extern_crate = "deny"
+meta_variable_misuse = "deny"
+missing_abi = "deny"
+missing_copy_implementations = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+variant_size_differences = "warn"
+
+# Burn-down (rustc): deny lints with existing violations, temporarily "warn"
+# until the backlog is cleared — then flip each back to "deny". Set 2026-06-30.
+missing_docs = "warn"                  # owner: human (doc prose)
+missing_debug_implementations = "warn"
+trivial_casts = "warn"
+unused_results = "warn"
+let_underscore_drop = "warn"
+unused_crate_dependencies = "warn"     # real: a few test-only deps belong in [dev-dependencies]
+
+# ──────────────────────────────────────────────────────────────
+# Clippy lint groups
+# ──────────────────────────────────────────────────────────────
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# Allow nursery lint that conflicts with rustc unreachable_pub
+redundant_pub_crate = "allow"
+# Transitive deps may pull multiple versions of the same crate
+multiple_crate_versions = "allow"
+
+# ── Intentional allows — these lints fight this codebase's architecture ──
+# Server run-loops are deliberately infinite (control-plane, tenant-router).
+infinite_loop = "allow"
+# Numeric casts are inherent to metrics/telemetry; routing From/TryFrom through
+# every counter adds noise without buying safety here.
+as_conversions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+
+# ── Cherry-picked restriction lints (never enable the whole group) ──
+# Panics / unwraps / unfinished code
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_in_result = "deny"
+
+# Printing / IO
+print_stdout = "deny"
+print_stderr = "deny"
+verbose_file_reads = "deny"
+
+# Indexing / arithmetic / casts
+float_cmp_const = "deny"
+fn_to_numeric_cast_any = "deny"
+lossy_float_literal = "deny"
+
+# Strings / allocations
+str_to_string = "deny"
+string_add = "deny"
+string_slice = "deny"
+format_push_string = "deny"
+
+# Unsafe / soundness
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+# Shadowing
+shadow_unrelated = "deny"
+
+# Lint suppression — "no cheating"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# Code quality / style
+create_dir = "deny"
+deref_by_slicing = "deny"
+empty_drop = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+exit = "deny"
+filetype_is_file = "deny"
+get_unwrap = "deny"
+large_include_file = "deny"
+mem_forget = "deny"
+min_ident_chars = "deny"
+missing_assert_message = "deny"
+mixed_read_write_in_expression = "deny"
+mutex_atomic = "deny"
+needless_raw_strings = "deny"
+partial_pub_fields = "deny"
+rc_mutex = "deny"
+redundant_type_annotations = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+same_name_method = "deny"
+self_named_module_files = "deny"
+try_err = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_self_imports = "deny"
+unneeded_field_pattern = "deny"
+wildcard_enum_match_arm = "deny"
+missing_trait_methods = "deny"
+absolute_paths = "deny"
+if_then_some_else_none = "deny"
+semicolon_outside_block = "deny"
+unseparated_literal_suffix = "deny"
+ref_patterns = "deny"
+renamed_function_params = "deny"
+
+# ── Burn-down (clippy): lints with existing violations, temporarily "warn" ──
+# until cleared, then flip each back to "deny". Set 2026-06-30.
+# Docs (owner: human)
+missing_docs_in_private_items = "warn"
+too_long_first_doc_paragraph = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+doc_lazy_continuation = "warn"
+# Relaxed in practice — heavy, legitimate use in #[cfg(test)] code
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+tests_outside_test_module = "warn"
+# Code-quality backlog (mechanical; safe to burn down incrementally)
+shadow_reuse = "warn"
+clone_on_ref_ptr = "warn"
+impl_trait_in_params = "warn"
+let_underscore_must_use = "warn"
+multiple_inherent_impl = "warn"
+option_if_let_else = "warn"
+items_after_statements = "warn"
+unreadable_literal = "warn"
+useless_let_if_seq = "warn"
+too_many_lines = "warn"
+needless_continue = "warn"
+needless_pass_by_value = "warn"
+# Soundness/quality with violations only in the identity service crates.
+# NOTE: routing-rs satisfies all four of these at "deny" — they are kept strict
+# there. Burn these down in identity-rs, then flip back to "deny" to match.
+arithmetic_side_effects = "warn"
+shadow_same = "warn"
+iter_over_hash_type = "warn"
+rc_buffer = "warn"
+
+# ──────────────────────────────────────────────────────────────
+# Profiles (apply at the workspace root only)
+# ──────────────────────────────────────────────────────────────
+[profile.dev]
+debug = true
+overflow-checks = true
+
 [profile.release]
-opt-level = 2
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+overflow-checks = true

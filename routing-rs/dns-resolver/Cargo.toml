@@ -2,6 +2,12 @@
 name = "dns-resolver"
 edition.workspace = true
 version.workspace = true
+description = "DNS ownership-proof resolver for the Nexus routing plane"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [lib]
 name = "dns_resolver"
@@ -10,5 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 router-core = { path = "../router-core" }
 async-trait.workspace = true
-tokio.workspace = true
 hickory-resolver.workspace = true
+
+[lints]
+workspace = true

@@ -3,13 +3,15 @@
 //! (rules §2). An adapter crate implements these against a concrete database;
 //! core and the services depend only on the traits.
 
+use std::error::Error;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::auth::AuthPolicy;
 use crate::domain::TenantConfig;
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxError = Box<dyn Error + Send + Sync>;
 
 /// A stored domain mapping as the control plane sees it (RFC §3.13): which tenant
 /// owns it, whether it is a wildcard, and whether it is verified. Unlike the

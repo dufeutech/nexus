@@ -1,10 +1,10 @@
-//! PostgreSQL adapter for the `RoutingStore` + `Invalidations` ports
+//! `PostgreSQL` adapter for the `RoutingStore` + `Invalidations` ports
 //! (RFC §3.10/§3.11/§3.13, C16).
 //!
 //! - The authoritative routing state is written by the control plane and read
 //!   (point lookups only) by the tenant-router. Reuses the lab's existing
 //!   Postgres server under a dedicated `routing` schema so it never collides
-//!   with the IdP's own tables (RFC decision 14: the routing plane reuses an
+//!   with the `IdP`'s own tables (RFC decision 14: the routing plane reuses an
 //!   authoritative store the control plane writes).
 //! - Invalidation is delivered over Postgres `LISTEN/NOTIFY`: every control-plane
 //!   mutation issues `pg_notify('routing_invalidations', <domain>)`; the router
@@ -14,7 +14,7 @@
 //! - All access is point-read/point-write by key (no request-path scans, §3.10).
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
+use futures::stream::{unfold, StreamExt};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row};
@@ -153,7 +153,7 @@ impl PgRoutingStore {
             .bind(key)
             .fetch_one(&mut *conn)
             .await?;
-        Ok(if got { Some(LeaderLease { conn }) } else { None })
+        Ok(got.then(|| LeaderLease { conn }))
     }
 }
 
@@ -460,9 +460,9 @@ impl Invalidations for PgInvalidations {
         listener.listen(INVALIDATION_CHANNEL).await?;
         // Built over `recv()` so each yielded item is the notification payload
         // (the normalized domain key) or a recoverable error the caller reopens on.
-        let stream = futures::stream::unfold(listener, |mut l| async move {
+        let stream = unfold(listener, |mut l| async move {
             let item = match l.recv().await {
-                Ok(n) => Ok(n.payload().to_string()),
+                Ok(n) => Ok(n.payload().to_owned()),
                 Err(e) => Err(Box::new(e) as BoxError),
             };
             Some((item, l))

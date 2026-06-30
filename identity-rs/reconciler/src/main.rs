@@ -1,7 +1,7 @@
 //! Reconciler (Rust) — the self-healing half of the sync pipeline (RFC C8).
 //!
-//! The IdP does not retry failed webhooks, so a dropped delivery would leave KV
-//! stale. The Reconciler converges KV toward the IdP's authoritative state on a
+//! The `IdP` does not retry failed webhooks, so a dropped delivery would leave KV
+//! stale. The Reconciler converges KV toward the `IdP`'s authoritative state on a
 //! periodic timer (and at startup). It uses the SHARED mapping/diff in
 //! `identity_core::reconcile` (same logic as the sync-worker's writes).
 //!
@@ -10,18 +10,29 @@
 //! select a hash-slice of subjects this instance owns; an instance only upserts
 //! and only deletes keys it owns. Default `SHARD_TOTAL=1` ⇒ one instance owns
 //! the whole keyspace (the small-scale reference behavior). NOTE: true 1B-scale
-//! reconciliation also requires *partitioned enumeration* at the IdP adapter
+//! reconciliation also requires *partitioned enumeration* at the `IdP` adapter
 //! (server-side key-range paging or a change-data feed); client-side hashing
 //! here is the seam, not the whole answer.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::env::var;
+use std::error::Error;
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(unix))]
+use std::future::pending;
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use reqwest::header::HOST;
 use serde_json::{json, Value};
+use tokio::signal;
+use tokio::sync::watch;
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use identity_core::reconcile::{build_profile_from_user, differs};
@@ -30,10 +41,10 @@ use identity_core::Profile;
 use store_postgres::PgProfileStore;
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    var(key).unwrap_or_else(|_| default.to_owned())
 }
-fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn env_num<T: FromStr>(key: &str, default: T) -> T {
+    var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -50,7 +61,7 @@ impl Shard {
         if self.total <= 1 {
             return true;
         }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = DefaultHasher::new();
         key.hash(&mut h);
         h.finish() % self.total == self.index
     }
@@ -69,7 +80,7 @@ impl Idp {
         self.client
             .post(format!("{}{}", self.internal_url, path))
             .bearer_auth(&self.pat)
-            .header(reqwest::header::HOST, &self.host)
+            .header(HOST, &self.host)
             .json(&body)
             .send()
             .await?
@@ -99,7 +110,7 @@ impl Idp {
                             .and_then(|v| v.as_array())
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
-                        out.entry(uid.to_string()).or_default().extend(roles);
+                        out.entry(uid.to_owned()).or_default().extend(roles);
                     }
                 }
             }
@@ -127,13 +138,13 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
         .collect();
 
     let mut authoritative: HashSet<String> = HashSet::new();
-    let mut upserted = 0u64;
+    let mut upserted = 0_u64;
     for u in &users {
         let Some(uid) = u.get("userId").and_then(|v| v.as_str()) else { continue };
         if !shard.owns(uid) {
             continue;
         }
-        authoritative.insert(uid.to_string());
+        authoritative.insert(uid.to_owned());
         let desired = build_profile_from_user(u, grants.get(uid).cloned().unwrap_or_default());
         if differs(&desired, stored.get(uid)) {
             store.put(&desired).await?;
@@ -143,7 +154,7 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
 
     // Orphan deletes: only safe when the (sharded) list was complete — a page
     // shortfall can't prove absence, so deletions are skipped that pass.
-    let mut deleted = 0u64;
+    let mut deleted = 0_u64;
     if users.len() as u64 >= idp.page {
         warn!(page = idp.page, "user list hit page limit; skipping deletions this pass");
     } else {
@@ -165,7 +176,7 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
     let term = async {
@@ -174,8 +185,8 @@ async fn shutdown_signal() {
         }
     };
     #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    let term = pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = term => {} }
 }
 
 fn init_tracing() {
@@ -190,25 +201,25 @@ fn init_tracing() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_tracing();
-    let metrics_port: u16 = env_num("METRICS_PORT", 9000u16);
+    let metrics_port: u16 = env_num("METRICS_PORT", 9000_u16);
     PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], metrics_port))
         .install()?;
     info!(port = metrics_port, "metrics listener up");
 
     let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
-    let interval = Duration::from_secs(env_num("RECONCILE_INTERVAL", 600u64));
-    let shard = Shard { total: env_num("SHARD_TOTAL", 1u64).max(1), index: env_num("SHARD_INDEX", 0u64) };
+    let interval = Duration::from_secs(env_num("RECONCILE_INTERVAL", 600_u64));
+    let shard = Shard { total: env_num("SHARD_TOTAL", 1_u64).max(1), index: env_num("SHARD_INDEX", 0_u64) };
 
-    let pat = std::fs::read_to_string(env("PAT_FILE", "/secrets/zitadel-admin-sa.pat"))?.trim().to_string();
+    let pat = fs::read_to_string(env("PAT_FILE", "/secrets/zitadel-admin-sa.pat"))?.trim().to_owned();
     let idp = Idp {
         client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
         internal_url: env("ZITADEL_INTERNAL_URL", "http://zitadel:8080"),
         host: env("ZITADEL_HOST", "localhost:8088"),
         pat,
-        page: env_num("RECONCILE_PAGE_LIMIT", 1000u64),
+        page: env_num("RECONCILE_PAGE_LIMIT", 1000_u64),
     };
 
     // The reconciler is an authoritative writer, so it owns idempotent schema
@@ -221,12 +232,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             Err(e) => warn!(error = %e, "waiting for Postgres"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
     };
     let store: Arc<dyn ProfileStore> = store;
     info!(interval_s = interval.as_secs(), shard_total = shard.total, shard_index = shard.index, "started");
 
-    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let (tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = tx.send(true);
@@ -244,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         histogram!("reconcile_pass_duration_seconds").record(started.elapsed().as_secs_f64());
 
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            () = sleep(interval) => {}
             _ = rx.changed() => break,
         }
     }

@@ -5,7 +5,7 @@
 //! data-driven (rules §1.3/§5: the rules come from the store, never a constant).
 //!
 //! Two-knob separation (N4): authentication *method* (password/passkey/MFA/SSO)
-//! stays in the IdP; this is route *protection* only — "must this path carry a
+//! stays in the `IdP`; this is route *protection* only — "must this path carry a
 //! verified credential, or may it pass through anonymously?". Phase 1 covers the
 //! single boolean `required`; role/entitlement/min-AAL gating is a later phase.
 //!
@@ -16,8 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The protection decision for one route: phase 1 is the single authentication
-/// gate. `required = false` → anonymous pass-through (jwt_authn `allow_missing`);
-/// `required = true` → a verified credential is demanded (jwt_authn `provider`).
+/// gate. `required = false` → anonymous pass-through (`jwt_authn` `allow_missing`);
+/// `required = true` → a verified credential is demanded (`jwt_authn` `provider`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAuth {
     pub required: bool,
@@ -25,16 +25,17 @@ pub struct RouteAuth {
 
 impl RouteAuth {
     /// The zero-config decision: public (anonymous pass-through).
-    pub const PASS_THROUGH: RouteAuth = RouteAuth { required: false };
+    pub const PASS_THROUGH: Self = Self { required: false };
 }
 
 impl Default for RouteAuth {
     fn default() -> Self {
-        RouteAuth::PASS_THROUGH
+        Self::PASS_THROUGH
     }
 }
 
 /// One path override: a request-path **prefix** and the protection it carries.
+///
 /// The prefix matches at *segment boundaries* (see [`AuthPolicy::resolve`]) so
 /// `/app` covers `/app` and `/app/…` but never `/application`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,12 +60,14 @@ pub struct AuthPolicy {
 }
 
 impl AuthPolicy {
-    pub fn new(rules: Vec<PathRule>) -> Self {
+    #[must_use]
+    pub const fn new(rules: Vec<PathRule>) -> Self {
         Self { rules }
     }
 
     /// The configured rules (unordered) — for the control-plane list endpoint and
     /// diagnostics. Resolution does not depend on their order.
+    #[must_use]
     pub fn rules(&self) -> &[PathRule] {
         &self.rules
     }
@@ -78,13 +81,13 @@ impl AuthPolicy {
     /// (or `p` itself ends with `/`). This prevents `/app` from matching
     /// `/application` while still covering `/app/orders`. Paths are case-sensitive
     /// (unlike hosts) and compared verbatim; the caller strips any query string.
+    #[must_use]
     pub fn resolve(&self, path: &str) -> RouteAuth {
         self.rules
             .iter()
             .filter(|r| prefix_matches(&r.prefix, path))
             .max_by_key(|r| r.prefix.len())
-            .map(|r| r.auth)
-            .unwrap_or(RouteAuth::PASS_THROUGH)
+            .map_or(RouteAuth::PASS_THROUGH, |r| r.auth)
     }
 }
 
@@ -98,12 +101,10 @@ fn prefix_matches(prefix: &str, path: &str) -> bool {
     if path == prefix {
         return true;
     }
-    match path.strip_prefix(prefix) {
-        // Boundary: either the rule prefix already ends at a separator (`/app/`)
-        // or the path continues with one (`/app` vs `/app/orders`).
-        Some(rest) => prefix.ends_with('/') || rest.starts_with('/'),
-        None => false,
-    }
+    // Boundary: either the rule prefix already ends at a separator (`/app/`)
+    // or the path continues with one (`/app` vs `/app/orders`).
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -188,19 +189,21 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trips() {
+    fn serde_round_trips() -> Result<(), serde_json::Error> {
         let p = AuthPolicy::new(vec![rule("/", true), rule("/blog", false)]);
-        let json = serde_json::to_string(&p).unwrap();
-        let back: AuthPolicy = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&p)?;
+        let back: AuthPolicy = serde_json::from_str(&json)?;
         assert_eq!(p, back);
+        Ok(())
     }
 
     #[test]
-    fn deserializes_from_absent_rules() {
+    fn deserializes_from_absent_rules() -> Result<(), serde_json::Error> {
         // #[serde(default)] keeps an old cached RoutingDecision (no `auth` block)
         // deserializable as the pass-through default.
-        let p: AuthPolicy = serde_json::from_str("{}").unwrap();
+        let p: AuthPolicy = serde_json::from_str("{}")?;
         assert_eq!(p, AuthPolicy::default());
         assert!(!p.resolve("/").required);
+        Ok(())
     }
 }

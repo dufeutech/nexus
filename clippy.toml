@@ -1,0 +1,15 @@
+msrv = "1.92"
+# `min_ident_chars` (restriction lint, enabled in [workspace.lints]) fires only on
+# single-char idents. Allow the conventional short bindings actually used across the
+# workspace (loop/closure vars, math, short locals) so the lint still catches *new*
+# cryptic single-char names outside this curated set rather than forcing renames of
+# idiomatic code.
+allowed-idents-below-min-chars = [
+    "_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+    "m", "n", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+]
+cognitive-complexity-threshold = 10
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 100
+type-complexity-threshold = 200
+avoid-breaking-exported-api = false

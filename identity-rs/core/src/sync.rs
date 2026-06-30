@@ -1,4 +1,5 @@
 //! Change-event → Profile mapping and the version/ordering guard (RFC C7, §3.4).
+//!
 //! Pure functions: no I/O. The caller fetches the existing Profile and persists
 //! the result, so this logic is identical and testable regardless of transport.
 
@@ -6,7 +7,7 @@ use serde_json::Value;
 
 use crate::profile::Profile;
 
-/// Provider (camelCase) → normalized (snake_case) field names (RFC §3.8).
+/// Provider (camelCase) → normalized (`snake_case`) field names (RFC §3.8).
 pub const FIELD_MAP: &[(&str, &str)] = &[
     ("userName", "username"),
     ("firstName", "given_name"),
@@ -17,12 +18,13 @@ pub const FIELD_MAP: &[(&str, &str)] = &[
 ];
 
 fn str_field(v: &Value, k: &str) -> Option<String> {
-    v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string())
+    v.get(k).and_then(|x| x.as_str()).map(str::to_owned)
 }
 
 /// A user-relevant change with the subject already resolved (RFC §3.4: the
 /// subject is resolved from the event contents, not assumed to be the notifying
 /// aggregate — a grant event carries the user id in its payload).
+#[derive(Debug)]
 pub struct UserEvent<'a> {
     pub sub: String,
     pub event_type: String,
@@ -35,6 +37,7 @@ pub struct UserEvent<'a> {
     pub payload: &'a Value,
 }
 
+#[derive(Debug)]
 pub enum Classify<'a> {
     /// Not a user-relevant event; ignore.
     Ignore,
@@ -44,6 +47,7 @@ pub enum Classify<'a> {
 }
 
 /// Decide whether an event concerns a user and resolve its subject.
+#[must_use]
 pub fn classify(event: &Value) -> Classify<'_> {
     let et = str_field(event, "event_type").unwrap_or_default();
     let agg_type = str_field(event, "aggregateType").unwrap_or_default();
@@ -58,11 +62,11 @@ pub fn classify(event: &Value) -> Classify<'_> {
             .or_else(|| payload.get("userId"))
             .or_else(|| payload.get("user_id"))
             .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
+            .map(str::to_owned)
     } else {
         str_field(event, "aggregateID")
     };
-    let sub = match sub {
+    let subject = match sub {
         Some(s) if !s.is_empty() => s,
         _ => return Classify::NoSubject,
     };
@@ -72,7 +76,7 @@ pub fn classify(event: &Value) -> Classify<'_> {
         _ => 0,
     };
     Classify::Event(UserEvent {
-        sub,
+        sub: subject,
         org: str_field(event, "resourceOwner"),
         ts: str_field(event, "created_at").unwrap_or_default(),
         sequence,
@@ -82,17 +86,18 @@ pub fn classify(event: &Value) -> Classify<'_> {
     })
 }
 
+#[derive(Debug)]
 pub enum Apply {
     /// The stored Profile is newer than this event; drop it.
     SkipStale,
     /// Remove the subject's Profile (user-level removal only).
     Delete,
     /// Create/update the Profile.
-    Upsert(Profile),
+    Upsert(Box<Profile>),
 }
 
 fn set_field(p: &mut Profile, target: &str, val: &str) {
-    let v = Some(val.to_string());
+    let v = Some(val.to_owned());
     match target {
         "username" => p.username = v,
         "given_name" => p.given_name = v,
@@ -111,7 +116,8 @@ fn set_field(p: &mut Profile, target: &str, val: &str) {
 /// deletion deletes the subject. The old code's `"removed" in et` delete check
 /// fired first for `user.grant.removed`, nuking the entire identity — corrected
 /// here now that the logic lives in one place.
-pub fn apply(existing: Option<Profile>, ev: &UserEvent) -> Apply {
+#[must_use]
+pub fn apply(existing: Option<Profile>, ev: &UserEvent<'_>) -> Apply {
     let removed_or_deleted =
         ev.event_type.contains("removed") || ev.event_type.contains("deleted");
     if removed_or_deleted && !ev.is_grant {
@@ -153,11 +159,11 @@ pub fn apply(existing: Option<Profile>, ev: &UserEvent) -> Apply {
         }
     }
 
-    prof.sub = ev.sub.clone();
-    prof.org_id = ev.org.clone();
+    prof.sub.clone_from(&ev.sub);
+    prof.org_id.clone_from(&ev.org);
     prof.version = ev.sequence;
     prof.updated_at = Some(ev.ts.clone());
-    Apply::Upsert(prof)
+    Apply::Upsert(Box::new(prof))
 }
 
 #[cfg(test)]
@@ -165,25 +171,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn ev(et: &str, agg_id: &str, ts: &str, payload: Value) -> Value {
+    fn ev(et: &str, agg_id: &str, ts: &str, payload: &Value) -> Value {
         json!({
             "event_type": et, "aggregateType": "user", "aggregateID": agg_id,
             "resourceOwner": "org1", "created_at": ts, "sequence": 5,
-            "event_payload": payload
+            "event_payload": payload.clone()
         })
     }
 
-    fn subj<'a>(c: Classify<'a>) -> UserEvent<'a> {
+    fn subj(c: Classify<'_>) -> UserEvent<'_> {
         match c {
             Classify::Event(e) => e,
-            _ => panic!("expected Event"),
+            Classify::Ignore | Classify::NoSubject => unreachable!("expected Event"),
         }
     }
 
     #[test]
     fn maps_human_fields_to_snake_case() {
         let e = ev("user.human.added", "u1", "2026-01-01T00:00:00Z",
-            json!({"userName": "alice", "firstName": "Al", "lastName": "Ice"}));
+            &json!({"userName": "alice", "firstName": "Al", "lastName": "Ice"}));
         match apply(None, &subj(classify(&e))) {
             Apply::Upsert(p) => {
                 assert_eq!(p.sub, "u1");
@@ -192,24 +198,28 @@ mod tests {
                 assert_eq!(p.family_name.as_deref(), Some("Ice"));
                 assert_eq!(p.org_id.as_deref(), Some("org1"));
             }
-            _ => panic!("expected upsert"),
+            Apply::SkipStale | Apply::Delete => unreachable!("expected upsert"),
         }
     }
 
     #[test]
     fn version_guard_drops_older_event() {
         let existing = Profile { updated_at: Some("2026-06-01T00:00:00Z".into()), ..Default::default() };
-        let e = ev("user.human.updated", "u1", "2026-01-01T00:00:00Z", json!({"userName": "stale"}));
+        let e = ev("user.human.updated", "u1", "2026-01-01T00:00:00Z", &json!({"userName": "stale"}));
         assert!(matches!(apply(Some(existing), &subj(classify(&e))), Apply::SkipStale));
     }
 
     #[test]
     fn deactivate_then_reactivate_flips_suspended() {
-        let e = ev("user.deactivated", "u1", "2026-02-01T00:00:00Z", json!({}));
-        let p = match apply(None, &subj(classify(&e))) { Apply::Upsert(p) => p, _ => panic!() };
+        let e = ev("user.deactivated", "u1", "2026-02-01T00:00:00Z", &json!({}));
+        let Apply::Upsert(p) = apply(None, &subj(classify(&e))) else {
+            unreachable!("expected upsert")
+        };
         assert!(p.is_suspended);
-        let e2 = ev("user.reactivated", "u1", "2026-03-01T00:00:00Z", json!({}));
-        let p2 = match apply(Some(p), &subj(classify(&e2))) { Apply::Upsert(p) => p, _ => panic!() };
+        let e2 = ev("user.reactivated", "u1", "2026-03-01T00:00:00Z", &json!({}));
+        let Apply::Upsert(p2) = apply(Some(*p), &subj(classify(&e2))) else {
+            unreachable!("expected upsert")
+        };
         assert!(!p2.is_suspended);
     }
 
@@ -228,7 +238,9 @@ mod tests {
         let existing = Profile { sub: "u1".into(), roles: vec!["admin".into()], ..Default::default() };
         match apply(Some(existing), &ue) {
             Apply::Upsert(p) => assert!(p.roles.is_empty(), "roles cleared, user kept"),
-            _ => panic!("grant removal must not delete the user"),
+            Apply::SkipStale | Apply::Delete => {
+                unreachable!("grant removal must not delete the user")
+            }
         }
     }
 
