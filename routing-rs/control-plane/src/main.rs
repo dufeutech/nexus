@@ -18,8 +18,10 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -37,7 +39,7 @@ use router_core::domain::{PoolSet, TenantConfig};
 use router_core::normalize::normalize_host;
 use router_core::plan::{DomainLimit, PlanLimits};
 use router_core::store::{BoxError, ChallengeStore, RoutingStore};
-use router_core::verify::{challenge_name, token_matches, OwnershipProof};
+use router_core::verify::{challenge_name, ct_eq, token_matches, OwnershipProof};
 use store_postgres::{LeaderLease, PgRoutingStore};
 
 /// Stable advisory-lock id electing the single verification-poll leader (RFC C4).
@@ -59,6 +61,12 @@ struct App {
     /// How long a domain may stay pending before it expires and frees quota,
     /// seconds (RFC C3). `0` disables expiry.
     pending_ttl: i64,
+    /// Shared admin bearer token required on every data endpoint. `None` ONLY
+    /// when auth is explicitly disabled at startup (`CONTROL_AUTH_DISABLED=true`);
+    /// the server otherwise refuses to start without a token, so it is never
+    /// silently open. The control plane is a trusted-broker admin surface, so a
+    /// single shared secret authenticates the caller; `tenant_id` is then trusted.
+    auth_token: Option<Arc<str>>,
 }
 
 /// Uniform 500 for an unexpected store/adapter error. The underlying error is
@@ -144,6 +152,29 @@ impl App {
 
 fn env(key: &str, default: &str) -> String {
     var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Admin-token gate (RFC C16 admin boundary): every DATA endpoint requires
+/// `Authorization: Bearer <CONTROL_AUTH_TOKEN>`. The token is compared in
+/// constant time. `/healthz` and `/metrics` are intentionally NOT behind this
+/// (liveness + scrape). When `auth_token` is `None` the operator explicitly
+/// disabled auth at startup, so requests pass through.
+async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Response {
+    let Some(expected) = s.auth_token.as_deref() else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(tok) if ct_eq(tok, expected) => next.run(req).await,
+        _ => {
+            counter!("control_mutations_total", "op" => "unauthorized").increment(1);
+            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
+        }
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -708,6 +739,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let challenge_ttl: i64 = env("ROUTING_CHALLENGE_TTL", "86400").parse().unwrap_or(86400);
     // Default 7 days; a domain unverified past this expires and frees quota.
     let pending_ttl: i64 = env("ROUTING_PENDING_TTL", "604800").parse().unwrap_or(604800);
+
+    // Admin-token gate, fail-closed: refuse to start without an explicit choice.
+    // Either supply CONTROL_AUTH_TOKEN (non-empty) or opt out with
+    // CONTROL_AUTH_DISABLED=true (trusted-network/dev only). This makes "ran with
+    // no auth" an explicit decision rather than a silent default.
+    let auth_disabled = matches!(
+        env("CONTROL_AUTH_DISABLED", "").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+    let token = env("CONTROL_AUTH_TOKEN", "");
+    let auth_token = match (auth_disabled, token.trim().is_empty()) {
+        (true, _) => {
+            warn!("CONTROL_AUTH_DISABLED=true — control plane admin endpoints are UNAUTHENTICATED");
+            None
+        }
+        (false, false) => Some(Arc::from(token.as_str())),
+        (false, true) => {
+            error!("CONTROL_AUTH_TOKEN is unset; refusing to start open. Set it, or set CONTROL_AUTH_DISABLED=true to run without auth.");
+            return Err("missing CONTROL_AUTH_TOKEN".into());
+        }
+    };
+
     let app = App {
         store,
         metrics,
@@ -716,6 +769,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         verifier: Arc::new(DnsOwnershipProof::public()),
         challenge_ttl,
         pending_ttl,
+        auth_token,
     };
 
     // Background verification poll for pending domains (RFC C4). Disabled when the
@@ -727,7 +781,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         info!(interval_s = poll_secs, "verification poll enabled");
     }
 
-    let router = Router::new()
+    // Data endpoints — all behind the admin-token gate (route_layer so an unknown
+    // path 404s without first demanding a token).
+    let data = Router::new()
         .route("/tenants", post(upsert_tenant))
         .route("/tenants/{id}", get(get_tenant))
         .route("/domains", post(upsert_domain))
@@ -740,6 +796,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .put(upsert_auth_route)
                 .delete(delete_auth_route),
         )
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
+
+    let router = data
+        // Liveness + scrape stay open (no token).
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
         // These are small JSON admin bodies; cap the request body so a malformed

@@ -137,6 +137,18 @@ controlPlane:
   replicas: 1
   logFormat: "json"
   logLevel: "info"
+  # Admin-token gate (RFC C16 admin boundary). The data endpoints mutate the
+  # authoritative routing store, so they require an `Authorization: Bearer <token>`.
+  # Fail-closed: with auth.enabled the chart REQUIRES a token (inline or via an
+  # existing Secret) and the container refuses to start without it. Set
+  # auth.enabled=false ONLY to run unauthenticated on a trusted network.
+  auth:
+    enabled: true
+    # Provide the token inline (chart wraps it in a managed Secret) OR reference
+    # an existing Secret holding it (preferred in production — keep it out of values).
+    token: ""
+    existingSecret: ""
+    existingSecretKey: "token"
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits: { cpu: "500m", memory: "128Mi" }

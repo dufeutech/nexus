@@ -27,9 +27,11 @@ pub fn token_matches(records: &[String], token: &str) -> bool {
 }
 
 /// Constant-time byte-equality (no early return on first mismatch). Length is
-/// not secret here (the token length is fixed and known), so an early
-/// length-mismatch return is fine.
-fn ct_eq(a: &str, b: &str) -> bool {
+/// not secret here (token lengths are fixed and known), so an early
+/// length-mismatch return is fine. Shared by the ownership-proof match and the
+/// control-plane admin-token check (both compare a server-minted secret).
+#[must_use]
+pub fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;

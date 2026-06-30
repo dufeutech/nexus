@@ -59,6 +59,33 @@ url
 {{- end -}}
 
 {{/*
+Control-plane admin-token Secret name/key (RFC C16). Uses an existing Secret when
+controlPlane.auth.existingSecret is set, otherwise the chart-managed Secret.
+*/}}
+{{- define "routing-plane.controlAuthSecretName" -}}
+{{- if .Values.controlPlane.auth.existingSecret -}}
+{{- .Values.controlPlane.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-control-auth" (include "routing-plane.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "routing-plane.controlAuthSecretKey" -}}
+{{- if .Values.controlPlane.auth.existingSecret -}}
+{{- .Values.controlPlane.auth.existingSecretKey -}}
+{{- else -}}
+token
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chart manages its own control-auth Secret (true) vs an existing one.
+*/}}
+{{- define "routing-plane.ownsControlAuthSecret" -}}
+{{- if .Values.controlPlane.auth.existingSecret -}}false{{- else -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 Whether the chart manages its own pg Secret (true) vs using an existing one.
 */}}
 {{- define "routing-plane.ownsPgSecret" -}}

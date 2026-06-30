@@ -61,6 +61,12 @@ services:
       # ./envoy/envoy.yaml. Set ROUTING_POOLS in .env to add a pool WITHOUT a
       # recompile — and add the matching pool_* cluster + route in envoy.yaml.
       ROUTING_POOLS: ${ROUTING_POOLS:-}
+      # Admin-token gate (RFC C16): the data endpoints mutate the authoritative
+      # routing store, so they require this bearer token. Fail-closed — the
+      # container refuses to start unless CONTROL_AUTH_TOKEN is set OR
+      # CONTROL_AUTH_DISABLED=true (trusted network/dev). Set a strong value in .env.
+      CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-}
+      CONTROL_AUTH_DISABLED: ${CONTROL_AUTH_DISABLED:-}
     ports:
       - "127.0.0.1:9400:9400"   # bound to loopback: admin boundary only
 
