@@ -126,16 +126,21 @@ jobs:
       - name: Lint & render routing-plane
         run: |
           # Render both the plain and the opt-in read-split (ROUTING_PG_READ_URL) paths.
-          BASE="--set postgres.url=postgres://u:p@h:5432/routing"
+          # controlPlane.auth is fail-closed: a token (or auth.enabled=false) is required.
+          BASE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
           helm lint routing-plane $BASE
           helm template rel routing-plane $BASE >/dev/null
           helm template rel routing-plane $BASE --set postgres.readUrl=postgres://u:p@pgbouncer:6432/routing >/dev/null
+          # Exercise the auth-disabled path and the broker-only NetworkPolicy helpers.
+          helm template rel routing-plane --set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.enabled=false >/dev/null
+          helm template rel routing-plane $BASE --set controlPlane.networkPolicy.enabled=true --set 'controlPlane.networkPolicy.allowFrom[0].podSelector.matchLabels.app=broker' >/dev/null
 
       - name: Lint & render edge-platform (umbrella)
         run: |
           helm dependency update edge-platform
           ARGS="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity \
                 --set identity-plane.zitadel.patSecret.value=dummy \
-                --set routing-plane.postgres.url=postgres://u:p@h:5432/routing"
+                --set routing-plane.postgres.url=postgres://u:p@h:5432/routing \
+                --set routing-plane.controlPlane.auth.token=ci-dummy"
           helm lint edge-platform $ARGS
           helm template rel edge-platform $ARGS >/dev/null

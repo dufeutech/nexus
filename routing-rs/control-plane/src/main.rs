@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env::var;
 use std::error::Error;
 use std::fmt;
+#[cfg(not(unix))]
 use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
@@ -702,7 +703,7 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let term = async {
         if let Ok(mut s) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            signal::unix::signal(signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }

@@ -163,6 +163,26 @@ controlPlane:
     tls:
       enabled: false
       secretName: "routing-plane-admin-tls"
+  # NetworkPolicy enforcing broker-only reachability of the admin API (:9400).
+  # The control plane is broker-only (RFC C16): tenants NEVER call it directly, so
+  # the shared admin token authenticates the broker and tenant_id is trusted. Enable
+  # this and set allowFrom to your broker's peer selector to ENFORCE that at the
+  # network layer, so a leaked token alone can't reach the port. Ingress-only —
+  # egress (Postgres / DNS) is unaffected. Requires a CNI that enforces
+  # NetworkPolicy. NOTE: kubelet health probes come from the node and are not
+  # subject to NetworkPolicy on common CNIs, so liveness/readiness keep working.
+  networkPolicy:
+    enabled: false
+    # REQUIRED when enabled: standard NetworkPolicyPeer entries (podSelector /
+    # namespaceSelector / ipBlock) identifying the broker(s) allowed to reach :9400.
+    # Empty while enabled => the chart refuses to render (so you can't silently lock
+    # the broker out). Example:
+    #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: brokers } }
+    #     podSelector: { matchLabels: { app: domain-broker } }
+    allowFrom: []
+    # OPTIONAL: peers allowed to scrape /metrics on :9400 (e.g. your Prometheus).
+    # Empty => the policy blocks scraping; add your monitoring peer to keep it.
+    allowMetricsFrom: []
 
 # -------------------------------------------------------------------------- #
 # Postgres — the authoritative routing store (control-plane-written, cache

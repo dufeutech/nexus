@@ -1,0 +1,33 @@
+{{- if .Values.controlPlane.networkPolicy.enabled }}
+{{- if not .Values.controlPlane.networkPolicy.allowFrom }}
+{{- fail "controlPlane.networkPolicy.enabled but controlPlane.networkPolicy.allowFrom is empty — specify the broker peer(s) allowed to reach :9400 (or set controlPlane.networkPolicy.enabled=false)" }}
+{{- end }}
+# Broker-only reachability for the control-plane admin API (RFC C16). Default-deny
+# ingress to :9400; only the configured broker peer(s) (and optional metrics
+# scrapers) may connect. This enforces, at the network layer, the rule the
+# shared-token auth assumes: tenants never reach the control plane directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "routing-plane.fullname" . }}-control-plane
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    # The broker(s) allowed to use the admin API.
+    - from:
+        {{- toYaml .Values.controlPlane.networkPolicy.allowFrom | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 9400 }
+    {{- with .Values.controlPlane.networkPolicy.allowMetricsFrom }}
+    # Metrics scrapers (Prometheus) — /metrics is served on the same :9400 port.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 9400 }
+    {{- end }}
+{{- end }}

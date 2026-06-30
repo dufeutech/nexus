@@ -58,8 +58,7 @@ const PAYLOAD_KEY: &str = "verified";
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Clone)]
@@ -129,7 +128,7 @@ impl AppState {
 /// authenticated request whose profile is store-UNAVAILABLE must be blocked
 /// unless fail-open is configured. Anonymous requests, found profiles, and
 /// genuinely absent profiles never fail closed.
-fn must_fail_closed(authenticated: bool, unavailable: bool, fail_open: bool) -> bool {
+const fn must_fail_closed(authenticated: bool, unavailable: bool, fail_open: bool) -> bool {
     authenticated && unavailable && !fail_open
 }
 
@@ -298,14 +297,7 @@ impl Sidecar {
             // `sub` is a user identifier (PII): keep it out of per-request info
             // logs (enable debug for the subject when diagnosing a specific user).
             debug!(sub = %sub, "enrich subject");
-            // Don't touch the store for unauthenticated requests: the subject is
-            // "anonymous" (no credential), which is never a stored profile — so a
-            // lookup is a guaranteed miss that needlessly loads the pool on
-            // high-volume anonymous traffic (and is not negatively cached).
-            if !authenticated {
-                info!(anonymous = true, token_roles = token_roles.len(), "enrich");
-                (enrich_response(&sub, &token_roles, None, false), "anonymous")
-            } else {
+            if authenticated {
                 match self.state.resolve(&sub).await {
                     Resolved::Found(p) => {
                         info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
@@ -330,6 +322,13 @@ impl Sidecar {
                         }
                     }
                 }
+            } else {
+                // Don't touch the store for unauthenticated requests: the subject
+                // is "anonymous" (no credential), which is never a stored profile —
+                // so a lookup is a guaranteed miss that needlessly loads the pool on
+                // high-volume anonymous traffic (and is not negatively cached).
+                info!(anonymous = true, token_roles = token_roles.len(), "enrich");
+                (enrich_response(&sub, &token_roles, None, false), "anonymous")
             }
         } else {
             warn!("not ready -> 503");
@@ -486,7 +485,7 @@ mod api {
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let json = env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
+    let json = env::var("LOG_FORMAT").is_ok_and(|v| v == "json");
     if json {
         tracing_subscriber::fmt().with_env_filter(filter).json().init();
     } else {
@@ -502,7 +501,7 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let term = async {
         if let Ok(mut s) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            signal::unix::signal(signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }
@@ -562,8 +561,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Default fail-CLOSED: when an authenticated request's profile can't be read,
     // block rather than serve it without its suspension state (see AppState).
     let fail_open = env::var("SIDECAR_FAIL_OPEN")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
 
     let store: Arc<dyn ProfileStore> = loop {
         match PgProfileStore::connect(&pg_url).await {
@@ -677,6 +675,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, reason = "test helpers legitimately panic on the impossible branch")]
     use super::*;
     use std::collections::HashMap;
 
@@ -735,8 +734,8 @@ mod tests {
         // A profile MISS (no row) must NOT assert a suspension either way — the
         // header is simply absent, which is exactly why a store outage that
         // collapses to "miss" is dangerous and must instead fail closed.
-        let h = set_headers(&enrich_response("u1", &[], None, true));
-        assert!(!h.contains_key("x-user-suspended"));
+        let h_miss = set_headers(&enrich_response("u1", &[], None, true));
+        assert!(!h_miss.contains_key("x-user-suspended"));
     }
 
     #[test]

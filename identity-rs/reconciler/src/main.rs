@@ -47,7 +47,7 @@ fn env_num<T: FromStr>(key: &str, default: T) -> T {
     var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 fn now_secs() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 #[derive(Clone)]
@@ -220,7 +220,7 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let term = async {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
             s.recv().await;
         }
     };

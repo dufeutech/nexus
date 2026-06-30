@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::env::var;
 use std::error::Error;
+#[cfg(not(unix))]
 use std::future::pending;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -64,8 +65,7 @@ use store_postgres::{PgInvalidations, PgRoutingStore};
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Clone)]
@@ -626,7 +626,7 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let term = async {
         if let Ok(mut s) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            signal::unix::signal(signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }
