@@ -17,7 +17,6 @@
 //! read-only routing connection this worker holds (least privilege). See the
 //! `membership-profile-propagation` change design.
 
-use std::collections::HashSet;
 use std::env::var;
 use std::error::Error;
 #[cfg(not(unix))]
@@ -33,8 +32,9 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use identity_core::projection::{backstop_pass, sync_subject};
 use identity_core::store::{BoxError, ProfileStore};
-use identity_core::{Profile, SourceMembershipReader};
+use identity_core::SourceMembershipReader;
 use store_postgres::{PgProfileStore, PgSourceMembershipReader};
 
 /// The routing-plane NOTIFY channel carrying membership changes. This is a
@@ -51,55 +51,17 @@ fn env_num<T: FromStr>(key: &str, default: T) -> T {
     var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Re-derive one subject's projected memberships from the source of record and
-/// read-merge-write them into its Profile. Preserves every other Profile field
-/// (identity attributes, roles). Skips creating an empty profile for a subject that
-/// has neither a profile nor any memberships (nothing to project).
-async fn sync_subject(
-    reader: &dyn SourceMembershipReader,
-    store: &dyn ProfileStore,
-    sub: &str,
-) -> Result<(), BoxError> {
-    let memberships = reader.memberships_for(sub).await?;
-    let existing = store.get(sub).await?;
-    if existing.is_none() && memberships.is_empty() {
-        return Ok(()); // no profile, no memberships → nothing to write.
-    }
-    let profile = existing
-        .unwrap_or_else(|| Profile { sub: sub.to_owned(), ..Default::default() })
-        .with_memberships(memberships);
-    store.put(&profile).await?;
-    counter!("membership_sync_subject_syncs_total").increment(1);
-    Ok(())
-}
-
-/// Backstop: converge EVERY subject that either holds a source-of-record membership
-/// (backfill / missed-grant) or still carries a projected membership (heal a missed
-/// revoke, including revoke-to-zero where the subject left the source set).
-async fn backstop_pass(
+/// Run one backstop pass (the convergence logic lives in `identity_core`) and emit
+/// metrics/logs around it.
+async fn run_backstop(
     reader: &dyn SourceMembershipReader,
     store: &dyn ProfileStore,
 ) -> Result<(), BoxError> {
-    let mut subjects: HashSet<String> =
-        reader.all_member_subjects().await?.into_iter().collect();
-    for p in store.scan_all().await? {
-        if !p.memberships.is_empty() {
-            subjects.insert(p.sub);
-        }
-    }
-    let total = subjects.len();
-    let mut synced = 0_u64;
-    for sub in subjects {
-        if let Err(e) = sync_subject(reader, store, &sub).await {
-            counter!("membership_sync_errors_total").increment(1);
-            warn!(error = %e, %sub, "backstop subject sync failed");
-        } else {
-            synced += 1;
-        }
-    }
+    let stats = backstop_pass(reader, store).await?;
+    counter!("membership_sync_subject_syncs_total").increment(stats.written as u64);
     counter!("membership_sync_backstop_passes_total").increment(1);
-    gauge!("membership_sync_last_backstop_subjects").set(total as f64);
-    info!(subjects = total, synced, "backstop pass");
+    gauge!("membership_sync_last_backstop_subjects").set(stats.subjects as f64);
+    info!(subjects = stats.subjects, written = stats.written, "backstop pass");
     Ok(())
 }
 
@@ -114,9 +76,13 @@ async fn listen_once(
         let notification = listener.recv().await?;
         let sub = notification.payload().to_owned();
         counter!("membership_sync_signals_total").increment(1);
-        if let Err(e) = sync_subject(reader, store, &sub).await {
-            counter!("membership_sync_errors_total").increment(1);
-            warn!(error = %e, %sub, "signal subject sync failed; backstop will heal");
+        match sync_subject(reader, store, &sub).await {
+            Ok(true) => counter!("membership_sync_subject_syncs_total").increment(1),
+            Ok(false) => {}
+            Err(e) => {
+                counter!("membership_sync_errors_total").increment(1);
+                warn!(error = %e, %sub, "signal subject sync failed; backstop will heal");
+            }
         }
     }
 }
@@ -173,7 +139,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(backstop_interval_s = backstop_interval.as_secs(), "started");
 
     // Backfill/heal immediately on startup, before we depend on live signals.
-    if let Err(e) = backstop_pass(reader.as_ref(), store.as_ref()).await {
+    if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
         counter!("membership_sync_errors_total").increment(1);
         error!(error = %e, "initial backstop pass failed");
     }
@@ -193,7 +159,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             loop {
                 tokio::select! {
                     () = sleep(backstop_interval) => {
-                        if let Err(e) = backstop_pass(reader.as_ref(), store.as_ref()).await {
+                        if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
                             counter!("membership_sync_errors_total").increment(1);
                             error!(error = %e, "backstop pass failed");
                         }

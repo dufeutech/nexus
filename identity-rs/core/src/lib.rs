@@ -5,6 +5,7 @@
 
 pub mod membership;
 pub mod profile;
+pub mod projection;
 pub mod reconcile;
 pub mod store;
 pub mod sync;
@@ -13,3 +14,4 @@ pub use membership::{
     Membership, MemberType, MembershipResolver, ResolvedMembership, SourceMembershipReader,
 };
 pub use profile::Profile;
+pub use projection::{backstop_pass, sync_subject, BackstopStats};

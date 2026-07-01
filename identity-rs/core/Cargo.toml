@@ -19,5 +19,9 @@ serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
+[dev-dependencies]
+# Async test runtime for the projection orchestration tests (fake in-memory ports).
+tokio = { workspace = true }
+
 [lints]
 workspace = true
