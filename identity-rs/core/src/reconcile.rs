@@ -35,6 +35,12 @@ pub fn build_profile_from_user(user: &Value, mut roles: Vec<String>) -> Profile 
         is_suspended: str_field(user, "state").as_deref() == Some("USER_STATE_INACTIVE"),
         roles,
         entitlements: Vec::new(),
+        // Memberships are nexus-native (not from the IdP), so the reconciler never
+        // authors them — left empty here and excluded from `differs`. TODO(apply):
+        // when membership CRUD populates them, the reconcile/sync WRITE path must
+        // PRESERVE existing memberships (read-merge-write, or store them outside the
+        // identity doc) so an identity-field update does not clobber them.
+        memberships: Vec::new(),
         version: 0,
         updated_at: str_field(det, "changeDate"),
     }
