@@ -158,10 +158,10 @@ impl AppState {
                     features: cfg.features,
                     auth,
                 };
-                if let Some(l2) = &l2 {
-                    if let Err(e) = l2.put(&key2, &decision, l2_ttl).await {
-                        warn!(error = %e, "L2 put failed");
-                    }
+                if let Some(l2) = &l2
+                    && let Err(e) = l2.put(&key2, &decision, l2_ttl).await
+                {
+                    warn!(error = %e, "L2 put failed");
                 }
                 Ok(Arc::new(decision))
             })
@@ -492,10 +492,10 @@ impl ExternalProcessor for Router {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(req) => {
-                        if let Some(resp) = me.handle(req).await {
-                            if tx.send(Ok(resp)).await.is_err() {
-                                break;
-                            }
+                        if let Some(resp) = me.handle(req).await
+                            && tx.send(Ok(resp)).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Err(status) => {
@@ -538,10 +538,10 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
         // under a requested host self-heal via the L1/L2 TTL (RFC §3.10 staleness
         // backstop) — routing has no per-second revocation requirement.
         state.l1.invalidate(&domain).await;
-        if let Some(l2) = &state.l2 {
-            if let Err(e) = l2.invalidate(&domain).await {
-                warn!(error = %e, "L2 invalidate failed");
-            }
+        if let Some(l2) = &state.l2
+            && let Err(e) = l2.invalidate(&domain).await
+        {
+            warn!(error = %e, "L2 invalidate failed");
         }
         counter!("router_invalidations_total").increment(1);
         state.last_apply_ms.store(now_ms(), Ordering::Relaxed);

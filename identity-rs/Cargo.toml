@@ -3,7 +3,7 @@ resolver = "2"
 members = ["core", "store-postgres", "sidecar", "sync-worker", "reconciler", "membership-sync"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 license = "MIT"
 repository = "https://github.com/dufeutech/nexus"
@@ -46,8 +46,6 @@ hex = "0.4"
 unsafe_code = "deny"
 unused = { level = "deny", priority = -1 }
 nonstandard_style = { level = "deny", priority = -1 }
-# Migration lint (crates are edition 2021); warn now, resolve before an edition bump.
-rust_2024_compatibility = { level = "warn", priority = -1 }
 elided_lifetimes_in_paths = "deny"
 explicit_outlives_requirements = "deny"
 macro_use_extern_crate = "deny"

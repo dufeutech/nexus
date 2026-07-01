@@ -183,10 +183,10 @@ fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
     // struct whose field names are the role keys).
     if roles.is_empty() {
         for (k, v) in fields {
-            if k.ends_with(":roles") {
-                if let Some(Kind::StructValue(s)) = v.kind.as_ref() {
-                    roles.extend(s.fields.keys().cloned());
-                }
+            if k.ends_with(":roles")
+                && let Some(Kind::StructValue(s)) = v.kind.as_ref()
+            {
+                roles.extend(s.fields.keys().cloned());
             }
         }
     }
@@ -458,10 +458,10 @@ impl ExternalProcessor for Sidecar {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(req) => {
-                        if let Some(resp) = me.handle(req).await {
-                            if tx.send(Ok(resp)).await.is_err() {
-                                break;
-                            }
+                        if let Some(resp) = me.handle(req).await
+                            && tx.send(Ok(resp)).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Err(status) => {
