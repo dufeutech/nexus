@@ -161,6 +161,9 @@ pub fn apply(existing: Option<Profile>, ev: &UserEvent<'_>) -> Apply {
 
     prof.sub.clone_from(&ev.sub);
     prof.org_id.clone_from(&ev.org);
+    // `home_org` mirrors the IdP resource owner like `org_id` (informational, not an
+    // authz input). Starting from `existing`, memberships are carried through untouched.
+    prof.home_org.clone_from(&ev.org);
     prof.version = ev.sequence;
     prof.updated_at = Some(ev.ts.clone());
     Apply::Upsert(Box::new(prof))

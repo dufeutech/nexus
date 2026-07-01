@@ -7,17 +7,21 @@
 
 ## 1. Core — the membership merge (identity_core, pure)
 
-- [ ] 1.1 Add `home_org: Option<String>` to `identity_core::Profile` (`#[serde(default)]`),
-  excluded from `resolve_membership`; assert it never affects resolution (unit test).
-- [ ] 1.2 Add a pure merge helper in `identity_core` (e.g. `apply_memberships(profile,
-  memberships) -> Profile`) that sets `Profile.memberships` from a source-of-record list
-  while preserving all other fields. Unit-cover: preserves identity fields; overwrites only
-  memberships; empty list clears memberships (revoke-all).
-- [ ] 1.3 Fix the reconciler clobber: make the identity-attribute reconcile write
-  read-merge-write so `Profile.memberships` is PRESERVED when identity/role fields change.
-  Update `build_profile_from_user`/its caller (and `differs` if needed) so a reconcile pass
-  that only changes attributes does not emit empty memberships. Unit-cover: attribute/role
-  change preserves memberships; membership change preserves attributes.
+- [x] 1.1 Add `home_org: Option<String>` to `identity_core::Profile` (`#[serde(default)]`),
+  excluded from `resolve_membership`; assert it never affects resolution (unit test). DONE:
+  field added (informational, non-authz); both writers populate it from the IdP resource
+  owner (`reconcile::build_profile_from_user`, `sync::apply`). Test
+  `home_org_never_affects_resolution`.
+- [x] 1.2 Pure merge helper `Profile::with_memberships(self, Vec<Membership>) -> Self` —
+  the single convergence point (consumer + backstop both call it); replaces only
+  memberships, preserves every other field. Tests `with_memberships_replaces_only_
+  memberships` + `with_memberships_empty_clears_membership_projection` (revoke-all).
+- [x] 1.3 Fix the reconciler clobber: new pure `reconcile::reconciled_profile(user, roles,
+  stored)` carries the STORED memberships forward via `with_memberships`; reconciler calls
+  it instead of `build_profile_from_user`. `differs` still ignores memberships (no spurious
+  puts). Tests `reconciled_profile_preserves_memberships_on_identity_change` +
+  `reconciled_profile_no_stored_has_empty_memberships`. (sync-worker was already safe —
+  read-modify-write from `existing`.)
 
 ## 2. Routing — emit the change signal (source of record stays authoritative)
 

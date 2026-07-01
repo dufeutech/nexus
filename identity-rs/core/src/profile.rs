@@ -13,6 +13,12 @@ pub struct Profile {
     pub sub: String,
     #[serde(default)]
     pub org_id: Option<String>,
+    /// The subject's home organization, denormalized for display/context only.
+    /// **Informational — NEVER an authorization input**: it does not influence
+    /// [`Profile::resolve_membership`] or the emitted acting scope (the `x-user-org`
+    /// authz signal was retired). See `identity-workspace-authz` spec.
+    #[serde(default)]
+    pub home_org: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -60,6 +66,17 @@ impl Profile {
                 member_type: m.member_type,
                 role: m.role.clone(),
             })
+    }
+
+    /// Return this profile with its membership projection replaced by the
+    /// source-of-record `memberships`, preserving every other field. This is the
+    /// single convergence point for the projection: both the real-time consumer and
+    /// the reconcile backstop call it, so an identity-attribute write never clobbers
+    /// memberships and a membership write never touches identity fields.
+    #[must_use]
+    pub fn with_memberships(mut self, memberships: Vec<Membership>) -> Self {
+        self.memberships = memberships;
+        self
     }
 }
 
@@ -112,5 +129,67 @@ mod tests {
     fn member_type_wire_values_are_stable() {
         assert_eq!(MemberType::Staff.as_str(), "staff");
         assert_eq!(MemberType::Customer.as_str(), "customer");
+    }
+
+    #[test]
+    fn home_org_never_affects_resolution() {
+        // home_org is informational: it must not grant a workspace, and must not
+        // change the scope resolved from an actual membership.
+        let non_member = Profile {
+            sub: "u1".into(),
+            home_org: Some("org-home".into()),
+            ..Default::default()
+        };
+        assert!(non_member.resolve_membership("org-home").is_none());
+        assert!(non_member.resolve_membership("ws-a").is_none());
+
+        let member = Profile {
+            sub: "u1".into(),
+            home_org: Some("org-home".into()),
+            memberships: vec![member("ws-a", MemberType::Customer, "pro")],
+            ..Default::default()
+        };
+        let r = member.resolve_membership("ws-a").expect("member of ws-a");
+        assert_eq!(r.member_type, MemberType::Customer);
+        assert_eq!(r.role, "pro");
+    }
+
+    #[test]
+    fn with_memberships_replaces_only_memberships() {
+        let base = Profile {
+            sub: "u1".into(),
+            org_id: Some("org1".into()),
+            home_org: Some("org-home".into()),
+            username: Some("alice".into()),
+            roles: vec!["admin".into()],
+            memberships: vec![member("ws-old", MemberType::Staff, "owner")],
+            version: 7,
+            ..Default::default()
+        };
+        let merged = base
+            .clone()
+            .with_memberships(vec![member("ws-a", MemberType::Customer, "pro")]);
+        // Memberships swapped to the source-of-record set...
+        assert_eq!(merged.memberships.len(), 1);
+        assert_eq!(merged.memberships[0].workspace_id, "ws-a");
+        // ...every other field preserved unchanged.
+        assert_eq!(merged.org_id, base.org_id);
+        assert_eq!(merged.home_org, base.home_org);
+        assert_eq!(merged.username, base.username);
+        assert_eq!(merged.roles, base.roles);
+        assert_eq!(merged.version, base.version);
+    }
+
+    #[test]
+    fn with_memberships_empty_clears_membership_projection() {
+        // Revoke-all: an empty source-of-record set removes every membership.
+        let p = Profile {
+            sub: "u1".into(),
+            memberships: vec![member("ws-a", MemberType::Staff, "admin")],
+            ..Default::default()
+        }
+        .with_memberships(Vec::new());
+        assert!(p.memberships.is_empty());
+        assert!(p.resolve_membership("ws-a").is_none());
     }
 }

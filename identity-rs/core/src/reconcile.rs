@@ -19,9 +19,13 @@ pub fn build_profile_from_user(user: &Value, mut roles: Vec<String>) -> Profile 
     let profile = human.get("profile").unwrap_or(&null);
     let det = user.get("details").unwrap_or(&null);
     roles.sort();
+    // The IdP resource owner is the subject's home org: `org_id` keeps the legacy
+    // field name; `home_org` is its informational (non-authz) successor. Read once.
+    let resource_owner = str_field(det, "resourceOwner");
     Profile {
         sub: str_field(user, "userId").unwrap_or_default(),
-        org_id: str_field(det, "resourceOwner"),
+        org_id: resource_owner.clone(),
+        home_org: resource_owner,
         username: str_field(user, "username"),
         email: human
             .get("email")
@@ -46,9 +50,21 @@ pub fn build_profile_from_user(user: &Value, mut roles: Vec<String>) -> Profile 
     }
 }
 
+/// Build the desired Profile for a reconcile pass, carrying the STORED membership
+/// projection forward. Memberships are nexus-native (not from the IdP) and are
+/// reconciled separately by the membership-sync worker/backstop, so an
+/// identity-attribute or role update here MUST NOT clobber them. This is the pure
+/// no-clobber merge the reconciler writes: identity fields come from the
+/// authoritative user record, memberships are preserved from what was stored.
+#[must_use]
+pub fn reconciled_profile(user: &Value, roles: Vec<String>, stored: Option<&Profile>) -> Profile {
+    let memberships = stored.map(|p| p.memberships.clone()).unwrap_or_default();
+    build_profile_from_user(user, roles).with_memberships(memberships)
+}
+
 /// True if the desired Profile differs from what is stored on the fields the
 /// reconciler is authoritative for (identity attributes + roles). Excludes
-/// `version`, `updated_at`, and `entitlements` (not reconciler-owned).
+/// `version`, `updated_at`, `entitlements`, and `memberships` (not reconciler-owned).
 #[must_use]
 pub fn differs(desired: &Profile, stored: Option<&Profile>) -> bool {
     let Some(s) = stored else {
@@ -103,5 +119,49 @@ mod tests {
         stored.roles = desired.roles.clone();
         stored.username = Some("bob".into());
         assert!(differs(&desired, Some(&stored)));
+    }
+
+    #[test]
+    fn build_populates_home_org_from_resource_owner() {
+        let u = json!({"userId": "u1", "details": {"resourceOwner": "org1"}});
+        let p = build_profile_from_user(&u, vec![]);
+        assert_eq!(p.org_id.as_deref(), Some("org1"));
+        assert_eq!(p.home_org.as_deref(), Some("org1"));
+    }
+
+    #[test]
+    fn reconciled_profile_preserves_memberships_on_identity_change() {
+        use crate::membership::{MemberType, Membership};
+        let stored = Profile {
+            sub: "u1".into(),
+            username: Some("alice".into()),
+            roles: vec!["viewer".into()],
+            memberships: vec![Membership {
+                workspace_id: "ws-a".into(),
+                member_type: MemberType::Staff,
+                role: "admin".into(),
+                entitlements: vec![],
+            }],
+            ..Default::default()
+        };
+        // The IdP record changed an identity attribute AND a role — a `put` would
+        // normally fire and, with empty memberships, clobber them.
+        let user = json!({"userId": "u1", "username": "alice2"});
+        let desired = reconciled_profile(&user, vec!["editor".into()], Some(&stored));
+
+        // Identity/role fields updated from the authoritative record...
+        assert_eq!(desired.username.as_deref(), Some("alice2"));
+        assert_eq!(desired.roles, vec!["editor".to_owned()]);
+        // ...but nexus-native memberships preserved (no clobber), and a `put` fires.
+        assert_eq!(desired.memberships, stored.memberships);
+        assert!(differs(&desired, Some(&stored)));
+    }
+
+    #[test]
+    fn reconciled_profile_no_stored_has_empty_memberships() {
+        // A brand-new subject has no memberships to preserve (the membership-sync
+        // worker fills them from the source of record).
+        let desired = reconciled_profile(&json!({"userId": "u1"}), vec![], None);
+        assert!(desired.memberships.is_empty());
     }
 }
