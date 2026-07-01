@@ -22,5 +22,5 @@ pub mod store;
 pub mod verify;
 
 pub use auth::{AuthPolicy, PathRule, RouteAuth};
-pub use domain::{Pool, RoutingDecision, TenantConfig};
+pub use domain::{Pool, RoutingDecision, WorkspaceConfig};
 pub use plan::{DomainLimit, PlanLimits, QuotaExceeded};

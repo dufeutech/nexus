@@ -37,12 +37,12 @@ use tonic::{transport::Server, Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 use envoy_types::pb::envoy::config::core::v3::{
-    header_value_option::HeaderAppendAction, HeaderValue, HeaderValueOption,
+    header_value_option::HeaderAppendAction, HeaderMap, HeaderValue, HeaderValueOption,
 };
 use envoy_types::pb::envoy::service::ext_proc::v3::{
     external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request, processing_response, CommonResponse, HeaderMutation, HeadersResponse,
-    ImmediateResponse, ProcessingRequest, ProcessingResponse,
+    HttpHeaders, ImmediateResponse, ProcessingRequest, ProcessingResponse,
 };
 use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 
@@ -196,11 +196,46 @@ fn header(key: &str, value: &str) -> HeaderValueOption {
     }
 }
 
+/// Read one request header by (case-insensitive) name from the ext_proc
+/// `HttpHeaders` payload. Envoy carries the value in `raw_value` (bytes) on modern
+/// wire versions and the legacy `value` (string) otherwise — accept either. An
+/// empty value is treated as absent.
+fn find_header(map: &HeaderMap, name: &str) -> Option<String> {
+    map.headers
+        .iter()
+        .find(|h| h.key.eq_ignore_ascii_case(name))
+        .and_then(|h| {
+            if h.raw_value.is_empty() {
+                Some(h.value.clone())
+            } else {
+                String::from_utf8(h.raw_value.clone()).ok()
+            }
+        })
+        .filter(|v| !v.is_empty())
+}
+
+/// The workspace the request is acting in, as resolved by the routing plane and
+/// carried on a TRUSTED header (never a client-forged value — the edge strips the
+/// client's copy and the routing stage overwrites it authoritatively, C3). Prefer
+/// the post-cut-over `x-workspace-id`; fall back to the routing plane's current
+/// `x-tenant-id` so this works both before and after the header rename (task 4.1).
+/// `None` when the request carries no resolved workspace (e.g. a public route) — no
+/// acting scope is then authorized.
+fn extract_acting_workspace(req: &ProcessingRequest) -> Option<String> {
+    let Some(processing_request::Request::RequestHeaders(HttpHeaders { headers: Some(map), .. })) =
+        &req.request
+    else {
+        return None;
+    };
+    find_header(map, "x-workspace-id").or_else(|| find_header(map, "x-tenant-id"))
+}
+
 fn enrich_response(
     sub: &str,
     token_roles: &[String],
     profile: Option<Arc<Profile>>,
     authenticated: bool,
+    acting_workspace: Option<&str>,
 ) -> ProcessingResponse {
     // Trusted auth-state, emitted on EVERY request (incl. the no-credential path)
     // so a backend never has to infer it from the absence of a header. Standards:
@@ -233,8 +268,33 @@ fn enrich_response(
     // `x-auth-required` is consumed by jwt_authn upstream and never authored
     // here, so it is always stripped before forwarding to the backend.
     let mut remove = vec!["x-auth-required".to_owned()];
+    // The nexus-owned acting scope (workspace-tenancy 3.2). Authored ONLY from a
+    // LIVE membership check of the resolved workspace against the Profile — never
+    // from the token — so a revoked/changed membership takes effect within seconds
+    // (like suspension). A non-member, an absent profile, or no resolved workspace
+    // authors nothing and STRIPS any client/forged copy, so the sidecar can never
+    // let an unauthorized acting scope reach the backend (fail-closed; the
+    // reject-vs-anonymous-vs-signup policy for a non-member is the backend's, per
+    // the surface). `x-user-type`/`x-user-role` are the matched relationship's, not
+    // a global role; the plural `x-user-roles` above stays the coarse token/profile
+    // roles.
+    let acting = acting_workspace
+        .zip(profile.as_ref())
+        .and_then(|(ws, p)| p.resolve_membership(ws));
+    if let Some(m) = &acting {
+        set.push(header("x-workspace-id", &m.workspace_id));
+        set.push(header("x-user-type", m.member_type.as_str()));
+        set.push(header("x-user-role", &m.role));
+    } else {
+        remove.push("x-workspace-id".to_owned());
+        remove.push("x-user-type".to_owned());
+        remove.push("x-user-role".to_owned());
+    }
+    // `x-user-org` is retired (workspace-tenancy): the fixed home org is no longer
+    // an authorization input, so it is NEVER authored and ALWAYS stripped from
+    // client input, on every path.
+    remove.push("x-user-org".to_owned());
     if let Some(p) = &profile {
-        set.push(header("x-user-org", p.org_id.as_deref().unwrap_or("")));
         set.push(header("x-user-entitlements", &p.entitlements.join(",")));
         // Revocation-sensitive: ALWAYS from the live Profile, never the token,
         // so a suspension takes effect within seconds without a token refresh.
@@ -244,11 +304,10 @@ fn enrich_response(
         ));
         set.push(header("x-user-enriched-by", "identity-sidecar-rs"));
     } else {
-        // No profile: this response does NOT author org/entitlements/suspended,
-        // so strip any client copies. Suspension especially — an absent
+        // No profile: this response does NOT author entitlements/suspended, so
+        // strip any client copies. Suspension especially — an absent
         // x-user-suspended must mean "unknown", never a client-asserted "false"
         // that would slip a suspended user through.
-        remove.push("x-user-org".to_owned());
         remove.push("x-user-entitlements".to_owned());
         remove.push("x-user-suspended".to_owned());
         set.push(header("x-user-enriched-by", "identity-sidecar-rs:miss"));
@@ -311,6 +370,11 @@ impl Sidecar {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             let (sub, token_roles, authenticated) = extract_identity(&req);
+            // The workspace this request acts in, from the trusted routing header.
+            // Threaded into enrich so the membership check authorizes the SAME
+            // workspace the router resolved (not a client-chosen one).
+            let acting_workspace = extract_acting_workspace(&req);
+            let ws = acting_workspace.as_deref();
             // `sub` is a user identifier (PII): keep it out of per-request info
             // logs (enable debug for the subject when diagnosing a specific user).
             debug!(sub = %sub, "enrich subject");
@@ -318,13 +382,13 @@ impl Sidecar {
                 match self.state.resolve(&sub).await {
                     Resolved::Found(p) => {
                         info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
-                        (enrich_response(&sub, &token_roles, Some(p), true), "hit")
+                        (enrich_response(&sub, &token_roles, Some(p), true, ws), "hit")
                     }
                     // Authenticated but no profile row yet — a legitimate state
                     // (e.g. not-yet-synced user); enrich without profile fields.
                     Resolved::Absent => {
                         info!(anonymous = false, hit = false, token_roles = token_roles.len(), "enrich");
-                        (enrich_response(&sub, &token_roles, None, true), "miss")
+                        (enrich_response(&sub, &token_roles, None, true, ws), "miss")
                     }
                     // Store unreadable → suspension state is UNKNOWN. Fail closed
                     // by default so a suspended user can't slip through during a
@@ -335,7 +399,7 @@ impl Sidecar {
                             (unavailable_503(), "unavailable_closed")
                         } else {
                             warn!("store unavailable for authenticated request -> enrich without profile (fail-open)");
-                            (enrich_response(&sub, &token_roles, None, true), "unavailable_open")
+                            (enrich_response(&sub, &token_roles, None, true, ws), "unavailable_open")
                         }
                     }
                 }
@@ -345,7 +409,7 @@ impl Sidecar {
                 // so a lookup is a guaranteed miss that needlessly loads the pool on
                 // high-volume anonymous traffic (and is not negatively cached).
                 info!(anonymous = true, token_roles = token_roles.len(), "enrich");
-                (enrich_response(&sub, &token_roles, None, false), "anonymous")
+                (enrich_response(&sub, &token_roles, None, false, ws), "anonymous")
             }
         } else {
             warn!("not ready -> 503");
@@ -706,7 +770,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     #![allow(clippy::panic, reason = "test helpers legitimately panic on the impossible branch")]
     use super::*;
+    use identity_core::{MemberType, Membership};
     use std::collections::HashMap;
+
+    /// A Profile holding one workspace membership, for the resolution matrix.
+    fn member_profile(ws: &str, ty: MemberType, role: &str) -> Arc<Profile> {
+        Arc::new(Profile {
+            sub: "u1".into(),
+            memberships: vec![Membership {
+                workspace_id: ws.into(),
+                member_type: ty,
+                role: role.into(),
+                entitlements: vec![],
+            }],
+            ..Default::default()
+        })
+    }
 
     /// Collect the response's set headers into a map for assertions.
     fn set_headers(resp: &ProcessingResponse) -> HashMap<String, String> {
@@ -749,18 +828,26 @@ mod tests {
             &[],
             Some(Arc::new(Profile { sub: "u1".into(), ..Default::default() })),
             true,
+            None,
         );
         let r_some = remove_headers(&some);
         assert!(r_some.contains(&"x-auth-required".to_owned()));
-        // On the profile-present path the sidecar AUTHORS org/entitlements/
-        // suspended, so it must NOT also remove them (that would risk wiping the
-        // value it just set, depending on Envoy's apply order).
+        // On the profile-present path the sidecar AUTHORS entitlements/suspended, so
+        // it must NOT also remove them (that would risk wiping the value it just set,
+        // depending on Envoy's apply order).
         assert!(!r_some.contains(&"x-user-suspended".to_owned()));
-        assert!(!r_some.contains(&"x-user-org".to_owned()));
+        // `x-user-org` is retired: never authored, so ALWAYS stripped — even on the
+        // profile-present path.
+        assert!(r_some.contains(&"x-user-org".to_owned()));
+        // No acting workspace resolved -> no membership -> the acting scope is
+        // stripped, never asserted.
+        for h in ["x-workspace-id", "x-user-type", "x-user-role"] {
+            assert!(r_some.contains(&h.to_owned()), "non-member must strip {h}");
+        }
 
         // On a profile MISS the sidecar authors none of those, so any client copy
         // must be stripped — suspension especially (absent == unknown).
-        let miss = enrich_response("u1", &[], None, true);
+        let miss = enrich_response("u1", &[], None, true, None);
         let r_miss = remove_headers(&miss);
         for h in ["x-auth-required", "x-user-org", "x-user-entitlements", "x-user-suspended"] {
             assert!(r_miss.contains(&h.to_owned()), "miss path must strip {h}");
@@ -797,14 +884,14 @@ mod tests {
             is_suspended: true,
             ..Default::default()
         });
-        let h = set_headers(&enrich_response("u1", &[], Some(suspended), true));
+        let h = set_headers(&enrich_response("u1", &[], Some(suspended), true, None));
         assert_eq!(h.get("x-user-suspended").map(String::as_str), Some("true"));
         assert_eq!(h.get("x-auth-anonymous").map(String::as_str), Some("false"));
 
         // A profile MISS (no row) must NOT assert a suspension either way — the
         // header is simply absent, which is exactly why a store outage that
         // collapses to "miss" is dangerous and must instead fail closed.
-        let h_miss = set_headers(&enrich_response("u1", &[], None, true));
+        let h_miss = set_headers(&enrich_response("u1", &[], None, true, None));
         assert!(!h_miss.contains_key("x-user-suspended"));
     }
 
@@ -812,5 +899,93 @@ mod tests {
     fn unavailable_503_is_a_blocking_503() {
         assert!(is_immediate_503(&unavailable_503()));
         assert!(is_immediate_503(&warming_503()));
+    }
+
+    /// Build a RequestHeaders ext_proc message carrying the given headers.
+    fn req_with_headers(pairs: &[(&str, &str)]) -> ProcessingRequest {
+        ProcessingRequest {
+            request: Some(processing_request::Request::RequestHeaders(HttpHeaders {
+                headers: Some(HeaderMap {
+                    headers: pairs
+                        .iter()
+                        .map(|(k, v)| HeaderValue {
+                            key: (*k).to_owned(),
+                            raw_value: v.as_bytes().to_vec(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn member_gets_authoritative_workspace_scope() {
+        // Member of the resolved workspace -> authoritative scope is emitted and
+        // NOT in the strip list (it was authored).
+        let resp = enrich_response(
+            "u1",
+            &[],
+            Some(member_profile("ws_1", MemberType::Staff, "admin")),
+            true,
+            Some("ws_1"),
+        );
+        let h = set_headers(&resp);
+        assert_eq!(h.get("x-workspace-id").map(String::as_str), Some("ws_1"));
+        assert_eq!(h.get("x-user-type").map(String::as_str), Some("staff"));
+        assert_eq!(h.get("x-user-role").map(String::as_str), Some("admin"));
+        let r = remove_headers(&resp);
+        for hh in ["x-workspace-id", "x-user-type", "x-user-role"] {
+            assert!(!r.contains(&hh.to_owned()), "authored {hh} must not be stripped");
+        }
+    }
+
+    #[test]
+    fn member_type_and_role_are_workspace_scoped() {
+        // Customer of ws_2 resolves to the customer type + the ws-scoped role.
+        let resp = enrich_response(
+            "u1",
+            &[],
+            Some(member_profile("ws_2", MemberType::Customer, "buyer")),
+            true,
+            Some("ws_2"),
+        );
+        let h = set_headers(&resp);
+        assert_eq!(h.get("x-user-type").map(String::as_str), Some("customer"));
+        assert_eq!(h.get("x-user-role").map(String::as_str), Some("buyer"));
+    }
+
+    #[test]
+    fn non_member_of_acting_workspace_is_fail_closed() {
+        // Member of ws_1, but the request resolves to a DIFFERENT workspace -> no
+        // authoritative scope, and any forged copy is stripped (fail-closed).
+        let resp = enrich_response(
+            "u1",
+            &[],
+            Some(member_profile("ws_1", MemberType::Staff, "admin")),
+            true,
+            Some("ws_other"),
+        );
+        assert!(!set_headers(&resp).contains_key("x-workspace-id"));
+        let r = remove_headers(&resp);
+        for hh in ["x-workspace-id", "x-user-type", "x-user-role"] {
+            assert!(r.contains(&hh.to_owned()), "non-member must strip {hh}");
+        }
+    }
+
+    #[test]
+    fn acting_workspace_prefers_x_workspace_id_then_x_tenant_id() {
+        // The post-cut-over authoritative name wins over the routing plane's current
+        // x-tenant-id.
+        let both = req_with_headers(&[("x-tenant-id", "ws_routing"), ("x-workspace-id", "ws_new")]);
+        assert_eq!(extract_acting_workspace(&both).as_deref(), Some("ws_new"));
+        // Falls back to the routing plane's current header before the rename.
+        let legacy = req_with_headers(&[("X-Tenant-Id", "ws_routing")]);
+        assert_eq!(extract_acting_workspace(&legacy).as_deref(), Some("ws_routing"));
+        // An empty value is treated as absent (no acting workspace).
+        let empty = req_with_headers(&[("x-workspace-id", "")]);
+        assert_eq!(extract_acting_workspace(&empty), None);
     }
 }

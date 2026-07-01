@@ -21,9 +21,10 @@ use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
 use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
-use router_core::domain::{Pool, TenantConfig};
+use router_core::domain::{Pool, WorkspaceConfig};
 use router_core::store::{
-    BoxError, Challenge, ChallengeStore, DomainRecord, InvalidationFeed, Invalidations, RoutingStore,
+    Account, AccountMember, BoxError, Challenge, ChallengeStore, DomainRecord, InvalidationFeed,
+    Invalidations, Membership, MembershipStore, OwnershipStore, RoutingStore,
 };
 
 /// The NOTIFY channel the control plane publishes invalidations on.
@@ -62,23 +63,110 @@ impl PgRoutingStore {
 
     /// Idempotent schema bootstrap. The control plane owns this on startup; the
     /// router only reads, so it never creates schema.
+    ///
+    /// There is no migration framework here (RFC decision 14: the routing plane
+    /// reuses a store the control plane bootstraps): schema is created idempotently
+    /// with `CREATE ... IF NOT EXISTS`. The BREAKING `tenant_id → workspace_id`
+    /// rename (nexus-owned-workspace-tenancy) therefore ships as an explicit,
+    /// guarded in-place migration for already-provisioned databases — `CREATE TABLE
+    /// IF NOT EXISTS` alone would never alter an existing table — followed by the
+    /// new-shape `CREATE`s that a fresh database gets directly.
     pub async fn init_schema(&self) -> Result<(), BoxError> {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS routing")
             .execute(&self.pool)
             .await?;
+        // --- BREAKING migration: tenant_id → workspace_id (guarded, idempotent).
+        // Renames the pre-existing `tenants` table and every `tenant_id` column to
+        // the workspace vocabulary. Postgres carries FK/PK constraints across a
+        // RENAME automatically, so the FKs below need no rebuild. Each step is
+        // guarded on the OLD name still existing, so this whole block is a no-op on
+        // a fresh database (new-shape `CREATE`s below make it) and on an
+        // already-migrated one (the old names are gone).
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS routing.tenants (\
-                 tenant_id  text PRIMARY KEY, \
-                 plan       text NOT NULL DEFAULT 'free', \
-                 target_pool text NOT NULL DEFAULT 'application', \
-                 features   text[] NOT NULL DEFAULT '{}', \
+            "DO $$ \
+             BEGIN \
+                 IF to_regclass('routing.tenants') IS NOT NULL THEN \
+                     ALTER TABLE routing.tenants RENAME TO workspaces; \
+                 END IF; \
+                 IF EXISTS (SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema='routing' AND table_name='workspaces' \
+                              AND column_name='tenant_id') THEN \
+                     ALTER TABLE routing.workspaces RENAME COLUMN tenant_id TO workspace_id; \
+                 END IF; \
+                 IF EXISTS (SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema='routing' AND table_name='domains' \
+                              AND column_name='tenant_id') THEN \
+                     ALTER TABLE routing.domains RENAME COLUMN tenant_id TO workspace_id; \
+                 END IF; \
+                 IF EXISTS (SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema='routing' AND table_name='domain_challenges' \
+                              AND column_name='tenant_id') THEN \
+                     ALTER TABLE routing.domain_challenges RENAME COLUMN tenant_id TO workspace_id; \
+                 END IF; \
+                 IF EXISTS (SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema='routing' AND table_name='auth_routes' \
+                              AND column_name='tenant_id') THEN \
+                     ALTER TABLE routing.auth_routes RENAME COLUMN tenant_id TO workspace_id; \
+                 END IF; \
+             END $$",
+        )
+        .execute(&self.pool)
+        .await?;
+        // --- Ownership: an Account owns Workspaces and is a member container
+        // (nexus-owned-workspace-tenancy). Created before `workspaces` so the
+        // `workspace.account_id` FK resolves. `payer_ref` is the billing/payer of
+        // record, which switches on a transfer (plan travels with the workspace,
+        // payer travels with the account); nullable until billing is wired.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.accounts (\
+                 account_id text PRIMARY KEY, \
+                 name       text NOT NULL DEFAULT '', \
+                 payer_ref  text, \
                  updated_at timestamptz NOT NULL DEFAULT now())",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Account membership. Owner-only in v1 (roles beyond `owner` are additive);
+        // a solo account is simply a one-member account (no personal|org type).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.account_members (\
+                 account_id text NOT NULL REFERENCES routing.accounts(account_id) ON DELETE CASCADE, \
+                 user_sub   text NOT NULL, \
+                 role       text NOT NULL DEFAULT 'owner', \
+                 updated_at timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (account_id, user_sub))",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Workspaces — the stable-ID routing pivot (formerly `tenants`). Fresh
+        // databases get this shape directly; a migrated database already has the
+        // renamed table, so this `CREATE IF NOT EXISTS` is a no-op and the
+        // `ADD COLUMN IF NOT EXISTS` below backfills its `account_id`. `account_id`
+        // is a plain reference (NOT cascade): deleting an account that still owns
+        // workspaces must fail — transfer first — never silently drop routing.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.workspaces (\
+                 workspace_id text PRIMARY KEY, \
+                 account_id   text REFERENCES routing.accounts(account_id), \
+                 plan         text NOT NULL DEFAULT 'free', \
+                 target_pool  text NOT NULL DEFAULT 'application', \
+                 features     text[] NOT NULL DEFAULT '{}', \
+                 updated_at   timestamptz NOT NULL DEFAULT now())",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Add `account_id` to a workspaces table migrated from the old `tenants`
+        // (which had no ownership column). No-op on a fresh DB where the CREATE
+        // above already included it; tied to column existence, so it is idempotent.
+        sqlx::query(
+            "ALTER TABLE routing.workspaces \
+             ADD COLUMN IF NOT EXISTS account_id text REFERENCES routing.accounts(account_id)",
         )
         .execute(&self.pool)
         .await?;
         // Keyed by (domain, is_wildcard), NOT domain alone: a domain string may
         // exist as both an apex/exact row (is_wildcard=false) AND a
-        // wildcard-subdomain row (is_wildcard=true) for the same tenant — the
+        // wildcard-subdomain row (is_wildcard=true) for the same workspace — the
         // apex+wildcard coexistence the explicit model forbids today but a future
         // wildcard tier needs (see nexus-upstream-requirements.md §N3). Choosing
         // the composite key now is free while the table is small; retrofitting it
@@ -87,11 +175,11 @@ impl PgRoutingStore {
         // (declare forces is_wildcard=false); wildcard rows are admin-seeded.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.domains (\
-                 domain      text NOT NULL, \
-                 tenant_id   text NOT NULL REFERENCES routing.tenants(tenant_id) ON DELETE CASCADE, \
-                 is_wildcard boolean NOT NULL DEFAULT false, \
-                 verified    boolean NOT NULL DEFAULT false, \
-                 updated_at  timestamptz NOT NULL DEFAULT now(), \
+                 domain       text NOT NULL, \
+                 workspace_id text NOT NULL REFERENCES routing.workspaces(workspace_id) ON DELETE CASCADE, \
+                 is_wildcard  boolean NOT NULL DEFAULT false, \
+                 verified     boolean NOT NULL DEFAULT false, \
+                 updated_at   timestamptz NOT NULL DEFAULT now(), \
                  PRIMARY KEY (domain, is_wildcard))",
         )
         .execute(&self.pool)
@@ -105,30 +193,50 @@ impl PgRoutingStore {
         // challenged (wildcard rows are admin-seeded already-verified).
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.domain_challenges (\
-                 domain      text NOT NULL, \
-                 is_wildcard boolean NOT NULL DEFAULT false, \
-                 tenant_id   text NOT NULL, \
-                 token       text NOT NULL, \
-                 expires_at  timestamptz NOT NULL, \
-                 updated_at  timestamptz NOT NULL DEFAULT now(), \
+                 domain       text NOT NULL, \
+                 is_wildcard  boolean NOT NULL DEFAULT false, \
+                 workspace_id text NOT NULL, \
+                 token        text NOT NULL, \
+                 expires_at   timestamptz NOT NULL, \
+                 updated_at   timestamptz NOT NULL DEFAULT now(), \
                  PRIMARY KEY (domain, is_wildcard), \
                  FOREIGN KEY (domain, is_wildcard) \
                      REFERENCES routing.domains(domain, is_wildcard) ON DELETE CASCADE)",
         )
         .execute(&self.pool)
         .await?;
-        // Per-route authentication policy (RFC N4). One row per (tenant, path
-        // prefix); the per-tenant default is the `prefix = '/'` row. Absence of any
-        // row for a tenant is "public" (pass-through) — the read path returns the
-        // default, so no backfill is needed when this table is introduced. Cascades
-        // away with its tenant.
+        // Per-route authentication policy (RFC N4). One row per (workspace, path
+        // prefix); the per-workspace default is the `prefix = '/'` row. Absence of
+        // any row for a workspace is "public" (pass-through) — the read path returns
+        // the default, so no backfill is needed when this table is introduced.
+        // Cascades away with its workspace.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.auth_routes (\
-                 tenant_id     text NOT NULL REFERENCES routing.tenants(tenant_id) ON DELETE CASCADE, \
+                 workspace_id  text NOT NULL REFERENCES routing.workspaces(workspace_id) ON DELETE CASCADE, \
                  path_prefix   text NOT NULL, \
                  auth_required boolean NOT NULL, \
                  updated_at    timestamptz NOT NULL DEFAULT now(), \
-                 PRIMARY KEY (tenant_id, path_prefix))",
+                 PRIMARY KEY (workspace_id, path_prefix))",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Memberships — the live authz source of record (nexus-owned-workspace-
+        // tenancy): who acts in a workspace, as which type (staff|customer) and
+        // role. The identity plane resolves it fail-closed on the hot path (behind
+        // the `MembershipResolver` port); the control plane writes it here and it
+        // rides the existing change feed. Keyed (user_sub, workspace_id) — a user
+        // holds at most one membership per workspace. `member_type` is constrained
+        // to the two modeled kinds; `status` is left open for the lifecycle
+        // (active/suspended/…). Cascades away with its workspace.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.memberships (\
+                 user_sub     text NOT NULL, \
+                 workspace_id text NOT NULL REFERENCES routing.workspaces(workspace_id) ON DELETE CASCADE, \
+                 member_type  text NOT NULL CHECK (member_type IN ('staff', 'customer')), \
+                 role         text NOT NULL DEFAULT 'member', \
+                 status       text NOT NULL DEFAULT 'active', \
+                 updated_at   timestamptz NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (user_sub, workspace_id))",
         )
         .execute(&self.pool)
         .await?;
@@ -200,22 +308,22 @@ impl RoutingStore for PgRoutingStore {
         // Point read on the `domain` primary key. `verified = true` enforces
         // RFC C16: an unverified domain MUST NOT resolve on protected routes.
         let row = sqlx::query(
-            "SELECT tenant_id FROM routing.domains \
+            "SELECT workspace_id FROM routing.domains \
              WHERE domain = $1 AND is_wildcard = $2 AND verified = true",
         )
         .bind(domain)
         .bind(wildcard)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| r.get::<String, _>("tenant_id")))
+        Ok(row.map(|r| r.get::<String, _>("workspace_id")))
     }
 
-    async fn get_tenant(&self, tenant_id: &str) -> Result<Option<TenantConfig>, BoxError> {
+    async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceConfig>, BoxError> {
         let row = sqlx::query(
-            "SELECT tenant_id, plan, target_pool, features, updated_at::text AS updated_at \
-             FROM routing.tenants WHERE tenant_id = $1",
+            "SELECT workspace_id, plan, target_pool, features, updated_at::text AS updated_at \
+             FROM routing.workspaces WHERE workspace_id = $1",
         )
-        .bind(tenant_id)
+        .bind(workspace_id)
         .fetch_optional(&self.pool)
         .await?;
         let Some(r) = row else { return Ok(None) };
@@ -225,8 +333,8 @@ impl RoutingStore for PgRoutingStore {
         // removed from the allow-list, the edge route table's default cluster is the
         // backstop (an unknown x-route-pool falls through to `application`).
         let target: String = r.get("target_pool");
-        Ok(Some(TenantConfig {
-            tenant_id: r.get("tenant_id"),
+        Ok(Some(WorkspaceConfig {
+            workspace_id: r.get("workspace_id"),
             plan: r.get("plan"),
             target_pool: Pool::new(target),
             features: r.get::<Vec<String>, _>("features"),
@@ -234,15 +342,15 @@ impl RoutingStore for PgRoutingStore {
         }))
     }
 
-    async fn upsert_tenant(&self, cfg: &TenantConfig) -> Result<(), BoxError> {
+    async fn upsert_workspace(&self, cfg: &WorkspaceConfig) -> Result<(), BoxError> {
         sqlx::query(
-            "INSERT INTO routing.tenants (tenant_id, plan, target_pool, features, updated_at) \
+            "INSERT INTO routing.workspaces (workspace_id, plan, target_pool, features, updated_at) \
              VALUES ($1, $2, $3, $4, now()) \
-             ON CONFLICT (tenant_id) DO UPDATE SET \
+             ON CONFLICT (workspace_id) DO UPDATE SET \
                  plan = EXCLUDED.plan, target_pool = EXCLUDED.target_pool, \
                  features = EXCLUDED.features, updated_at = now()",
         )
-        .bind(&cfg.tenant_id)
+        .bind(&cfg.workspace_id)
         .bind(&cfg.plan)
         .bind(cfg.target_pool.as_str())
         .bind(&cfg.features)
@@ -254,19 +362,19 @@ impl RoutingStore for PgRoutingStore {
     async fn upsert_domain(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
         wildcard: bool,
         verified: bool,
     ) -> Result<(), BoxError> {
         sqlx::query(
-            "INSERT INTO routing.domains (domain, tenant_id, is_wildcard, verified, updated_at) \
+            "INSERT INTO routing.domains (domain, workspace_id, is_wildcard, verified, updated_at) \
              VALUES ($1, $2, $3, $4, now()) \
              ON CONFLICT (domain, is_wildcard) DO UPDATE SET \
-                 tenant_id = EXCLUDED.tenant_id, \
+                 workspace_id = EXCLUDED.workspace_id, \
                  verified = EXCLUDED.verified, updated_at = now()",
         )
         .bind(domain)
-        .bind(tenant_id)
+        .bind(workspace_id)
         .bind(wildcard)
         .bind(verified)
         .execute(&self.pool)
@@ -277,19 +385,19 @@ impl RoutingStore for PgRoutingStore {
     async fn create_pending_domain(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
     ) -> Result<bool, BoxError> {
         // INSERT ... ON CONFLICT DO NOTHING never reassigns an existing row's
-        // tenant_id, so two tenants racing the same new domain can't steal it: the
-        // loser's insert is a no-op (rows_affected == 0) and the caller resolves it
-        // as `domain_taken`. Exact (non-wildcard), unverified by construction.
+        // workspace_id, so two workspaces racing the same new domain can't steal it:
+        // the loser's insert is a no-op (rows_affected == 0) and the caller resolves
+        // it as `domain_taken`. Exact (non-wildcard), unverified by construction.
         let res = sqlx::query(
-            "INSERT INTO routing.domains (domain, tenant_id, is_wildcard, verified, updated_at) \
+            "INSERT INTO routing.domains (domain, workspace_id, is_wildcard, verified, updated_at) \
              VALUES ($1, $2, false, false, now()) \
              ON CONFLICT (domain, is_wildcard) DO NOTHING",
         )
         .bind(domain)
-        .bind(tenant_id)
+        .bind(workspace_id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
@@ -316,9 +424,9 @@ impl RoutingStore for PgRoutingStore {
         Ok(())
     }
 
-    async fn domains_for_tenant(&self, tenant_id: &str) -> Result<Vec<String>, BoxError> {
-        let rows = sqlx::query("SELECT domain FROM routing.domains WHERE tenant_id = $1")
-            .bind(tenant_id)
+    async fn domains_for_workspace(&self, workspace_id: &str) -> Result<Vec<String>, BoxError> {
+        let rows = sqlx::query("SELECT domain FROM routing.domains WHERE workspace_id = $1")
+            .bind(workspace_id)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("domain")).collect())
@@ -330,7 +438,7 @@ impl RoutingStore for PgRoutingStore {
         wildcard: bool,
     ) -> Result<Option<DomainRecord>, BoxError> {
         let row = sqlx::query(
-            "SELECT tenant_id, is_wildcard, verified FROM routing.domains \
+            "SELECT workspace_id, is_wildcard, verified FROM routing.domains \
              WHERE domain = $1 AND is_wildcard = $2",
         )
         .bind(domain)
@@ -338,16 +446,16 @@ impl RoutingStore for PgRoutingStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| DomainRecord {
-            tenant_id: r.get("tenant_id"),
+            workspace_id: r.get("workspace_id"),
             wildcard: r.get("is_wildcard"),
             verified: r.get("verified"),
         }))
     }
 
-    async fn count_domains_for_tenant(&self, tenant_id: &str) -> Result<u32, BoxError> {
-        // verified + pending: every row the tenant holds (RFC C3/I6).
-        let row = sqlx::query("SELECT count(*) AS n FROM routing.domains WHERE tenant_id = $1")
-            .bind(tenant_id)
+    async fn count_domains_for_workspace(&self, workspace_id: &str) -> Result<u32, BoxError> {
+        // verified + pending: every row the workspace holds (RFC C3/I6).
+        let row = sqlx::query("SELECT count(*) AS n FROM routing.domains WHERE workspace_id = $1")
+            .bind(workspace_id)
             .fetch_one(&self.pool)
             .await?;
         let n: i64 = row.get("n");
@@ -376,13 +484,14 @@ impl RoutingStore for PgRoutingStore {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("domain")).collect())
     }
 
-    async fn get_auth_policy(&self, tenant_id: &str) -> Result<AuthPolicy, BoxError> {
-        // Point read of the tenant's rule set. No rows -> the default (pass-through)
-        // falls out of an empty `AuthPolicy`, so a tenant with no policy is public.
+    async fn get_auth_policy(&self, workspace_id: &str) -> Result<AuthPolicy, BoxError> {
+        // Point read of the workspace's rule set. No rows -> the default (pass-
+        // through) falls out of an empty `AuthPolicy`, so a workspace with no policy
+        // is public.
         let rows = sqlx::query(
-            "SELECT path_prefix, auth_required FROM routing.auth_routes WHERE tenant_id = $1",
+            "SELECT path_prefix, auth_required FROM routing.auth_routes WHERE workspace_id = $1",
         )
-        .bind(tenant_id)
+        .bind(workspace_id)
         .fetch_all(&self.pool)
         .await?;
         let rules = rows
@@ -397,17 +506,17 @@ impl RoutingStore for PgRoutingStore {
 
     async fn upsert_auth_route(
         &self,
-        tenant_id: &str,
+        workspace_id: &str,
         prefix: &str,
         required: bool,
     ) -> Result<(), BoxError> {
         sqlx::query(
-            "INSERT INTO routing.auth_routes (tenant_id, path_prefix, auth_required, updated_at) \
+            "INSERT INTO routing.auth_routes (workspace_id, path_prefix, auth_required, updated_at) \
              VALUES ($1, $2, $3, now()) \
-             ON CONFLICT (tenant_id, path_prefix) DO UPDATE SET \
+             ON CONFLICT (workspace_id, path_prefix) DO UPDATE SET \
                  auth_required = EXCLUDED.auth_required, updated_at = now()",
         )
-        .bind(tenant_id)
+        .bind(workspace_id)
         .bind(prefix)
         .bind(required)
         .execute(&self.pool)
@@ -415,9 +524,9 @@ impl RoutingStore for PgRoutingStore {
         Ok(())
     }
 
-    async fn delete_auth_route(&self, tenant_id: &str, prefix: &str) -> Result<(), BoxError> {
-        sqlx::query("DELETE FROM routing.auth_routes WHERE tenant_id = $1 AND path_prefix = $2")
-            .bind(tenant_id)
+    async fn delete_auth_route(&self, workspace_id: &str, prefix: &str) -> Result<(), BoxError> {
+        sqlx::query("DELETE FROM routing.auth_routes WHERE workspace_id = $1 AND path_prefix = $2")
+            .bind(workspace_id)
             .bind(prefix)
             .execute(&self.pool)
             .await?;
@@ -430,7 +539,7 @@ impl ChallengeStore for PgRoutingStore {
     async fn mint_or_get_challenge(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
         ttl_secs: i64,
     ) -> Result<Challenge, BoxError> {
         // Mint a fresh ownership-proof token: 256 bits from the OS CSPRNG (ring's
@@ -456,7 +565,7 @@ impl ChallengeStore for PgRoutingStore {
         // (domain, false) row the declare flow created just before this call.
         let token = mint_challenge_token()?;
         let row = sqlx::query(
-            "INSERT INTO routing.domain_challenges (domain, is_wildcard, tenant_id, token, expires_at, updated_at) \
+            "INSERT INTO routing.domain_challenges (domain, is_wildcard, workspace_id, token, expires_at, updated_at) \
              VALUES ($1, false, $2, $4, now() + make_interval(secs => $3), now()) \
              ON CONFLICT (domain, is_wildcard) DO UPDATE SET \
                  token = CASE WHEN routing.domain_challenges.expires_at < now() \
@@ -465,12 +574,12 @@ impl ChallengeStore for PgRoutingStore {
                  expires_at = CASE WHEN routing.domain_challenges.expires_at < now() \
                               THEN now() + make_interval(secs => $3) \
                               ELSE routing.domain_challenges.expires_at END, \
-                 tenant_id = EXCLUDED.tenant_id, \
+                 workspace_id = EXCLUDED.workspace_id, \
                  updated_at = now() \
              RETURNING domain, token, (expires_at < now()) AS expired",
         )
         .bind(domain)
-        .bind(tenant_id)
+        .bind(workspace_id)
         .bind(ttl_secs as f64)
         .bind(&token)
         .fetch_one(&self.pool)
@@ -503,6 +612,195 @@ impl ChallengeStore for PgRoutingStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl OwnershipStore for PgRoutingStore {
+    async fn create_account(
+        &self,
+        account_id: &str,
+        name: &str,
+        payer_ref: Option<&str>,
+    ) -> Result<bool, BoxError> {
+        // Idempotent provision (ON CONFLICT DO NOTHING): a repeat signup for an
+        // already-provisioned account is a no-op and never clobbers its name/payer.
+        let res = sqlx::query(
+            "INSERT INTO routing.accounts (account_id, name, payer_ref, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (account_id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(name)
+        .bind(payer_ref)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError> {
+        let row = sqlx::query(
+            "SELECT account_id, name, payer_ref, updated_at::text AS updated_at \
+             FROM routing.accounts WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| Account {
+            account_id: r.get("account_id"),
+            name: r.get("name"),
+            payer_ref: r.get::<Option<String>, _>("payer_ref"),
+            updated_at: r.get::<Option<String>, _>("updated_at"),
+        }))
+    }
+
+    async fn add_account_member(
+        &self,
+        account_id: &str,
+        user_sub: &str,
+        role: &str,
+    ) -> Result<(), BoxError> {
+        sqlx::query(
+            "INSERT INTO routing.account_members (account_id, user_sub, role, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (account_id, user_sub) DO UPDATE SET \
+                 role = EXCLUDED.role, updated_at = now()",
+        )
+        .bind(account_id)
+        .bind(user_sub)
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn account_members(&self, account_id: &str) -> Result<Vec<AccountMember>, BoxError> {
+        let rows = sqlx::query(
+            "SELECT account_id, user_sub, role FROM routing.account_members WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AccountMember {
+                account_id: r.get("account_id"),
+                user_sub: r.get("user_sub"),
+                role: r.get("role"),
+            })
+            .collect())
+    }
+
+    async fn set_workspace_account(
+        &self,
+        workspace_id: &str,
+        account_id: &str,
+    ) -> Result<bool, BoxError> {
+        // Create-time ownership assignment: repoint ONLY `account_id`, no staff
+        // reset (a brand-new workspace has none). An ownership CHANGE goes through
+        // `transfer_workspace`, which also resets staff atomically.
+        let res = sqlx::query(
+            "UPDATE routing.workspaces SET account_id = $2, updated_at = now() \
+             WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn transfer_workspace(
+        &self,
+        workspace_id: &str,
+        account_id: &str,
+    ) -> Result<Option<u64>, BoxError> {
+        // One transaction: repoint ownership AND reset staff together, so a crash
+        // between the two can never leave the previous owner's staff with access.
+        // Customer memberships (member_type <> 'staff') are deliberately left, and
+        // domains/data ride through on the unchanged workspace_id.
+        let mut tx = self.pool.begin().await?;
+        let moved = sqlx::query(
+            "UPDATE routing.workspaces SET account_id = $2, updated_at = now() \
+             WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        if moved.rows_affected() == 0 {
+            // Unknown workspace — nothing to transfer; roll back so no partial state.
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let cleared = sqlx::query(
+            "DELETE FROM routing.memberships WHERE workspace_id = $1 AND member_type = 'staff'",
+        )
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(cleared.rows_affected()))
+    }
+}
+
+#[async_trait]
+impl MembershipStore for PgRoutingStore {
+    async fn upsert_membership(&self, m: &Membership) -> Result<(), BoxError> {
+        sqlx::query(
+            "INSERT INTO routing.memberships \
+                 (user_sub, workspace_id, member_type, role, status, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, now()) \
+             ON CONFLICT (user_sub, workspace_id) DO UPDATE SET \
+                 member_type = EXCLUDED.member_type, role = EXCLUDED.role, \
+                 status = EXCLUDED.status, updated_at = now()",
+        )
+        .bind(&m.user_sub)
+        .bind(&m.workspace_id)
+        .bind(&m.member_type)
+        .bind(&m.role)
+        .bind(&m.status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_membership(
+        &self,
+        user_sub: &str,
+        workspace_id: &str,
+    ) -> Result<(), BoxError> {
+        sqlx::query(
+            "DELETE FROM routing.memberships WHERE user_sub = $1 AND workspace_id = $2",
+        )
+        .bind(user_sub)
+        .bind(workspace_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn memberships_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<Membership>, BoxError> {
+        let rows = sqlx::query(
+            "SELECT user_sub, workspace_id, member_type, role, status \
+             FROM routing.memberships WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Membership {
+                user_sub: r.get("user_sub"),
+                workspace_id: r.get("workspace_id"),
+                member_type: r.get("member_type"),
+                role: r.get("role"),
+                status: r.get("status"),
+            })
+            .collect())
     }
 }
 

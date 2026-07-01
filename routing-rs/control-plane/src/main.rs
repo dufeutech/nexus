@@ -38,10 +38,13 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
-use router_core::domain::{PoolSet, TenantConfig};
+use router_core::domain::{PoolSet, WorkspaceConfig};
 use router_core::normalize::normalize_host;
 use router_core::plan::{DomainLimit, PlanLimits};
-use router_core::store::{BoxError, ChallengeStore, RoutingStore};
+use router_core::store::{
+    BoxError, ChallengeStore, Membership, MembershipStore, OwnershipStore, RoutingStore,
+    MEMBER_TYPES,
+};
 use router_core::verify::{challenge_name, ct_eq, token_matches, OwnershipProof};
 use store_postgres::{LeaderLease, PgRoutingStore};
 
@@ -191,7 +194,11 @@ async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Respons
 }
 
 // --------------------------------------------------------------------------- //
-// Tenants
+// Tenants — DEPRECATED alias of Workspaces (nexus-owned-workspace-tenancy, 2.2).
+// The `/tenants*` routes + this account-less `tenant_id` body are frozen for the
+// running broker/e2e during cut-over; new callers use `/workspaces*` (which also
+// carries `account_id` + membership). Removed in a later archive step. The handler
+// maps `tenant_id` → the store's `workspace_id` (the same identifier).
 // --------------------------------------------------------------------------- //
 #[derive(Deserialize)]
 struct TenantBody {
@@ -222,19 +229,22 @@ async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> im
         )
             .into_response();
     };
-    let cfg = TenantConfig {
-        tenant_id: body.tenant_id.clone(),
+    // Migration seam: the store/core now speak `workspace_id`, but this HTTP body
+    // is still the legacy `tenant_id` field (the `/tenants` API rename is task 2.2).
+    // The value is the same workspace identifier — map it across here.
+    let cfg = WorkspaceConfig {
+        workspace_id: body.tenant_id.clone(),
         plan: body.plan,
         target_pool: pool,
         features: body.features,
         updated_at: None,
     };
-    if let Err(e) = s.store.upsert_tenant(&cfg).await {
+    if let Err(e) = s.store.upsert_workspace(&cfg).await {
         return internal(e);
     }
-    // A tenant change affects all of its domains — invalidate each precisely so
+    // A workspace change affects all of its domains — invalidate each precisely so
     // both the L1 (per-edge) and L2 (shared) tiers converge by domain key.
-    match s.store.domains_for_tenant(&body.tenant_id).await {
+    match s.store.domains_for_workspace(&body.tenant_id).await {
         Ok(domains) => {
             for d in &domains {
                 s.invalidate(d).await;
@@ -248,7 +258,7 @@ async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> im
 }
 
 async fn get_tenant(State(s): State<App>, Path(id): Path<String>) -> impl IntoResponse {
-    match s.store.get_tenant(&id).await {
+    match s.store.get_workspace(&id).await {
         Ok(Some(cfg)) => (StatusCode::OK, Json(serde_json::to_value(cfg).unwrap())).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "tenant_id": id })))
             .into_response(),
@@ -314,8 +324,8 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
     }
 
     match s.store.get_domain(&domain, false).await {
-        // Owned (verified or pending) by another tenant — never grant a second claim.
-        Ok(Some(rec)) if rec.tenant_id != body.tenant_id => {
+        // Owned (verified or pending) by another workspace — never grant a second claim.
+        Ok(Some(rec)) if rec.workspace_id != body.tenant_id => {
             return (StatusCode::CONFLICT, Json(json!({ "error": "domain_taken", "domain": domain })))
                 .into_response();
         }
@@ -336,7 +346,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
                     warn!(error = %e, "declare: pending sweep failed (count may be stale)");
                 }
             }
-            let plan = match s.store.get_tenant(&body.tenant_id).await {
+            let plan = match s.store.get_workspace(&body.tenant_id).await {
                 Ok(Some(cfg)) => cfg.plan,
                 Ok(None) => {
                     return (
@@ -347,7 +357,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
                 }
                 Err(e) => return internal(e),
             };
-            let used = match s.store.count_domains_for_tenant(&body.tenant_id).await {
+            let used = match s.store.count_domains_for_workspace(&body.tenant_id).await {
                 Ok(n) => n,
                 Err(e) => return internal(e),
             };
@@ -372,8 +382,8 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
                 Ok(true) => {}
                 Ok(false) => {
                     match s.store.get_domain(&domain, false).await {
-                        // Another tenant claimed it first — never a second claim.
-                        Ok(Some(rec)) if rec.tenant_id != body.tenant_id => {
+                        // Another workspace claimed it first — never a second claim.
+                        Ok(Some(rec)) if rec.workspace_id != body.tenant_id => {
                             return (
                                 StatusCode::CONFLICT,
                                 Json(json!({ "error": "domain_taken", "domain": domain })),
@@ -609,7 +619,7 @@ impl App {
     /// Invalidate every domain a tenant owns — the precise convergence signal for
     /// a change that affects all of the tenant's routes (policy or config).
     async fn invalidate_tenant(&self, tenant_id: &str, op: &'static str) {
-        match self.store.domains_for_tenant(tenant_id).await {
+        match self.store.domains_for_workspace(tenant_id).await {
             Ok(domains) => {
                 for d in &domains {
                     self.invalidate(d).await;
@@ -639,8 +649,8 @@ async fn upsert_auth_route(
         )
             .into_response();
     }
-    // The FK would reject an unknown tenant as a 500; check first for a clean 404.
-    match s.store.get_tenant(&tenant_id).await {
+    // The FK would reject an unknown workspace as a 500; check first for a clean 404.
+    match s.store.get_workspace(&tenant_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return (StatusCode::NOT_FOUND, Json(json!({ "error": "unknown_tenant", "tenant_id": tenant_id })))
@@ -683,6 +693,290 @@ async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -
                 .map(|r| json!({ "path_prefix": r.prefix, "auth_required": r.auth.required }))
                 .collect();
             (StatusCode::OK, Json(json!({ "tenant_id": tenant_id, "routes": routes }))).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Accounts (ownership container) — nexus-owned-workspace-tenancy 2.1
+// --------------------------------------------------------------------------- //
+#[derive(Deserialize)]
+struct AccountBody {
+    account_id: String,
+    /// The user this account is provisioned for — becomes its `owner` member.
+    owner_sub: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    payer_ref: Option<String>,
+}
+
+/// Provision an account and its owner member (2.1). Idempotent: on repeat (e.g. a
+/// re-run of first-signup provisioning) the account is left as-is and the owner
+/// membership is re-asserted, so it is safe to call unconditionally on signup.
+/// Trusted-broker model: the authenticated caller supplies the ids and owner sub.
+async fn provision_account(State(s): State<App>, Json(body): Json<AccountBody>) -> Response {
+    let created = match s
+        .store
+        .create_account(&body.account_id, &body.name, body.payer_ref.as_deref())
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    if let Err(e) = s.store.add_account_member(&body.account_id, &body.owner_sub, "owner").await {
+        return internal(e);
+    }
+    counter!("control_mutations_total", "op" => "provision_account").increment(1);
+    info!(account = %body.account_id, owner = %body.owner_sub, created, "account provisioned");
+    (
+        StatusCode::OK,
+        Json(json!({ "result": "ok", "account_id": body.account_id, "created": created })),
+    )
+        .into_response()
+}
+
+async fn get_account(State(s): State<App>, Path(id): Path<String>) -> Response {
+    let account = match s.store.get_account(&id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "account_id": id })))
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    };
+    let members = match s.store.account_members(&id).await {
+        Ok(m) => m,
+        Err(e) => return internal(e),
+    };
+    (StatusCode::OK, Json(json!({ "account": account, "members": members }))).into_response()
+}
+
+// --------------------------------------------------------------------------- //
+// Workspaces (the stable-ID routing pivot) — nexus-owned-workspace-tenancy 2.2
+// --------------------------------------------------------------------------- //
+#[derive(Deserialize)]
+struct WorkspaceBody {
+    workspace_id: String,
+    /// Owning account. Supplied at create; OMITTED on a config-only update leaves
+    /// ownership unchanged. An ownership CHANGE goes through `/transfer`, never here.
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default = "default_plan")]
+    plan: String,
+    target_pool: String,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+async fn upsert_workspace(State(s): State<App>, Json(body): Json<WorkspaceBody>) -> Response {
+    // Same pool allow-list validation as the legacy alias (RFC C15, fail-closed).
+    let Some(pool) = s.pools.parse(&body.target_pool) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid target_pool",
+                "value": body.target_pool,
+                "allowed": s.pools.names(),
+            })),
+        )
+            .into_response();
+    };
+    // If an account was supplied, it MUST exist — check first so the FK surfaces as
+    // a clean 404 instead of a raw 500.
+    if let Some(account_id) = &body.account_id {
+        match s.store.get_account(account_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unknown_account", "account_id": account_id })),
+                )
+                    .into_response();
+            }
+            Err(e) => return internal(e),
+        }
+    }
+    let cfg = WorkspaceConfig {
+        workspace_id: body.workspace_id.clone(),
+        plan: body.plan,
+        target_pool: pool,
+        features: body.features,
+        updated_at: None,
+    };
+    if let Err(e) = s.store.upsert_workspace(&cfg).await {
+        return internal(e);
+    }
+    // Assign ownership at create time (no staff reset — a new workspace has none).
+    if let Some(account_id) = &body.account_id {
+        match s.store.set_workspace_account(&body.workspace_id, account_id).await {
+            Ok(true) => {}
+            // We just upserted the row, so a no-match is unexpected — log, don't fail.
+            Ok(false) => warn!(workspace = %body.workspace_id, "ownership set matched no row"),
+            Err(e) => return internal(e),
+        }
+    }
+    // A workspace change affects all of its domains — invalidate each precisely.
+    match s.store.domains_for_workspace(&body.workspace_id).await {
+        Ok(domains) => {
+            for d in &domains {
+                s.invalidate(d).await;
+            }
+            counter!("control_mutations_total", "op" => "upsert_workspace").increment(1);
+            info!(workspace = %body.workspace_id, invalidated = domains.len(), "workspace upserted");
+        }
+        Err(e) => warn!(error = %e, "domains_for_workspace failed; relying on TTL"),
+    }
+    (StatusCode::OK, Json(json!({ "result": "ok", "workspace_id": body.workspace_id }))).into_response()
+}
+
+async fn get_workspace(State(s): State<App>, Path(id): Path<String>) -> Response {
+    match s.store.get_workspace(&id).await {
+        Ok(Some(cfg)) => (StatusCode::OK, Json(serde_json::to_value(cfg).unwrap())).into_response(),
+        Ok(None) => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "workspace_id": id })))
+                .into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferBody {
+    /// The new owning account. Must already exist.
+    account_id: String,
+}
+
+/// Transfer a workspace to a different account (2.4). Repoints ownership and resets
+/// staff atomically (customers, domains, and data ride through unchanged).
+async fn transfer_workspace(
+    State(s): State<App>,
+    Path(workspace_id): Path<String>,
+    Json(body): Json<TransferBody>,
+) -> Response {
+    // Target account must exist — clean 404 rather than a raw FK 500.
+    match s.store.get_account(&body.account_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown_account", "account_id": body.account_id })),
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+    let staff_removed = match s.store.transfer_workspace(&workspace_id, &body.account_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown_workspace", "workspace_id": workspace_id })),
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    };
+    counter!("control_mutations_total", "op" => "transfer_workspace").increment(1);
+    info!(workspace = %workspace_id, new_account = %body.account_id, staff_removed, "workspace transferred");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "result": "ok",
+            "workspace_id": workspace_id,
+            "account_id": body.account_id,
+            "staff_removed": staff_removed,
+        })),
+    )
+        .into_response()
+}
+
+// --------------------------------------------------------------------------- //
+// Memberships (the live authz source of record) — nexus-owned-workspace-tenancy 2.3
+// --------------------------------------------------------------------------- //
+#[derive(Deserialize)]
+struct MembershipBody {
+    user_sub: String,
+    /// `"staff"` or `"customer"` — validated against `MEMBER_TYPES`.
+    member_type: String,
+    #[serde(default = "default_member_role")]
+    role: String,
+    #[serde(default = "default_status")]
+    status: String,
+}
+
+fn default_member_role() -> String {
+    "member".to_owned()
+}
+
+fn default_status() -> String {
+    "active".to_owned()
+}
+
+/// Grant or update a workspace membership (2.3). Writes the source-of-record row;
+/// the identity plane picks the change up via the change feed to resolve the acting
+/// workspace scope (the feed wiring lands with the identity-plane stage).
+async fn upsert_membership(
+    State(s): State<App>,
+    Path(workspace_id): Path<String>,
+    Json(body): Json<MembershipBody>,
+) -> Response {
+    if !MEMBER_TYPES.contains(&body.member_type.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_member_type", "value": body.member_type, "allowed": MEMBER_TYPES })),
+        )
+            .into_response();
+    }
+    // Unknown workspace → clean 404 (the FK would otherwise surface as a 500).
+    match s.store.get_workspace(&workspace_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown_workspace", "workspace_id": workspace_id })),
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+    let m = Membership {
+        user_sub: body.user_sub,
+        workspace_id: workspace_id.clone(),
+        member_type: body.member_type,
+        role: body.role,
+        status: body.status,
+    };
+    if let Err(e) = s.store.upsert_membership(&m).await {
+        return internal(e);
+    }
+    counter!("control_mutations_total", "op" => "upsert_membership").increment(1);
+    info!(workspace = %workspace_id, user = %m.user_sub, member_type = %m.member_type, "membership granted");
+    (
+        StatusCode::OK,
+        Json(json!({ "result": "ok", "workspace_id": workspace_id, "user_sub": m.user_sub })),
+    )
+        .into_response()
+}
+
+async fn delete_membership(
+    State(s): State<App>,
+    Path((workspace_id, user_sub)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = s.store.delete_membership(&user_sub, &workspace_id).await {
+        return internal(e);
+    }
+    counter!("control_mutations_total", "op" => "delete_membership").increment(1);
+    (StatusCode::OK, Json(json!({ "result": "ok", "workspace_id": workspace_id, "user_sub": user_sub })))
+        .into_response()
+}
+
+async fn list_memberships(State(s): State<App>, Path(workspace_id): Path<String>) -> Response {
+    match s.store.memberships_for_workspace(&workspace_id).await {
+        Ok(memberships) => {
+            (StatusCode::OK, Json(json!({ "workspace_id": workspace_id, "memberships": memberships })))
+                .into_response()
         }
         Err(e) => internal(e),
     }
@@ -797,12 +1091,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Data endpoints — all behind the admin-token gate (route_layer so an unknown
     // path 404s without first demanding a token).
     let data = Router::new()
-        .route("/tenants", post(upsert_tenant))
-        .route("/tenants/{id}", get(get_tenant))
+        // Accounts + Workspaces + Memberships (nexus-owned-workspace-tenancy).
+        .route("/accounts", post(provision_account))
+        .route("/accounts/{id}", get(get_account))
+        .route("/workspaces", post(upsert_workspace))
+        .route("/workspaces/{id}", get(get_workspace))
+        .route("/workspaces/{id}/transfer", post(transfer_workspace))
+        .route(
+            "/workspaces/{id}/members",
+            get(list_memberships).put(upsert_membership),
+        )
+        .route("/workspaces/{id}/members/{sub}", delete(delete_membership))
+        .route(
+            "/workspaces/{id}/auth-routes",
+            get(list_auth_routes).put(upsert_auth_route).delete(delete_auth_route),
+        )
+        // Domains (workspace-keyed via the same handlers).
         .route("/domains", post(upsert_domain))
         .route("/domains/declare", post(declare_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
         .route("/domains/{domain}", delete(delete_domain))
+        // DEPRECATED `/tenants*` aliases (account-less) — frozen for the broker/e2e
+        // during cut-over; new callers use `/workspaces*` above.
+        .route("/tenants", post(upsert_tenant))
+        .route("/tenants/{id}", get(get_tenant))
         .route(
             "/tenants/{id}/auth-routes",
             get(list_auth_routes)
@@ -850,7 +1162,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let admin_listener = TcpListener::bind("0.0.0.0:9400").await?;
     let ops_listener = TcpListener::bind("0.0.0.0:9401").await?;
     info!(
-        "control plane: admin on :9400 (/tenants, /tenants/:id/auth-routes, /domains, /domains/declare, /healthz); \
+        "control plane: admin on :9400 (/accounts, /workspaces[+/members,/transfer,/auth-routes], \
+         /domains, /domains/declare, /tenants[deprecated], /healthz); \
          ops on :9401 (/metrics, /healthz)"
     );
     // Serve both concurrently; either erroring (or a shutdown signal) brings the

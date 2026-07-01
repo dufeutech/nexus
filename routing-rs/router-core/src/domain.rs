@@ -1,5 +1,5 @@
 //! The canonical routing-plane value types: the finite backend-pool set, the
-//! Tenant Config (the routing store's value), and the Routing Decision the edge
+//! Workspace Config (the routing store's value), and the Routing Decision the edge
 //! data plane enacts. Field identifiers are normalized lower `snake_case`
 //! (RFC §3.8). Vendor-free (rules §2).
 
@@ -72,11 +72,13 @@ impl PoolSet {
     }
 }
 
-/// The routing store's value, keyed by tenant identifier (RFC §3.11): the target
-/// backend selector (from the finite pool set), a plan, and feature flags.
+/// The routing store's value, keyed by the stable `workspace_id` (RFC §3.11): the
+/// target backend selector (from the finite pool set), a plan, and feature flags.
+/// A workspace is the stable-ID routing pivot (formerly "tenant"); domains are
+/// many-to-one aliases onto it and ownership lives on the owning account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TenantConfig {
-    pub tenant_id: String,
+pub struct WorkspaceConfig {
+    pub workspace_id: String,
     pub plan: String,
     pub target_pool: Pool,
     #[serde(default)]
@@ -86,18 +88,18 @@ pub struct TenantConfig {
 }
 
 /// The resolved selection the edge data plane enacts (RFC §3.12): one backend
-/// pool plus the trusted tenant annotations attached as request metadata. The
+/// pool plus the trusted workspace annotations attached as request metadata. The
 /// plane only resolves and annotates — the data plane does the forwarding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingDecision {
-    pub tenant_id: String,
+    pub workspace_id: String,
     pub plan: String,
     pub pool: Pool,
     #[serde(default)]
     pub features: Vec<String>,
-    /// The tenant's per-route authentication policy (RFC N4). Carried on the
+    /// The workspace's per-route authentication policy (RFC N4). Carried on the
     /// cached decision so it rides the existing domain-keyed invalidation (a
-    /// policy change invalidates the tenant's domains, evicting this value), and
+    /// policy change invalidates the workspace's domains, evicting this value), and
     /// so the per-request emit needs no second lookup — only the request path.
     /// `#[serde(default)]` keeps a pre-N4 cached value (no `auth` block) readable
     /// as the pass-through default.

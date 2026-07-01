@@ -122,7 +122,7 @@ impl AppState {
 
                 // Authoritative store: one exact point read, then one wildcard
                 // parent point read (RFC C14 — never a scan).
-                let tenant = match store.lookup_domain(&key2, false).await {
+                let workspace = match store.lookup_domain(&key2, false).await {
                     Ok(Some(t)) => Some(t),
                     Ok(None) => match parent_domain(&key2) {
                         Some(parent) => {
@@ -132,27 +132,27 @@ impl AppState {
                     },
                     Err(e) => return Err(e.to_string()),
                 };
-                let Some(tenant_id) = tenant else {
+                let Some(workspace_id) = workspace else {
                     // Unknown/unverified host → not cached, surfaced as a miss the
                     // caller rejects (C18).
                     return Err("no_tenant".to_owned());
                 };
-                let cfg = match store.get_tenant(&tenant_id).await {
+                let cfg = match store.get_workspace(&workspace_id).await {
                     Ok(Some(c)) => c,
                     Ok(None) => return Err("no_tenant_config".to_owned()),
                     Err(e) => return Err(e.to_string()),
                 };
-                // Fold the tenant's per-route auth policy (RFC N4) into the cached
+                // Fold the workspace's per-route auth policy (RFC N4) into the cached
                 // decision: one extra point read on the miss path, then resolved
                 // per-request against the request path with no further lookup. It
                 // rides the same domain-keyed invalidation as the rest of the
-                // decision (a policy change invalidates the tenant's domains).
-                let auth = match store.get_auth_policy(&tenant_id).await {
+                // decision (a policy change invalidates the workspace's domains).
+                let auth = match store.get_auth_policy(&workspace_id).await {
                     Ok(p) => p,
                     Err(e) => return Err(e.to_string()),
                 };
                 let decision = RoutingDecision {
-                    tenant_id: cfg.tenant_id,
+                    workspace_id: cfg.workspace_id,
                     plan: cfg.plan,
                     pool: cfg.target_pool,
                     features: cfg.features,
@@ -344,14 +344,19 @@ fn header(key: &str, value: &str) -> HeaderValueOption {
     }
 }
 
-/// Inject the trusted tenant annotations + the pool selector (RFC §3.12), plus any
-/// normalized request-context annotations (`x-geo-*`, `x-locale`, `x-currency`,
+/// Inject the trusted workspace annotations + the pool selector (RFC §3.12), plus
+/// any normalized request-context annotations (`x-geo-*`, `x-locale`, `x-currency`,
 /// `x-privacy-*`, `x-device-type`, …) in `extra`. The edge data plane routes on
 /// `x-route-pool`; the backend trusts every header we set here. Client-supplied
 /// copies were stripped before this filter ran (C3-equivalent).
+//
+// NOTE: the emitted header *names* are still the legacy `x-tenant-*` wire contract.
+// Renaming them to `x-workspace-*` is the coordinated edge cut-over (tasks 4.1/4.2),
+// done after the identity plane resolves the acting workspace — kept stable here so
+// the running edge/backends aren't broken by this internal rename.
 fn route_response(d: &RoutingDecision, extra: &[(&'static str, String)]) -> ProcessingResponse {
     let mut set = vec![
-        header("x-tenant-id", &d.tenant_id),
+        header("x-tenant-id", &d.workspace_id),
         header("x-tenant-plan", &d.plan),
         header("x-tenant-features", &d.features.join(",")),
         header("x-route-pool", d.pool.as_str()),
@@ -449,7 +454,7 @@ impl Router {
                     extra.extend(geo);
                 }
                 extra.extend(extract_client_context(&req, country.as_deref()));
-                info!(host = %host, tenant = %d.tenant_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
+                info!(host = %host, workspace = %d.workspace_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
                 (route_response(&d, &extra), "hit")
             } else {
                 // Debug-format (escapes control/ESC bytes): this is the RAW,

@@ -7,19 +7,20 @@ use std::error::Error;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::Serialize;
 
 use crate::auth::AuthPolicy;
-use crate::domain::TenantConfig;
+use crate::domain::WorkspaceConfig;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-/// A stored domain mapping as the control plane sees it (RFC §3.13): which tenant
-/// owns it, whether it is a wildcard, and whether it is verified. Unlike the
-/// hot-path `lookup_domain`, this reads a row regardless of verification state —
-/// the lifecycle (declare/verify) needs to see pending rows too.
+/// A stored domain mapping as the control plane sees it (RFC §3.13): which
+/// workspace owns it, whether it is a wildcard, and whether it is verified. Unlike
+/// the hot-path `lookup_domain`, this reads a row regardless of verification state
+/// — the lifecycle (declare/verify) needs to see pending rows too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainRecord {
-    pub tenant_id: String,
+    pub workspace_id: String,
     pub wildcard: bool,
     pub verified: bool,
 }
@@ -34,50 +35,51 @@ pub struct Challenge {
     pub expired: bool,
 }
 
-/// Abstract routing store: point lookups by domain and tenant on the request
+/// Abstract routing store: point lookups by domain and workspace on the request
 /// path (no scans, RFC §3.10), plus the control-plane write surface (RFC §3.13).
 ///
 /// `lookup_domain` is the hot-path read (on a cache miss): a point read by the
 /// **normalized** domain key. The router does at most two — one exact, then one
 /// wildcard-parent (RFC C14). Only **verified** mappings resolve (RFC C16):
-/// an unverified domain MUST NOT resolve to a tenant on protected routes.
+/// an unverified domain MUST NOT resolve to a workspace on protected routes.
 #[async_trait]
 pub trait RoutingStore: Send + Sync {
-    /// Resolve a normalized domain to its owning tenant id, if a *verified*
+    /// Resolve a normalized domain to its owning `workspace_id`, if a *verified*
     /// mapping exists. `wildcard = false` matches an exact custom domain/subdomain;
     /// `wildcard = true` matches a wildcard registered against the parent domain.
     async fn lookup_domain(&self, domain: &str, wildcard: bool)
         -> Result<Option<String>, BoxError>;
 
-    /// Load a tenant's config (the routing value). `None` if absent.
-    async fn get_tenant(&self, tenant_id: &str) -> Result<Option<TenantConfig>, BoxError>;
+    /// Load a workspace's config (the routing value). `None` if absent.
+    async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceConfig>, BoxError>;
 
     // --- control-plane write surface (RFC §3.13) ---------------------------- //
 
-    /// Create or update a tenant config.
-    async fn upsert_tenant(&self, cfg: &TenantConfig) -> Result<(), BoxError>;
+    /// Create or update a workspace config.
+    async fn upsert_workspace(&self, cfg: &WorkspaceConfig) -> Result<(), BoxError>;
 
-    /// Create or update a domain → tenant mapping. This is the **admin** write
+    /// Create or update a domain → workspace mapping. This is the **admin** write
     /// (it may reassign ownership); the self-service declare path uses
     /// [`RoutingStore::create_pending_domain`], which never reassigns.
     async fn upsert_domain(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
         wildcard: bool,
         verified: bool,
     ) -> Result<(), BoxError>;
 
-    /// Atomically claim a NEW exact (non-wildcard), unverified domain for a tenant
-    /// (RFC C3 self-service declare). Returns `true` iff this call inserted the
-    /// row; `false` if a row for the domain already existed (insert was a no-op).
-    /// Crucially it MUST NOT overwrite an existing row's `tenant_id` — that closes
-    /// the declare race where two tenants claim the same domain concurrently (the
-    /// loser gets `false` and is then told `domain_taken`).
+    /// Atomically claim a NEW exact (non-wildcard), unverified domain for a
+    /// workspace (RFC C3 self-service declare). Returns `true` iff this call
+    /// inserted the row; `false` if a row for the domain already existed (insert
+    /// was a no-op). Crucially it MUST NOT overwrite an existing row's
+    /// `workspace_id` — that closes the declare race where two workspaces claim the
+    /// same domain concurrently (the loser gets `false` and is then told
+    /// `domain_taken`).
     async fn create_pending_domain(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
     ) -> Result<bool, BoxError>;
 
     /// Set an exact (non-wildcard) domain's ownership-verification flag (RFC C16:
@@ -89,12 +91,12 @@ pub trait RoutingStore: Send + Sync {
     /// selects which row of the `(domain, is_wildcard)` pair to drop.
     async fn delete_domain(&self, domain: &str, wildcard: bool) -> Result<(), BoxError>;
 
-    /// The domains owned by a tenant — used by the control plane to publish the
-    /// precise invalidations for a tenant-config change.
-    async fn domains_for_tenant(&self, tenant_id: &str) -> Result<Vec<String>, BoxError>;
+    /// The domains owned by a workspace — used by the control plane to publish the
+    /// precise invalidations for a workspace-config change.
+    async fn domains_for_workspace(&self, workspace_id: &str) -> Result<Vec<String>, BoxError>;
 
     /// Read one domain row regardless of verification state (RFC C3): lets the
-    /// lifecycle detect a cross-tenant claim and an idempotent re-declare. Keyed
+    /// lifecycle detect a cross-workspace claim and an idempotent re-declare. Keyed
     /// on `(domain, is_wildcard)` so a same-name wildcard row can never be read in
     /// place of the exact self-service row. `None` if that row is unknown.
     async fn get_domain(
@@ -103,9 +105,9 @@ pub trait RoutingStore: Send + Sync {
         wildcard: bool,
     ) -> Result<Option<DomainRecord>, BoxError>;
 
-    /// Count the domains a tenant holds — **verified plus pending** (RFC C3/I6),
+    /// Count the domains a workspace holds — **verified plus pending** (RFC C3/I6),
     /// the figure the quota gate compares against the plan limit.
-    async fn count_domains_for_tenant(&self, tenant_id: &str) -> Result<u32, BoxError>;
+    async fn count_domains_for_workspace(&self, workspace_id: &str) -> Result<u32, BoxError>;
 
     /// The pending (unverified) domains, for the periodic verification poll
     /// (RFC C4). Order is unspecified.
@@ -120,24 +122,24 @@ pub trait RoutingStore: Send + Sync {
 
     // --- per-route auth policy (RFC N4) ------------------------------------- //
 
-    /// Load a tenant's route-protection policy (RFC N4). A hot-path read folded
+    /// Load a workspace's route-protection policy (RFC N4). A hot-path read folded
     /// into the router's decision miss-load. Returns the pass-through default
-    /// ([`AuthPolicy::default`]) when the tenant has no rules — absence of a
+    /// ([`AuthPolicy::default`]) when the workspace has no rules — absence of a
     /// policy is "public", never an error, so no row needs to exist for a site to
     /// work.
-    async fn get_auth_policy(&self, tenant_id: &str) -> Result<AuthPolicy, BoxError>;
+    async fn get_auth_policy(&self, workspace_id: &str) -> Result<AuthPolicy, BoxError>;
 
-    /// Create or update one path-prefix rule for a tenant (control-plane write).
-    /// The per-tenant default is the rule with `prefix = "/"`.
+    /// Create or update one path-prefix rule for a workspace (control-plane write).
+    /// The per-workspace default is the rule with `prefix = "/"`.
     async fn upsert_auth_route(
         &self,
-        tenant_id: &str,
+        workspace_id: &str,
         prefix: &str,
         required: bool,
     ) -> Result<(), BoxError>;
 
     /// Remove one path-prefix rule (idempotent — missing is not an error).
-    async fn delete_auth_route(&self, tenant_id: &str, prefix: &str) -> Result<(), BoxError>;
+    async fn delete_auth_route(&self, workspace_id: &str, prefix: &str) -> Result<(), BoxError>;
 }
 
 /// The ownership-proof challenge store (RFC C4). Kept distinct from the routing
@@ -153,7 +155,7 @@ pub trait ChallengeStore: Send + Sync {
     async fn mint_or_get_challenge(
         &self,
         domain: &str,
-        tenant_id: &str,
+        workspace_id: &str,
         ttl_secs: i64,
     ) -> Result<Challenge, BoxError>;
 
@@ -177,4 +179,124 @@ pub type InvalidationFeed = BoxStream<'static, Result<String, BoxError>>;
 pub trait Invalidations: Send + Sync {
     /// Open a live invalidation feed. Callers reopen on error.
     async fn subscribe(&self) -> Result<InvalidationFeed, BoxError>;
+}
+
+// --- ownership + membership (nexus-owned-workspace-tenancy) ------------------ //
+//
+// The management-plane write surface for the tenancy model: Accounts own
+// Workspaces (transferable by repointing `account_id`), and typed staff|customer
+// Memberships are the live authz source of record. These are control-plane
+// concerns only — deliberately split OUT of the hot-path `RoutingStore` so the
+// resolver's port stays a lean point-lookup surface (rules §2). One adapter MAY
+// back all of them with one technology.
+
+/// An owning Account (the member container; a solo user is a one-member account).
+/// `payer_ref` is the billing/payer of record, which switches on a transfer.
+#[expect(
+    clippy::struct_field_names,
+    reason = "account_id keeps the uniform <entity>_id wire name shared with the \
+              store column and every other id field, not a bare `id`"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Account {
+    pub account_id: String,
+    pub name: String,
+    pub payer_ref: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// One membership of a user in an account (owner-only in v1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountMember {
+    pub account_id: String,
+    pub user_sub: String,
+    pub role: String,
+}
+
+/// A workspace-scoped membership — the live authz record the identity plane
+/// projects and resolves fail-closed. `member_type` is `"staff"` or `"customer"`
+/// (validated at the write boundary and CHECK-constrained in the store).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Membership {
+    pub user_sub: String,
+    pub workspace_id: String,
+    pub member_type: String,
+    pub role: String,
+    pub status: String,
+}
+
+/// The two membership kinds. Kept as bare `&str` constants (not an enum) because
+/// the store persists the wire string and the DB CHECK is the backstop — the
+/// control plane only needs to validate admin input against this closed set.
+pub const MEMBER_TYPES: [&str; 2] = ["staff", "customer"];
+
+/// Account ownership + workspace-transfer surface (control plane, RFC §3.13).
+#[async_trait]
+pub trait OwnershipStore: Send + Sync {
+    /// Idempotently create an account (RFC C3-style declare idempotence): returns
+    /// `true` iff this call inserted it, `false` if it already existed. Never
+    /// overwrites an existing account's name/payer — provisioning on repeat signup
+    /// is a no-op.
+    async fn create_account(
+        &self,
+        account_id: &str,
+        name: &str,
+        payer_ref: Option<&str>,
+    ) -> Result<bool, BoxError>;
+
+    /// Load an account, `None` if absent.
+    async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError>;
+
+    /// Grant (or update the role of) a member of an account. Idempotent upsert.
+    async fn add_account_member(
+        &self,
+        account_id: &str,
+        user_sub: &str,
+        role: &str,
+    ) -> Result<(), BoxError>;
+
+    /// The members of an account.
+    async fn account_members(&self, account_id: &str) -> Result<Vec<AccountMember>, BoxError>;
+
+    /// Assign a workspace's owning account at CREATE time (no staff reset). Returns
+    /// `true` iff a workspace row matched, `false` if the workspace is unknown. Use
+    /// [`OwnershipStore::transfer_workspace`] for an ownership change (it also resets
+    /// staff atomically).
+    async fn set_workspace_account(
+        &self,
+        workspace_id: &str,
+        account_id: &str,
+    ) -> Result<bool, BoxError>;
+
+    /// Transfer a workspace to a different owning account (RFC workspace-tenancy):
+    /// repoint `account_id` AND reset staff memberships in ONE transaction, so a
+    /// half-applied transfer can never leave the previous owner's staff with access
+    /// (the security contract of a sale/transfer). The `workspace_id`, its domains,
+    /// its data, and its **customer** memberships are untouched. Returns
+    /// `Some(staff_removed)` on success, or `None` if the workspace is unknown.
+    async fn transfer_workspace(
+        &self,
+        workspace_id: &str,
+        account_id: &str,
+    ) -> Result<Option<u64>, BoxError>;
+}
+
+/// Workspace membership CRUD (control plane): the write surface the identity plane
+/// consumes via the change feed to resolve `(sub, workspace) -> {type, role}`.
+#[async_trait]
+pub trait MembershipStore: Send + Sync {
+    /// Grant or update a membership. Idempotent upsert keyed `(user_sub,
+    /// workspace_id)` — a user holds at most one membership per workspace.
+    async fn upsert_membership(&self, m: &Membership) -> Result<(), BoxError>;
+
+    /// Revoke a membership (idempotent — missing is not an error).
+    async fn delete_membership(&self, user_sub: &str, workspace_id: &str)
+        -> Result<(), BoxError>;
+
+    /// The memberships of a workspace (staff and customer).
+    async fn memberships_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<Membership>, BoxError>;
 }
