@@ -25,6 +25,38 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: edge
+                # Canonicalize :path BEFORE the tenant-router ext_proc, the auth gate
+                # and routing all read it — otherwise an encoded/dot-segment path can
+                # read as one route to the gate (public) and another to the backend
+                # (protected): auth-gate path confusion. RFC 3986 dot-segment removal
+                # + collapse duplicate slashes + unescape %2F so all stages agree.
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                # JSON access log (audit trail): method/path/status/host/tenant and
+                # the per-route gate decision. Deliberately NO Authorization header
+                # and NO x-user-* (PII/secret hygiene). response_flags shows WHY a
+                # request was rejected (e.g. jwt_authn 401).
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          start_time: "%START_TIME%"
+                          method: "%REQ(:METHOD)%"
+                          path: "%REQ(:PATH)%"
+                          protocol: "%PROTOCOL%"
+                          response_code: "%RESPONSE_CODE%"
+                          response_flags: "%RESPONSE_FLAGS%"
+                          duration_ms: "%DURATION%"
+                          authority: "%REQ(:AUTHORITY)%"
+                          upstream_host: "%UPSTREAM_HOST%"
+                          route_pool: "%REQ(X-ROUTE-POOL)%"
+                          tenant_id: "%REQ(X-TENANT-ID)%"
+                          auth_required: "%REQ(X-AUTH-REQUIRED)%"
+                          user_agent: "%REQ(USER-AGENT)%"
+                          request_id: "%REQ(X-REQUEST-ID)%"
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -173,6 +205,11 @@ static_resources:
                             # uri authority -> Host header (must match ZITADEL's
                             # external domain, which validates Host); cluster ->
                             # the actual in-network upstream (zitadel:8080).
+                            # This reference/lab config fetches over trusted loopback,
+                            # so plaintext is fine. SECURITY (production): if ZITADEL
+                            # is reached over an untrusted network, use HTTPS + give
+                            # the zitadel_jwks cluster a TLS transport_socket (a
+                            # plaintext JWKS lets a MITM swap keys → auth bypass).
                             http_uri:
                               uri: "http://localhost:8088/oauth/v2/keys"
                               cluster: zitadel_jwks
@@ -183,12 +220,17 @@ static_resources:
                       # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
                       # tenant-router ext_proc (RFC C17 tenant-first), so it can
                       # branch on the x-auth-required header that filter just set
-                      # from the resolved (domain, path) policy. First match wins:
-                      #  - x-auth-required: true  -> a verified credential is demanded.
-                      #  - otherwise (false/absent) -> allow_missing: a MISSING token
+                      # from the resolved (domain, path) policy. First match wins,
+                      # INVERTED fail-safe polarity:
+                      #  - x-auth-required: "false" -> allow_missing: a MISSING token
                       #    passes through anonymous; a PRESENT-but-invalid/expired one
-                      #    still 401s (NOT allow_missing_or_failed). This is the
-                      #    public+private-on-one-domain default (auth: none).
+                      #    still 401s (NOT allow_missing_or_failed). This opens the
+                      #    public routes (public+private on one domain).
+                      #  - "true" OR ABSENT -> the catch-all demands a verified
+                      #    credential. Making the catch-all (not the "false" branch)
+                      #    the fallthrough keeps the gate fail-CLOSED if the router's
+                      #    signal is ever lost — the header_mutation strip above makes
+                      #    x-auth-required unforgeable, which this relies on.
                       rules:
                         - match:
                             prefix: "/"
@@ -196,12 +238,12 @@ static_resources:
                               [
                                 {
                                   name: x-auth-required,
-                                  string_match: { exact: "true" },
+                                  string_match: { exact: "false" },
                                 },
                               ]
-                          requires: { provider_name: zitadel }
-                        - match: { prefix: "/" }
                           requires: { allow_missing: {} }
+                        - match: { prefix: "/" }
+                          requires: { provider_name: zitadel }
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
