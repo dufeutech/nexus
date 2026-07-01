@@ -27,6 +27,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use tower_http::timeout::TimeoutLayer;
 use metrics::counter;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Deserialize;
@@ -239,7 +240,7 @@ async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> im
                 s.invalidate(d).await;
             }
             counter!("control_mutations_total", "op" => "upsert_tenant").increment(1);
-            info!(tenant = %body.tenant_id, invalidated = domains.len(), "tenant upserted");
+            info!(tenant = ?body.tenant_id, invalidated = domains.len(), "tenant upserted");
         }
         Err(e) => warn!(error = %e, "domains_for_tenant failed; relying on TTL"),
     }
@@ -284,7 +285,7 @@ async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainBody>) -> im
     }
     s.invalidate(&domain).await;
     counter!("control_mutations_total", "op" => "upsert_domain").increment(1);
-    info!(domain = %domain, tenant = %body.tenant_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
+    info!(domain = %domain, tenant = ?body.tenant_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
     (
         StatusCode::OK,
         Json(json!({ "result": "ok", "domain": domain, "verified": VERIFIED })),
@@ -396,7 +397,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
         Err(e) => return internal(e),
     };
     counter!("control_mutations_total", "op" => "declare_domain").increment(1);
-    info!(domain = %domain, tenant = %body.tenant_id, "domain declared (pending)");
+    info!(domain = %domain, tenant = ?body.tenant_id, "domain declared (pending)");
     (
         StatusCode::OK,
         Json(json!({
@@ -613,7 +614,7 @@ impl App {
                 for d in &domains {
                     self.invalidate(d).await;
                 }
-                info!(tenant = %tenant_id, op, invalidated = domains.len(), "tenant invalidated");
+                info!(tenant = ?tenant_id, op, invalidated = domains.len(), "tenant invalidated");
             }
             Err(e) => warn!(error = %e, "domains_for_tenant failed; relying on TTL"),
         }
@@ -817,6 +818,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // hole in the broker-only guarantee (RFC C16) for every metrics peer. /metrics
     // moves to the separate ops port below so the policy can gate the two
     // independently (admin = broker-only; ops = scrapers + kubelet).
+    // Per-request timeout for both servers (returns 408): bounds a slow/stalled
+    // client so it cannot hold a connection/task indefinitely. Operator-tunable via
+    // HTTP_REQUEST_TIMEOUT_SECS; default 30s (well above the 5s DB statement cap).
+    let req_timeout = Duration::from_secs(
+        var("HTTP_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    );
+
     let admin = data
         // Liveness stays open (no token), kept on the admin port so existing
         // tooling/healthchecks that target :9400 keep working.
@@ -824,6 +835,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // These are small JSON admin bodies; cap the request body so a malformed
         // or hostile caller can't force an unbounded buffer (defense-in-depth).
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
         .with_state(app.clone());
 
     // Ops surface (:9401) — /metrics for scrapers and /healthz for kubelet probes.
@@ -832,6 +844,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let ops = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
         .with_state(app);
 
     let admin_listener = TcpListener::bind("0.0.0.0:9400").await?;

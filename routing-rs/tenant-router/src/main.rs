@@ -452,7 +452,10 @@ impl Router {
                 info!(host = %host, tenant = %d.tenant_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
                 (route_response(&d, &extra), "hit")
             } else {
-                info!(host = %host, "reject: no tenant");
+                // Debug-format (escapes control/ESC bytes): this is the RAW,
+                // un-normalized :authority — the reject branch is exactly where a
+                // host `normalize_host` refused can carry log-corrupting bytes.
+                info!(host = ?host, "reject: no tenant");
                 (reject_unknown_host(), "reject")
             }
         } else {
@@ -546,17 +549,33 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
 // --------------------------------------------------------------------------- //
 mod api {
     use super::{counter, AppState, Ordering};
-    use axum::extract::{Path, Query, State};
+    use std::env::var;
+    use std::time::Duration;
+    use axum::extract::{DefaultBodyLimit, Path, Query, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router as AxumRouter};
+    use tower_http::timeout::TimeoutLayer;
 
     pub(crate) fn router(state: AppState) -> AxumRouter {
+        // Per-request timeout (408): the externally-reachable /authorize (CA
+        // on-demand-TLS ask) must not let a slow client pin a task. Tunable via
+        // HTTP_REQUEST_TIMEOUT_SECS; default 30s.
+        let req_timeout = Duration::from_secs(
+            var("HTTP_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        );
         AxumRouter::new()
             .route("/healthz", get(healthz))
             .route("/resolve/{host}", get(resolve))
             .route("/authorize", get(authorize))
+            // GET-only API; cap any request body as defense-in-depth (this router
+            // otherwise relies on axum's implicit 2 MB extractor limit).
+            .layer(DefaultBodyLimit::max(64 * 1024))
+            .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
             .with_state(state)
     }
 

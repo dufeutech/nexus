@@ -18,15 +18,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::future::pending;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::timeout::TimeoutLayer;
 use hmac::{Hmac, Mac};
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use reqwest::header::HOST;
+use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use tokio::net::TcpListener;
@@ -144,7 +146,7 @@ async fn webhook(State(s): State<App>, headers: HeaderMap, body: Bytes) -> impl 
 
     counter!("sync_events_total", "result" => result).increment(1);
     gauge!("sync_last_event_timestamp_seconds").set(now_secs());
-    info!(event_type = %event.get("event_type").and_then(|v| v.as_str()).unwrap_or(""), result, "handled");
+    info!(event_type = ?event.get("event_type").and_then(|v| v.as_str()).unwrap_or(""), result, "handled");
     (status, axum::Json(json!({ "result": result }))).into_response()
 }
 
@@ -165,7 +167,12 @@ async fn register_webhook(
     pat: &str,
     self_url: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        // Don't follow redirects: the target is the fixed trusted ZITADEL upstream;
+        // following a 3xx `Location` could steer egress to an unintended host.
+        .redirect(Policy::none())
+        .build()?;
     let name = format!("sync-worker-{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
     let target: Value = client
         .post(format!("{internal_url}/v2/actions/targets"))
@@ -258,10 +265,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("webhook registered; signing key acquired; store ready");
 
     let app = App { store, signing_key: Arc::new(signing_key), metrics: handle };
+    // Per-request timeout (408): the /webhook endpoint is externally reachable, so
+    // a slow/stalled client must not hold a connection/task. Tunable via
+    // HTTP_REQUEST_TIMEOUT_SECS; default 30s.
+    let req_timeout = Duration::from_secs(
+        var("HTTP_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+    );
     let router = Router::new()
         .route("/webhook", post(webhook))
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
+        // Cap the (unauthenticated) webhook body: it is buffered and HMAC'd before
+        // the signature is checked, so bound it tightly rather than lean on axum's
+        // implicit 2 MB. ZITADEL webhook events are well under 64 KiB.
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
         .with_state(app);
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;

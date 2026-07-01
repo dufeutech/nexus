@@ -29,6 +29,7 @@ use std::future::pending;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::header::HOST;
+use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use tokio::signal;
 use tokio::sync::watch;
@@ -255,7 +256,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let pat = fs::read_to_string(env("PAT_FILE", "/secrets/zitadel-admin-sa.pat"))?.trim().to_owned();
     let idp = Idp {
-        client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            // Fixed trusted ZITADEL upstream — don't follow redirects that could
+            // steer egress elsewhere.
+            .redirect(Policy::none())
+            .build()?,
         internal_url: env("ZITADEL_INTERNAL_URL", "http://zitadel:8080"),
         host: env("ZITADEL_HOST", "localhost:8088"),
         pat,

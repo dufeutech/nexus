@@ -453,21 +453,33 @@ async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<
 // --------------------------------------------------------------------------- //
 mod api {
     use super::{AppState, Ordering, Resolved};
+    use std::env::var;
+    use std::time::Duration;
     use axum::extract::{DefaultBodyLimit, Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router};
+    use tower_http::timeout::TimeoutLayer;
 
     pub(crate) fn router(state: AppState) -> Router {
         // Metrics are served by the exporter's own listener (:9202) so the
         // protobuf/native-histogram content negotiation works; this axum server
         // only carries the profile + health surfaces.
+        // Per-request timeout (408): a slow client must not pin a task. Tunable via
+        // HTTP_REQUEST_TIMEOUT_SECS; default 30s.
+        let req_timeout = Duration::from_secs(
+            var("HTTP_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        );
         Router::new()
             .route("/healthz", get(healthz))
             .route("/profile/{sub}", get(profile))
             // GET-only localhost API; cap any request body as defense-in-depth.
             .layer(DefaultBodyLimit::max(64 * 1024))
+            .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
             .with_state(state)
     }
 

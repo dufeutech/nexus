@@ -67,3 +67,26 @@ route as public or protected.
 - **WHEN** an inbound request carries a client-set `x-auth-required` header
 - **THEN** the edge SHALL remove it before the tenant-routing stage emits the
   authoritative value, and the client value SHALL have no effect on the gate
+
+### Requirement: The request path is canonicalized before the gate decides
+
+The edge SHALL canonicalize the request path — remove RFC 3986 `.`/`..` dot
+segments, collapse duplicate slashes, and resolve percent-encoded slashes — BEFORE
+the tenant policy resolves the authentication requirement, so that the path the gate
+evaluates is the same path the backend acts on. A request MUST NOT be able to
+present a path that resolves to a public route for the gate but a different
+(protected) route at the backend.
+
+#### Scenario: Encoded traversal cannot downgrade a protected route
+- **WHEN** a request targets a path such as `/public%2f..%2fadmin` or
+  `/public/../admin`, whose literal prefix matches a public rule but which resolves
+  to a protected route
+- **THEN** the edge SHALL evaluate the gate against the canonical path (`/admin`)
+  and require a verified credential (401 without one), not treat the request as
+  public
+
+#### Scenario: Genuine public and protected paths are unaffected
+- **WHEN** a request targets an already-canonical public path (e.g. `/public`) or a
+  protected path (e.g. `/app`)
+- **THEN** the gate outcome SHALL be unchanged by canonicalization (public allows
+  anonymous; protected requires a credential)

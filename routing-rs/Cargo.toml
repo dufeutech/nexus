@@ -39,6 +39,8 @@ axum = "0.8"
 # Vetted typed HTTP header parsing (hyperium) — used for RFC 7235 `Authorization:
 # Bearer` instead of a hand-rolled split.
 headers = "0.4"
+# HTTP-aware per-request timeout layer (returns 408) for the axum servers.
+tower-http = { version = "0.6", features = ["timeout"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
 

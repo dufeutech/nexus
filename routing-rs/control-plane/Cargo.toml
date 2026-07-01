@@ -20,6 +20,7 @@ dns-resolver = { path = "../dns-resolver" }
 tokio.workspace = true
 axum.workspace = true
 headers.workspace = true
+tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

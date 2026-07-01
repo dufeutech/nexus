@@ -28,6 +28,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Control-plane services
 axum = "0.8"
+# HTTP-aware per-request timeout layer (returns 408) for the axum servers.
+tower-http = { version = "0.6", features = ["timeout"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hmac = "0.12"
 sha2 = "0.10"
