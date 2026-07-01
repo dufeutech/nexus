@@ -1,0 +1,70 @@
+# Tasks — membership-profile-propagation
+
+> Sequence keeps the running system coherent: emit the signal first (no consumer =
+> harmless), then the identity-side merge core, then the worker + reconciler backstop, then
+> wiring/verify. Cross-DB direction is one-way: identity holds a read-only routing
+> connection; routing never writes profiles.
+
+## 1. Core — the membership merge (identity_core, pure)
+
+- [ ] 1.1 Add `home_org: Option<String>` to `identity_core::Profile` (`#[serde(default)]`),
+  excluded from `resolve_membership`; assert it never affects resolution (unit test).
+- [ ] 1.2 Add a pure merge helper in `identity_core` (e.g. `apply_memberships(profile,
+  memberships) -> Profile`) that sets `Profile.memberships` from a source-of-record list
+  while preserving all other fields. Unit-cover: preserves identity fields; overwrites only
+  memberships; empty list clears memberships (revoke-all).
+- [ ] 1.3 Fix the reconciler clobber: make the identity-attribute reconcile write
+  read-merge-write so `Profile.memberships` is PRESERVED when identity/role fields change.
+  Update `build_profile_from_user`/its caller (and `differs` if needed) so a reconcile pass
+  that only changes attributes does not emit empty memberships. Unit-cover: attribute/role
+  change preserves memberships; membership change preserves attributes.
+
+## 2. Routing — emit the change signal (source of record stays authoritative)
+
+- [ ] 2.1 Add a routing membership-changed NOTIFY: a dedicated channel constant (e.g.
+  `routing_membership_changes`) + a `notify_membership_change(user_sub, workspace_id, op)`
+  on the routing store, mirroring the existing `notify_invalidation` pattern. Payload is a
+  hint only.
+- [ ] 2.2 Emit it from control-plane `upsert_membership` and `delete_membership` after the
+  source-of-record write commits. No behavior change to the CRUD response.
+
+## 3. Identity — the read seam + consumer worker
+
+- [ ] 3.1 Add a read-only `SourceMembershipReader` port in `identity_core`
+  (`memberships_for(sub) -> Vec<Membership>`) and implement it against the routing
+  `memberships` table (read-only routing connection; SQL behind the adapter, not in core).
+- [ ] 3.2 New thin binary `identity-rs/membership-sync`: LISTEN on the routing channel →
+  on signal, `SourceMembershipReader::memberships_for(sub)` → `ProfileStore::get(sub)` →
+  `apply_memberships` → `ProfileStore::put` (upserting a minimal profile if `sub` is absent,
+  per design R5). Re-reads source of record (never trusts payload). Reconnect/resume on
+  LISTEN drop.
+
+## 4. Backstop — periodic reconcile merge
+
+- [ ] 4.1 Add a periodic backstop pass (in the reconciler or the new worker — pick the
+  smaller wiring) that re-derives each subject's memberships from the source of record and
+  merges via `apply_memberships`, healing missed NOTIFYs and backfilling on first run.
+- [ ] 4.2 Confirm the first backstop pass backfills existing `routing.memberships` into
+  profiles (no separate ETL).
+
+## 5. Wiring & config
+
+- [ ] 5.1 Add the identity plane's read-only routing DB input (env var, e.g.
+  `ROUTING_PG_RO_URL`) + the new worker to docker-compose and the identity-plane Helm chart
+  (deployment, values, secret ref). Least-privilege: `SELECT` on `memberships` + `LISTEN`,
+  no write grant.
+- [ ] 5.2 Document the new cross-plane connection + channel in the deploy README /
+  identity-plane NOTES.
+
+## 6. Verify
+
+- [ ] 6.1 Both workspaces: clippy `--all-targets --locked` 0-deny, cargo-deny, tests
+  (identity-rs needs `PROTOC`).
+- [ ] 6.2 Integration (gated on a throwaway Postgres): membership upsert in routing →
+  NOTIFY → worker merges → `Profile.memberships` updated + `identity_changes` fired;
+  delete → membership removed within the window; reconcile backstop converges after a
+  dropped signal; existing memberships backfilled on first run.
+- [ ] 6.3 No-clobber regression: an identity-attribute reconcile pass leaves projected
+  memberships intact; a membership change leaves identity attributes intact.
+- [ ] 6.4 `home_org`: present-but-non-member fails closed; home_org never emitted as an
+  authz header (extend the existing sidecar tests).
