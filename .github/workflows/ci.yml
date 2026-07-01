@@ -119,7 +119,9 @@ jobs:
       # actually exercises the helpers (postgres.url, the pg secret, pools, etc.).
       - name: Lint & render identity-plane
         run: |
-          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set zitadel.patSecret.value=dummy"
+          # routingPg.url is required whenever membershipSync is enabled (default) and
+          # no existingSecret is set — it feeds the read-only routing DB Secret.
+          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set zitadel.patSecret.value=dummy --set routingPg.url=postgres://u:p@h:5432/routing"
           helm lint identity-plane $ARGS
           helm template rel identity-plane $ARGS >/dev/null
 
@@ -140,6 +142,7 @@ jobs:
           helm dependency update edge-platform
           ARGS="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity \
                 --set identity-plane.zitadel.patSecret.value=dummy \
+                --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.postgres.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.controlPlane.auth.token=ci-dummy"
           helm lint edge-platform $ARGS
