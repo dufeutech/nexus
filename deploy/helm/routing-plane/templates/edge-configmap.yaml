@@ -47,6 +47,35 @@ data:
                   typed_config:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: edge
+                    # Canonicalize :path BEFORE the tenant-router ext_proc + routing
+                    # read it, so an encoded/dot-segment path resolves consistently
+                    # across the gate (in the umbrella) and the backend. RFC 3986
+                    # dot removal + merge slashes + unescape %2F.
+                    normalize_path: true
+                    merge_slashes: true
+                    path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                    # JSON access log (audit trail): method/path/status/host, the
+                    # resolved tenant and chosen pool. Routing-only plane (no auth
+                    # here). response_flags shows rejections (e.g. no-tenant 404).
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                          log_format:
+                            json_format:
+                              start_time: "%START_TIME%"
+                              method: "%REQ(:METHOD)%"
+                              path: "%REQ(:PATH)%"
+                              protocol: "%PROTOCOL%"
+                              response_code: "%RESPONSE_CODE%"
+                              response_flags: "%RESPONSE_FLAGS%"
+                              duration_ms: "%DURATION%"
+                              authority: "%REQ(:AUTHORITY)%"
+                              upstream_host: "%UPSTREAM_HOST%"
+                              route_pool: "%REQ(X-ROUTE-POOL)%"
+                              tenant_id: "%REQ(X-TENANT-ID)%"
+                              user_agent: "%REQ(USER-AGENT)%"
+                              request_id: "%REQ(X-REQUEST-ID)%"
                     route_config:
                       name: local_route
                       virtual_hosts:
@@ -95,6 +124,22 @@ data:
                               - remove: "x-privacy-gpc"
                               - remove: "x-privacy-dnt"
                               - remove: "x-device-type"
+                              # Identity/auth family (RFC C3 defense-in-depth).
+                              # This plane has NO jwt_authn/identity ext_proc, so it
+                              # never legitimately injects these; strip any client
+                              # copies so routing-plane is safe even if exposed
+                              # standalone (without the edge-platform umbrella in
+                              # front). The umbrella's edge strips them too.
+                              - remove: "x-user-id"
+                              - remove: "x-user-org"
+                              - remove: "x-user-roles"
+                              - remove: "x-user-roles-source"
+                              - remove: "x-user-entitlements"
+                              - remove: "x-user-suspended"
+                              - remove: "x-user-enriched-by"
+                              - remove: "x-auth-anonymous"
+                              - remove: "x-auth-method"
+                              - remove: "x-auth-required"
                       # Tenant routing (C14/C15/C18). fail-closed: a routing failure
                       # must not silently default a route.
                       - name: tenant-router.ext_proc

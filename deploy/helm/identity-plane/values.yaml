@@ -185,7 +185,9 @@ postgres:
   existingSecretKey: "url"
   # Inline fallback (discouraged — ends up in a chart-managed Secret). Must reach
   # a database the app can create its `identity` schema in.
-  url: ""                       # e.g. postgres://user:pass@host:5432/identitydb
+  # ENCRYPTION IN TRANSIT: append `?sslmode=verify-full` in production (encrypt +
+  # verify the server cert; profile rows are PII). `require` only encrypts.
+  url: ""                       # e.g. postgres://user:pass@host:5432/identitydb?sslmode=verify-full
 
 # -------------------------------------------------------------------------- #
 # Observability — emit a ServiceMonitor per component if you run the Prometheus

@@ -49,9 +49,13 @@ edge:
   # default a route, and enrichment fail-open must never weaken auth — RFC C10/C17).
   failureModeAllow: false
   extProcTimeout: "5s"
-  # Routes listed here skip the identity ext_proc (fail-open, no enrichment) but
-  # are STILL tenant-routed and (unless also excluded from jwt rules) authenticated.
-  # Use for public assets that need a tenant but no user. Default: none.
+  # Routes listed here skip the identity ext_proc (fail-open, no enrichment) so
+  # they survive a sidecar outage (C10). This is ENRICHMENT-only and orthogonal to
+  # auth: a publicPaths route is still tenant-routed, and whether it requires a
+  # credential is decided ONLY by the per-route auth gate (the tenant's auth_routes
+  # policy -> x-auth-required). To make a path anonymous-accessible, set it public
+  # in auth_routes; listing it here alone does NOT open it. Use for tenant-scoped
+  # public assets that need no user context. Default: none.
   publicPaths: []
   resources:
     envoy:

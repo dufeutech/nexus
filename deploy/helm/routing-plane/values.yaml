@@ -233,7 +233,9 @@ postgres:
   existingSecretKey: "url"
   # Inline fallback (discouraged — ends up in a chart-managed Secret). Must reach
   # a database the control plane can create its `routing` schema in.
-  url: ""                       # e.g. postgres://user:pass@host:5432/routing
+  # ENCRYPTION IN TRANSIT: append `?sslmode=verify-full` in production (encrypt +
+  # verify the server cert). `require` only encrypts; `disable` is dev-only.
+  url: ""                       # e.g. postgres://user:pass@host:5432/routing?sslmode=verify-full
   # OPTIONAL pooled read endpoint for the tenant-router (cache-miss reads only).
   # Same two-way choice as above; empty => read over the direct URL.
   readExistingSecret: ""        # Secret name holding the pooled URL; key below

@@ -46,6 +46,38 @@ data:
                   typed_config:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: edge
+                    # Canonicalize :path BEFORE the tenant-router ext_proc, the auth
+                    # gate and routing read it — else an encoded/dot-segment path can
+                    # read as one route to the gate (public) and another to the
+                    # backend (protected): auth-gate path confusion. RFC 3986 dot
+                    # removal + merge slashes + unescape %2F so all stages agree.
+                    normalize_path: true
+                    merge_slashes: true
+                    path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                    # JSON access log (audit trail): method/path/status/host/tenant
+                    # and the per-route gate decision. Deliberately NO Authorization
+                    # header and NO x-user-* (PII/secret hygiene). response_flags
+                    # shows WHY a request was rejected (e.g. jwt_authn 401).
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                          log_format:
+                            json_format:
+                              start_time: "%START_TIME%"
+                              method: "%REQ(:METHOD)%"
+                              path: "%REQ(:PATH)%"
+                              protocol: "%PROTOCOL%"
+                              response_code: "%RESPONSE_CODE%"
+                              response_flags: "%RESPONSE_FLAGS%"
+                              duration_ms: "%DURATION%"
+                              authority: "%REQ(:AUTHORITY)%"
+                              upstream_host: "%UPSTREAM_HOST%"
+                              route_pool: "%REQ(X-ROUTE-POOL)%"
+                              tenant_id: "%REQ(X-TENANT-ID)%"
+                              auth_required: "%REQ(X-AUTH-REQUIRED)%"
+                              user_agent: "%REQ(USER-AGENT)%"
+                              request_id: "%REQ(X-REQUEST-ID)%"
                     route_config:
                       name: local_route
                       virtual_hosts:
@@ -141,6 +173,16 @@ data:
                             zitadel:
                               issuer: {{ $iv.zitadel.issuer | quote }}
                               remote_jwks:
+                                # SECURITY (production): the JWKS gates ALL token
+                                # verification — a network MITM that substitutes keys
+                                # is a full auth bypass. When ZITADEL is reached over
+                                # an untrusted network, fetch over HTTPS with cert
+                                # validation. Switching this scheme to https is NOT
+                                # sufficient on its own: Envoy uses TLS only if the
+                                # `zitadel_jwks` cluster carries a `transport_socket`
+                                # (UpstreamTlsContext: validation_context + SNI).
+                                # TODO(hardening): gate cluster TLS behind a
+                                # `zitadel.jwksTls` value (CA/SNI/port are env-specific).
                                 http_uri:
                                   uri: "http://{{ include "edge-platform.jwksHost" . }}{{ $iv.zitadel.jwksPath }}"
                                   cluster: zitadel_jwks
@@ -148,7 +190,20 @@ data:
                                 cache_duration: { seconds: {{ $iv.zitadel.jwksCacheSeconds }} }
                               payload_in_metadata: verified
                               forward: true
+                          # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
+                          # tenant-router ext_proc (C17), branching on the
+                          # x-auth-required it set from the (domain, path) policy.
+                          # INVERTED fail-safe polarity, first match wins:
+                          #  - "false" -> allow_missing (public: missing token OK,
+                          #    invalid token still 401s — NOT allow_missing_or_failed)
+                          #  - "true" OR ABSENT -> catch-all demands a credential, so
+                          #    the gate stays fail-CLOSED if the signal is ever lost.
+                          # Relies on the header_mutation strip above for unforgeability.
                           rules:
+                            - match:
+                                prefix: "/"
+                                headers: [{ name: x-auth-required, string_match: { exact: "false" } }]
+                              requires: { allow_missing: {} }
                             - match: { prefix: "/" }
                               requires: { provider_name: zitadel }
                       # Enrich from the verified subject (C2).

@@ -45,6 +45,35 @@ data:
                   typed_config:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: edge
+                    # Canonicalize :path BEFORE the auth gate / enrichment read it,
+                    # so an encoded/dot-segment path can't read as one route to the
+                    # gate and another to the backend (auth-gate path confusion).
+                    # RFC 3986 dot removal + merge slashes + unescape %2F.
+                    normalize_path: true
+                    merge_slashes: true
+                    path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                    # JSON access log (audit trail): method/path/status/host and the
+                    # auth outcome. Deliberately NO Authorization header and NO
+                    # x-user-* (PII/secret hygiene). response_flags shows WHY a
+                    # request was rejected (e.g. jwt_authn 401).
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                          log_format:
+                            json_format:
+                              start_time: "%START_TIME%"
+                              method: "%REQ(:METHOD)%"
+                              path: "%REQ(:PATH)%"
+                              protocol: "%PROTOCOL%"
+                              response_code: "%RESPONSE_CODE%"
+                              response_flags: "%RESPONSE_FLAGS%"
+                              duration_ms: "%DURATION%"
+                              authority: "%REQ(:AUTHORITY)%"
+                              upstream_host: "%UPSTREAM_HOST%"
+                              auth_required: "%REQ(X-AUTH-REQUIRED)%"
+                              user_agent: "%REQ(USER-AGENT)%"
+                              request_id: "%REQ(X-REQUEST-ID)%"
                     route_config:
                       name: local_route
                       virtual_hosts:
@@ -82,9 +111,13 @@ data:
                               # client copies so is-anonymous is unforgeable (C3).
                               - remove: "x-auth-anonymous"
                               - remove: "x-auth-method"
-                              # Per-route auth gate (RFC N4): tenant-router emits it,
-                              # jwt_authn branches on it — a client copy must never
-                              # survive to forge the gate (C3).
+                              # x-auth-required (RFC N4 per-route gate): this plane
+                              # has NO tenant-router and does NOT consume it (jwt_authn
+                              # below hard-requires a credential). Stripped purely as
+                              # C3 hygiene so no client copy leaks to the backend. The
+                              # per-route gate lives in the combined edge; adopting it
+                              # here is a separate trust-boundary design (see the
+                              # combined-edge-per-route-auth-gate change, design.md).
                               - remove: "x-auth-required"
                       - name: envoy.filters.http.jwt_authn
                         typed_config:
@@ -96,6 +129,13 @@ data:
                                 # uri authority -> Host header (must equal the
                                 # issuer's external domain, which ZITADEL checks);
                                 # cluster -> the in-cluster ZITADEL upstream.
+                                # SECURITY (production): the JWKS gates ALL token
+                                # verification — a MITM substituting keys is a full
+                                # auth bypass. Over an untrusted network, fetch via
+                                # HTTPS with cert validation. Scheme alone is not
+                                # enough — Envoy uses TLS only if the `zitadel_jwks`
+                                # cluster has a `transport_socket` (validation_context
+                                # + SNI). TODO(hardening): gate behind zitadel.jwksTls.
                                 http_uri:
                                   uri: "http://{{ include "identity-plane.jwksHost" . }}{{ .Values.zitadel.jwksPath }}"
                                   cluster: zitadel_jwks

@@ -21,8 +21,16 @@ Edge entry point:
 {{- end }}
 
 Order matters (RFC C17): an unknown/unverified host is rejected (404) BEFORE auth,
-so even a valid token cannot reach a backend for an unregistered tenant; a known
-host with a missing/invalid token is rejected (401) by jwt_authn.
+so even a valid token cannot reach a backend for an unregistered tenant. On a known
+host, the per-route auth gate (RFC N4) decides per path:
+  - a PRESENT-but-invalid/expired token is ALWAYS rejected (401), public or not;
+  - a MISSING token is rejected (401) only on paths the tenant marks protected.
+
+PUBLIC BY DEFAULT: a tenant with no auth_routes configured serves EVERY path
+anonymously. Protection is opt-in via the control-plane auth-routes API
+(POST /tenants/{id}/auth-routes): a "/" rule locks the whole site; add specific
+path-prefix rules to carve out protected (or public) sub-trees. Verify your
+intended posture before exposing a tenant.
 
 Before trusting in production:
   1. Register routing config via the routing control plane (administrative boundary):
