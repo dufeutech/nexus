@@ -164,6 +164,36 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
+        // --- Backfill: one solo account per ownerless workspace (nexus-owned-
+        // workspace-tenancy §5.1). A workspace migrated from the old single-org
+        // `tenants` shape has account_id IS NULL after the ADD COLUMN above; give it
+        // an owning account so no routing row is left ownerless post-migration. The
+        // old model was one owner per tenant/workspace (no multi-workspace grouping),
+        // so a 1:1 solo account keyed by the workspace_id is the faithful backfill
+        // (this is the "personal" account the UI presents; the schema is identical).
+        // Idempotent + guarded on the NULL: it fills ONLY legacy ownerless rows and
+        // never re-owns a workspace the control plane already assigned, so it is a
+        // no-op on a fresh DB and on every subsequent startup. The `ON CONFLICT DO
+        // NOTHING` also makes re-provisioning an existing solo account a no-op.
+        //   Member seeding (the account owner + the per-user `staff` memberships) is
+        // deliberately NOT done here: like the identity Profile projection it is a
+        // rebuildable, broker-seeded native CRUD write, not a routing-side ETL — the
+        // routing schema holds no user roster to seed from (see MIGRATION.md's
+        // "no ETL" model and the change's design.md Migration section).
+        sqlx::query(
+            "INSERT INTO routing.accounts (account_id, name) \
+             SELECT workspace_id, workspace_id FROM routing.workspaces \
+             WHERE account_id IS NULL \
+             ON CONFLICT (account_id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE routing.workspaces SET account_id = workspace_id, updated_at = now() \
+             WHERE account_id IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
         // Keyed by (domain, is_wildcard), NOT domain alone: a domain string may
         // exist as both an apex/exact row (is_wildcard=false) AND a
         // wildcard-subdomain row (is_wildcard=true) for the same workspace — the

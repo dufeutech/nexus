@@ -147,37 +147,84 @@
   pre-existing required-value guards: postgres.url / patSecret / control-auth token);
   both plain-YAML Envoy configs parse. Caught+fixed a Go-template pitfall: `x-user-*/`
   inside the umbrella's `{{/* */}}` comment closed it early.
-- [ ] 4.3 Versioned `x-identity-contract` stamp (see design.md Decision + the
-  `identity-workspace-authz` / `edge-auth-gate` deltas). Identity sidecar emits
-  `x-identity-contract: v1` on every enriched request; add `x-identity-contract` to the
-  C3 strip family across all 5 Envoy configs (unforgeable, like `x-auth-required`); the
-  consuming backend/box requires a version it accepts and rejects absent/unrecognized.
-  Acting-scope presence is part of the `v1` contract (a `v1` request missing the
-  authoritative `x-workspace-id`/`x-user-type` is invalid) — no standalone scope
-  sentinel. NOTE: `v1` is a shared cross-repo contract; coordinate the number with the box.
+- [x] 4.3 Versioned `x-identity-contract` stamp (see design.md Decision + the
+  `identity-workspace-authz` / `edge-auth-gate` deltas). DONE: the identity sidecar
+  emits `x-identity-contract: v1` (new `IDENTITY_CONTRACT_VERSION` const) on EVERY
+  enriched path — member, non-member, profile-miss, anonymous — authored in `set`
+  (OverwriteIfExistsOrAdd), so it is order-independent and needs no `remove` entry.
+  Added `x-identity-contract` to the C3 strip family in all 5 Envoy configs
+  (`edge/envoy.yaml`, `deploy/compose/envoy/envoy.yaml`, and the routing-plane /
+  identity-plane / edge-platform Helm `edge-configmap.yaml`s), grouped with
+  `x-auth-required` as a trusted-emitted unforgeable header. The consuming backend/box
+  requiring a version it accepts (+ rejecting absent/unrecognized, and treating a `v1`
+  request missing the authoritative `x-workspace-id`/`x-user-type` as invalid) is the
+  cross-repo counterpart — out of this repo. NOTE: `v1` is the shared cross-repo
+  contract number; coordinate with the box before bumping. Verify: identity-sidecar
+  clippy `--all-targets` 0-deny + 9 tests green (new
+  `contract_stamp_is_emitted_on_every_enriched_path`); both plain Envoy YAMLs parse;
+  all 3 Helm charts render exactly one `x-identity-contract` strip.
 
 ## 5. Migration
 
-- [ ] 5.1 Backfill: one account per existing owner; one `staff` membership per user for
-  their `org_id`'s workspace; `tenant_id → workspace_id` data migration.
-- [ ] 5.2 Cut-over plan for the header rename (data-plane contract change coordinated
+- [x] 5.1 Backfill: one account per existing owner; one `staff` membership per user for
+  their `org_id`'s workspace; `tenant_id → workspace_id` data migration. DONE: the
+  `tenant_id → workspace_id` **data** migration is the guarded in-place `ALTER … RENAME`
+  in `init_schema` (task 1.1). Added the **account backfill** to `init_schema` (idempotent,
+  guarded on `account_id IS NULL`): every workspace migrated from the old single-org
+  `tenants` shape gets a solo owning account keyed by its `workspace_id` (the old model was
+  one owner per tenant/workspace, so 1:1 is faithful; this is the "personal" account the UI
+  presents). The **user→`staff`-membership seed is NOT a routing-side ETL** — the routing
+  schema holds no user roster; like the identity `Profile` projection it is a rebuildable,
+  broker-seeded native CRUD write (see MIGRATION.md's "no ETL" model + design.md Migration).
+  Verified against a throwaway Postgres:
+  `init_schema_backfills_a_solo_account_for_an_ownerless_workspace` (ownerless legacy row →
+  auto-owned + idempotent on a second pass) — `store-postgres` integration suite green.
+- [x] 5.2 Cut-over plan for the header rename (data-plane contract change coordinated
   with the running edge). MECHANISM: the versioned `x-identity-contract` stamp (4.3) is
   the coordination gate — bump the version when the header shape changes so a
   half-deployed rename fails closed rather than being silently misread by the backend.
+  DONE: wrote the ordered **Cut-over sequence** in design.md (Migration section) — a
+  single coordinated cut (pre-production, per MIGRATION.md's rebuildable-projection
+  model): (1) schema+account-backfill on startup, wire name still `x-tenant-*`; (2) seed
+  memberships (native CRUD, not ETL) BEFORE flipping surfaces protected; (3) roll the
+  sidecar+router emit to `x-workspace-*` and stamp `v1` (the sidecar reads either header
+  name mid-roll); (4) roll the edge C3 strips (3→4 safe: stripped-not-authored = absent =
+  fail-closed); (5) backend requires `v1`, bump the version on any future shape change.
+  Rollback = `git revert` (no live data rollback — rebuildable projection).
 
 ## 6. Verify
 
 - [x] 6.1 Both workspaces: clippy `--all-targets --locked` 0-deny, cargo-deny, tests
   (identity-rs needs `PROTOC`). DONE 2026-07-01: routing-rs clippy+tests+deny green;
   identity-rs clippy+deny green, 35 tests pass (PROTOC=libprotoc 35.0).
-- [ ] 6.2 Real edge test (extend the Envoy harness): member → authoritative
+- [x] 6.2 Real edge test (extend the Envoy harness): member → authoritative
   `x-workspace-id`+role reaches the backend; non-member → fail-closed; forged
   `x-workspace-id`/`x-user-type` on a non-member request → stripped, no access.
   Also assert the contract stamp (4.3): enriched request carries `x-identity-contract: v1`;
   a client-supplied `x-identity-contract` is stripped; a request bypassing the edge lacks
-  it and the backend rejects.
-- [ ] 6.3 Transfer test: repoint account_id; confirm routing + customer memberships +
-  data intact.
+  it and the backend rejects. DONE: new `scripts/tenancy-edge-e2e.sh` (extends
+  `scripts/n4-e2e.sh`; asserts against the `traefik/whoami` backend, which echoes the
+  headers it received). **Ran LIVE against the real `docker compose` edge (Envoy +
+  tenant-router + identity-sidecar), 8/8 green:** the contract stamp reaches the backend
+  as `v1` even when the client sends `x-identity-contract: vFORGED` (stripped + re-
+  authored); client-forged `x-workspace-id`/`x-user-type`/`x-user-role` on a non-member
+  are stripped (backend sees `<none>`); public route → 200 pass-through; protected route →
+  401 fail-closed (non-member can't reach the backend). The POSITIVE **member** path
+  (authoritative scope from a live membership) requires a ZITADEL-minted JWT + a seeded
+  membership Profile — layered onto the same script via a bearer token (procedure in
+  design.md's cut-over section); its authoring logic is unit-covered by the sidecar tests
+  (`member_gets_authoritative_workspace_scope`, `member_type_and_role_are_workspace_
+  scoped`). The backend's reject-on-absent-stamp is the consuming box's contract (cross-
+  repo), not nexus-emitted. NOTE: `init_schema` (incl. the §5.1 account backfill) also ran
+  clean inside the containerized control-plane against its Postgres.
+- [x] 6.3 Transfer test: repoint account_id; confirm routing + customer memberships +
+  data intact. DONE: new `routing-rs/store-postgres/tests/integration.rs` (gated on
+  `STORE_PG_TEST_URL`, mirroring identity-rs). `transfer_repoints_ownership_and_resets_
+  staff_only` seeds a workspace owned by `acct_old` with a verified domain + one staff +
+  one customer membership, transfers to `acct_new`, and asserts: `staff_removed == 1`,
+  `account_id` repointed, the domain still resolves the workspace (routing intact), and
+  ONLY the customer membership survives. `transfer_of_unknown_workspace_is_none` covers
+  the clean-404 path. Verified end-to-end against a throwaway Postgres 16 (3/3 green).
 
 ## Out of scope (do NOT do here)
 

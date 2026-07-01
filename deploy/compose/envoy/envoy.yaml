@@ -138,6 +138,11 @@ static_resources:
                           # emits it and jwt_authn branches on it, so a client
                           # copy must never survive to forge the gate (C3).
                           - remove: "x-auth-required"
+                          # Versioned identity-contract stamp: the identity sidecar
+                          # authors it so the backend can prove the identity headers
+                          # came from the current trusted edge — strip any client copy
+                          # (C3, same rule as x-auth-required/x-workspace-id).
+                          - remove: "x-identity-contract"
                   # Tenant routing (C14/C15/C18) — BEFORE auth so verification may
                   # be tenant-scoped (C17). fail-closed: a routing failure must not
                   # silently default a route.

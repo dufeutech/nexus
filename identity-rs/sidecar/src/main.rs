@@ -55,6 +55,18 @@ use store_postgres::PgProfileStore;
 const JWT_NS: &str = "envoy.filters.http.jwt_authn";
 const PAYLOAD_KEY: &str = "verified";
 
+/// Version of the edge→backend identity-header contract this sidecar emits, stamped
+/// on every enriched request as `x-identity-contract`. It is the single coordination
+/// gate for the whole `x-workspace-*`/`x-user-*` family: any drift in that family's
+/// shape (a rename, a removed/added field, a changed meaning) is a version bump, so a
+/// partially-deployed contract change fails closed instead of feeding the backend
+/// headers it silently misreads. A well-formed `vN` request also carries the
+/// authoritative acting scope (`x-workspace-id`/`x-user-type`), so the acting-scope
+/// guarantee is PART of this version, not a separate sentinel header. SHARED CONTRACT:
+/// the number is coordinated cross-repo with the consuming backend/box — bump both
+/// sides together.
+const IDENTITY_CONTRACT_VERSION: &str = "v1";
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -243,6 +255,12 @@ fn enrich_response(
     // SP 800-63B AAL, mTLS) can extend `x-auth-method` later. These are stripped
     // from client input (C3) so a client cannot self-assert as authenticated.
     let mut set = vec![
+        // The contract stamp: proves to the backend that this request's identity
+        // headers were produced by the current, trusted edge (an absent stamp = a
+        // bypass). Authored on EVERY enriched request; since it is always in `set`
+        // (OverwriteIfExistsOrAdd) it needs no entry in `remove` — the overwrite is
+        // order-independent, and the edge C3 strip already discards any client copy.
+        header("x-identity-contract", IDENTITY_CONTRACT_VERSION),
         header("x-auth-anonymous", if authenticated { "false" } else { "true" }),
         header("x-auth-method", if authenticated { "bearer" } else { "none" }),
         header("x-user-id", sub),
@@ -972,6 +990,51 @@ mod tests {
         let r = remove_headers(&resp);
         for hh in ["x-workspace-id", "x-user-type", "x-user-role"] {
             assert!(r.contains(&hh.to_owned()), "non-member must strip {hh}");
+        }
+    }
+
+    #[test]
+    fn contract_stamp_is_emitted_on_every_enriched_path() {
+        // The contract stamp proves the identity headers came from the trusted edge.
+        // It is authored on EVERY forwarded path — member, non-member, profile miss,
+        // and anonymous — so the backend can reject an absent stamp as a bypass.
+        let cases = [
+            // (label, response)
+            (
+                "member",
+                enrich_response(
+                    "u1",
+                    &[],
+                    Some(member_profile("ws_1", MemberType::Staff, "admin")),
+                    true,
+                    Some("ws_1"),
+                ),
+            ),
+            (
+                "non_member",
+                enrich_response(
+                    "u1",
+                    &[],
+                    Some(member_profile("ws_1", MemberType::Staff, "admin")),
+                    true,
+                    Some("ws_other"),
+                ),
+            ),
+            ("miss", enrich_response("u1", &[], None, true, None)),
+            ("anonymous", enrich_response("anonymous", &[], None, false, None)),
+        ];
+        for (label, resp) in &cases {
+            let h = set_headers(resp);
+            assert_eq!(
+                h.get("x-identity-contract").map(String::as_str),
+                Some("v1"),
+                "{label} path must stamp the contract version",
+            );
+            // Always authored -> must never appear in the strip list (order-independent).
+            assert!(
+                !remove_headers(resp).contains(&"x-identity-contract".to_owned()),
+                "{label} path must not strip the authored contract stamp",
+            );
         }
     }
 

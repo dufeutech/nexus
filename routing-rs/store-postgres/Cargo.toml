@@ -21,5 +21,10 @@ futures.workspace = true
 ring.workspace = true
 hex.workspace = true
 
+[dev-dependencies]
+# Transfer/backfill integration tests (tests/integration.rs), gated on
+# STORE_PG_TEST_URL against a throwaway Postgres — mirror identity-rs/store-postgres.
+tokio = { workspace = true }
+
 [lints]
 workspace = true

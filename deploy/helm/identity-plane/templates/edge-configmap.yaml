@@ -128,6 +128,12 @@ data:
                               # here is a separate trust-boundary design (see the
                               # combined-edge-per-route-auth-gate change, design.md).
                               - remove: "x-auth-required"
+                              # Versioned identity-contract stamp: authored by THIS
+                              # plane's identity sidecar so the backend can prove the
+                              # identity headers are edge-produced. Strip client copies
+                              # so a client can neither forge a version nor mask a
+                              # bypass (C3, same rule as x-workspace-id).
+                              - remove: "x-identity-contract"
                       - name: envoy.filters.http.jwt_authn
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication

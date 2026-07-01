@@ -183,6 +183,13 @@ static_resources:
                           # public (C3) — tenant-router runs AFTER this filter, so
                           # its emit is authoritative.
                           - remove: "x-auth-required"
+                          # Versioned edge->backend identity-contract stamp: authored
+                          # by the identity sidecar so the backend can prove the
+                          # identity headers came from the current trusted edge. Strip
+                          # any client copy so a client can neither forge a version nor
+                          # mask a bypass of the enrichment (C3, same rule as
+                          # x-auth-required/x-workspace-id).
+                          - remove: "x-identity-contract"
                   # TENANT-FIRST (RFC C17): resolve host -> workspace -> pool before
                   # auth/enrichment. Sets x-workspace-* + x-route-pool, or rejects an
                   # unknown/unverified host with an immediate 404 (C18). A distinct

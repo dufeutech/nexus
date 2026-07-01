@@ -155,6 +155,46 @@ nexus-owned and transferable; ZITADEL authenticates only.
 - `Profile` gains `memberships` (projection) and `home_org`; `enrich_response` emits
   the resolved workspace scope + `x-user-type` instead of the fixed `x-user-org`.
 
+### Cut-over sequence (task 5.2 — header rename coordinated with the running edge)
+
+The header rename is a data-plane **contract change**; the versioned
+`x-identity-contract` stamp (task 4.3) is the coordination gate that makes a
+half-deployed rename fail **closed** rather than be silently misread. Because the
+project is **pre-production** (see `identity-rs/MIGRATION.md`: the Mongo→Postgres cut
+was a single hard cutover, and the store is a rebuildable projection), the plan below
+is a single coordinated cut, not a long dual-run — but each step is ordered so the
+running edge stays coherent at every point.
+
+1. **Schema + backfill first (no wire change).** Deploy the control plane / routing
+   store: the guarded in-place `ALTER … RENAME` (`tenant_id → workspace_id`) and the
+   idempotent account backfill run in `init_schema` on startup. Internal field is
+   renamed; the **wire** `x-tenant-*` name is still emitted. No edge coordination
+   needed — this is backward-compatible at the header layer.
+2. **Seed memberships (rebuildable, not ETL).** Memberships are nexus-native CRUD, so
+   there is no routing-side ETL: the broker seeds one `staff` membership per existing
+   user for their `org_id`'s workspace (the same "let the projection rebuild" model as
+   the Profile store). Until a user has a membership, the fail-closed resolver emits no
+   acting scope for them — so seed **before** flipping any surface to protected.
+3. **Roll the identity sidecar + routing emit together to `x-workspace-*` and stamp
+   `v1`.** The sidecar reads the acting workspace from EITHER `x-workspace-id`
+   (post-rename) or `x-tenant-id` (pre-rename) — see `extract_acting_workspace` — so
+   the sidecar tolerates both router versions during the roll. It emits the new
+   `x-workspace-*`/`x-user-type`/`x-user-role` set and `x-identity-contract: v1`.
+4. **Roll the edge C3 strip lists** (all 5 Envoy configs) to strip the new
+   `x-workspace-*`/`x-user-*`/`x-identity-contract` family. Order 3→4 is safe: a
+   stripped-but-not-yet-authored header is simply absent (fail-closed), never a forged
+   client value.
+5. **Backend requires `v1`.** The consuming box starts requiring `x-identity-contract:
+   v1` (rejecting absent/unrecognized, and treating a `v1` request missing the
+   authoritative `x-workspace-id`/`x-user-type` as invalid). Coordinate this version
+   number cross-repo. If a future rename changes the header shape, **bump the version**
+   — the mismatch makes the request fail closed until both edge and backend reach the
+   new version, which is exactly the property this whole plan is built on.
+
+**Rollback:** `git revert` the roll; because the store is a rebuildable projection and
+this is pre-production, there is no live data rollback to manage (mirrors the
+Mongo→Postgres cut). A version bump is the forward-fix for any drift caught in prod.
+
 ## Open questions (carry into decide/apply)
 
 - ~~Non-member policy on a resolved workspace~~ — **RESOLVED** (see the Decision above):

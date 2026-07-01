@@ -2137,6 +2137,7 @@ dependencies = [
  "ring",
  "router-core",
  "sqlx",
+ "tokio",
 ]
 
 [[package]]
