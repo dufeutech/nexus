@@ -158,10 +158,12 @@ header. No decision hierarchy needed — a denormalized informational field.
 - **Rollback:** `git revert`; the projection is a rebuildable read-model (drop the worker,
   memberships simply stop refreshing — source of record is untouched).
 
-## Open Questions
+## Open Questions (resolved at apply time)
 
-- Channel/credential naming for the identity-plane read-only routing connection (settle in
-  `/opsx:apply` against the existing env-var conventions).
-- Whether the reconcile backstop is a new pass in the existing `reconciler` binary or a
-  tick inside the new `membership-sync` worker (both satisfy the spec; pick the smaller
-  wiring at apply time).
+- **Read-only routing connection input** → `ROUTING_PG_RO_URL` (mirrors `PROFILE_PG_URL`
+  naming); routing NOTIFY channel constant `routing_membership_changes` (shared wire
+  contract, duplicated across planes like the `x-workspace-*` header names).
+- **Backstop location** → the new `membership-sync` worker (not the reconciler): it already
+  holds the routing read-only connection, so the backstop is one tick there rather than a
+  new cross-plane dependency in the reconciler. The reconciler keeps only the no-clobber
+  fix (carry stored memberships forward).

@@ -1071,6 +1071,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "membership-sync"
+version = "0.1.0"
+dependencies = [
+ "identity-core",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "sqlx",
+ "store-postgres",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

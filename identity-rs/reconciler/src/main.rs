@@ -36,7 +36,7 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use identity_core::reconcile::{build_profile_from_user, differs};
+use identity_core::reconcile::{differs, reconciled_profile};
 use identity_core::store::{BoxError, ProfileStore};
 use identity_core::Profile;
 use store_postgres::PgProfileStore;
@@ -186,7 +186,11 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
             }
             None => Vec::new(),
         };
-        let desired = build_profile_from_user(u, roles);
+        // Carry the stored membership projection forward so this identity/role
+        // reconcile never clobbers nexus-native memberships (reconciled separately
+        // by the membership-sync worker). `differs` ignores memberships, so this
+        // does not cause spurious upserts.
+        let desired = reconciled_profile(u, roles, stored.get(uid));
         if differs(&desired, stored.get(uid)) {
             store.put(&desired).await?;
             upserted += 1;

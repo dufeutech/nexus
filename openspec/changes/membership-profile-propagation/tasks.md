@@ -35,22 +35,28 @@
 
 ## 3. Identity — the read seam + consumer worker
 
-- [ ] 3.1 Add a read-only `SourceMembershipReader` port in `identity_core`
-  (`memberships_for(sub) -> Vec<Membership>`) and implement it against the routing
-  `memberships` table (read-only routing connection; SQL behind the adapter, not in core).
-- [ ] 3.2 New thin binary `identity-rs/membership-sync`: LISTEN on the routing channel →
-  on signal, `SourceMembershipReader::memberships_for(sub)` → `ProfileStore::get(sub)` →
-  `apply_memberships` → `ProfileStore::put` (upserting a minimal profile if `sub` is absent,
-  per design R5). Re-reads source of record (never trusts payload). Reconnect/resume on
-  LISTEN drop.
+- [x] 3.1 `SourceMembershipReader` port in `identity_core` (`memberships_for(sub)` +
+  `all_member_subjects()` for the backstop). Adapter `PgSourceMembershipReader` in
+  identity `store-postgres` — its own read-only routing pool, projects ONLY
+  `status='active'` rows (fail-closed), maps the wire `member_type` string → `MemberType`
+  (unknown dropped). SQL stays in the adapter.
+- [x] 3.2 New thin binary `identity-rs/membership-sync`: LISTENs on the routing channel →
+  per signal, `memberships_for(sub)` → `ProfileStore::get` → `with_memberships` →
+  `put` (upserts a minimal profile if absent; skips creating an empty profile for a
+  sub with no profile and no memberships, per design R5). Re-reads the source of record
+  (never trusts the payload — payload is just `user_sub`). Listener reconnects with backoff
+  on drop.
 
 ## 4. Backstop — periodic reconcile merge
 
-- [ ] 4.1 Add a periodic backstop pass (in the reconciler or the new worker — pick the
-  smaller wiring) that re-derives each subject's memberships from the source of record and
-  merges via `apply_memberships`, healing missed NOTIFYs and backfilling on first run.
-- [ ] 4.2 Confirm the first backstop pass backfills existing `routing.memberships` into
-  profiles (no separate ETL).
+- [x] 4.1 Backstop lives in the new worker (resolves design Open Question #2 — smaller
+  wiring; the worker already holds the routing read-only connection). `backstop_pass`
+  converges the UNION of {subjects with source-of-record memberships} ∪ {profiles still
+  carrying memberships}, so it heals missed grants AND missed revokes (incl. revoke-to-zero,
+  where the sub left the source set). Runs on startup + every `MEMBERSHIP_BACKSTOP_INTERVAL`
+  (default 600s).
+- [x] 4.2 First backstop pass (startup) backfills existing `routing.memberships` into
+  profiles — no separate ETL. (Runtime-verified in 6.2.)
 
 ## 5. Wiring & config
 

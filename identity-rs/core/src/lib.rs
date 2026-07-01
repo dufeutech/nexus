@@ -9,5 +9,7 @@ pub mod reconcile;
 pub mod store;
 pub mod sync;
 
-pub use membership::{Membership, MemberType, MembershipResolver, ResolvedMembership};
+pub use membership::{
+    Membership, MemberType, MembershipResolver, ResolvedMembership, SourceMembershipReader,
+};
 pub use profile::Profile;
