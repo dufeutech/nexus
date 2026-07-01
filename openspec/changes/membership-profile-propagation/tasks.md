@@ -25,12 +25,13 @@
 
 ## 2. Routing — emit the change signal (source of record stays authoritative)
 
-- [ ] 2.1 Add a routing membership-changed NOTIFY: a dedicated channel constant (e.g.
-  `routing_membership_changes`) + a `notify_membership_change(user_sub, workspace_id, op)`
-  on the routing store, mirroring the existing `notify_invalidation` pattern. Payload is a
-  hint only.
-- [ ] 2.2 Emit it from control-plane `upsert_membership` and `delete_membership` after the
-  source-of-record write commits. No behavior change to the CRUD response.
+- [x] 2.1 Added `MEMBERSHIP_CHANNEL = "routing_membership_changes"` + `PgRoutingStore::
+  notify_membership_change(user_sub)`, mirroring `notify_invalidation`. Payload is just
+  `user_sub` (a hint — consumer re-reads the source of record for the full set), simpler
+  than the sketched `{user_sub, workspace_id, op}` and needs no parsing.
+- [x] 2.2 Emitted from control-plane `upsert_membership` + `delete_membership` after the
+  write commits; best-effort (a notify failure logs a warn and does NOT fail the CRUD — the
+  backstop heals it). No CRUD response change. Builds clean.
 
 ## 3. Identity — the read seam + consumer worker
 
