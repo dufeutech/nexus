@@ -341,10 +341,10 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
             // Sweep abandoned pending declares first so the used count excludes
             // expired-pending at declare time (RFC C3 boundary). Best-effort: a
             // sweep error only risks counting a stale slot until the next poll.
-            if s.pending_ttl > 0 {
-                if let Err(e) = s.store.expire_pending_domains(s.pending_ttl).await {
-                    warn!(error = %e, "declare: pending sweep failed (count may be stale)");
-                }
+            if s.pending_ttl > 0
+                && let Err(e) = s.store.expire_pending_domains(s.pending_ttl).await
+            {
+                warn!(error = %e, "declare: pending sweep failed (count may be stale)");
             }
             let plan = match s.store.get_workspace(&body.tenant_id).await {
                 Ok(Some(cfg)) => cfg.plan,

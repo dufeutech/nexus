@@ -126,10 +126,10 @@ pub fn apply(existing: Option<Profile>, ev: &UserEvent<'_>) -> Apply {
 
     // Version guard: a newer stored value is never overwritten by an older event
     // (globally-ordered timestamp, RFC §3.4).
-    if let Some(e) = &existing {
-        if e.updated_at.as_deref().unwrap_or("") > ev.ts.as_str() {
-            return Apply::SkipStale;
-        }
+    if let Some(e) = &existing
+        && e.updated_at.as_deref().unwrap_or("") > ev.ts.as_str()
+    {
+        return Apply::SkipStale;
     }
 
     let mut prof = existing.unwrap_or_default();
