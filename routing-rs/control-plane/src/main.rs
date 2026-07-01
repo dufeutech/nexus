@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
+use headers::authorization::Bearer;
+use headers::{Authorization, HeaderMapExt};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -164,22 +165,25 @@ async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Respons
     let Some(expected) = s.auth_token.as_deref() else {
         return next.run(req).await;
     };
-    // The `Bearer` auth scheme is case-insensitive (RFC 7235: auth-scheme is a
-    // token), so fold the SCHEME with ASCII case-insensitivity — but only the
-    // scheme. The token itself stays an exact, constant-time byte compare below.
-    // ASCII (not Unicode) folding is correct here: the scheme is ASCII by spec, and
-    // Unicode case folding would invite locale/homoglyph surprises (e.g. Kelvin-sign
-    // `K` U+212A) on what is a fixed protocol keyword.
-    let presented = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split_once(' '))
-        .and_then(|(scheme, tok)| scheme.eq_ignore_ascii_case("Bearer").then_some(tok));
-    match presented {
-        Some(tok) if ct_eq(tok, expected) => next.run(req).await,
+    // Parse `Authorization: Bearer <token>` with the vetted `headers` typed-header
+    // parser (RFC 7235: case-insensitive scheme, correct whitespace handling)
+    // rather than a hand-rolled split. The token itself is then compared in
+    // constant time; a present-but-wrong or missing/malformed header both 401.
+    let bearer = req.headers().typed_get::<Authorization<Bearer>>();
+    match &bearer {
+        Some(auth) if ct_eq(auth.token(), expected) => next.run(req).await,
         _ => {
             counter!("control_mutations_total", "op" => "unauthorized").increment(1);
+            // Emit an audit line (not only a metric) so a rejected admin attempt is
+            // visible in the log trail. Method + path only — never the presented
+            // credential. `bearer.is_some()` distinguishes a bad token from a
+            // missing/malformed Authorization header.
+            warn!(
+                method = %req.method(),
+                path = %req.uri().path(),
+                had_bearer = bearer.is_some(),
+                "unauthorized control-plane request"
+            );
             (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
         }
     }

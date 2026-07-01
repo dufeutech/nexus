@@ -17,6 +17,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 futures = "0.3"
+# Vetted constant-time primitives (RustCrypto) — used for secret/token equality
+# instead of a hand-rolled compare. Already in the tree transitively via ring.
+subtle = { version = "2", default-features = false }
+# CSPRNG (ring's SystemRandom) + hex encoding for minting ownership-proof tokens
+# in security-aware code rather than in SQL. Both already in the tree.
+ring = "0.17"
+hex = "0.4"
 # Routing store adapter (authoritative, control-plane-written) + invalidation feed
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 # Optional shared L2 cache tier
@@ -29,6 +36,9 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = "0.8"
+# Vetted typed HTTP header parsing (hyperium) — used for RFC 7235 `Authorization:
+# Bearer` instead of a hand-rolled split.
+headers = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
 

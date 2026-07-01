@@ -17,6 +17,7 @@ path = "src/lib.rs"
 serde.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 # Used only by the serde round-trip tests in auth.rs / domain.rs.

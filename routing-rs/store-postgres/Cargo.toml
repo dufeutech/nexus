@@ -18,6 +18,8 @@ router-core = { path = "../router-core" }
 sqlx.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+ring.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

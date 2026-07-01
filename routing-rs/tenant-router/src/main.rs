@@ -204,6 +204,13 @@ fn extract_host(req: &ProcessingRequest) -> Option<String> {
 // the HTTP/2 `:path` pseudo-header and strip the query string + fragment, so the
 // policy matches on the path alone (`/app?x=1` resolves as `/app`). Defaults to
 // `/` when absent so a path-less request still resolves the tenant default.
+//
+// SECURITY: the edge Envoy canonicalizes :path (normalize_path + merge_slashes +
+// path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD) BEFORE this ext_proc
+// runs, so the path matched against the auth policy is already dot-segment- and
+// %2F-normalized and agrees with what the backend receives. This avoids auth-gate
+// path confusion (e.g. `/public%2f..%2fadmin`). Do NOT front the tenant-router
+// with a proxy that leaves :path un-normalized.
 // --------------------------------------------------------------------------- //
 fn extract_path(req: &ProcessingRequest) -> String {
     let headers = match &req.request {

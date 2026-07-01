@@ -19,6 +19,7 @@ store-postgres = { path = "../store-postgres" }
 dns-resolver = { path = "../dns-resolver" }
 tokio.workspace = true
 axum.workspace = true
+headers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

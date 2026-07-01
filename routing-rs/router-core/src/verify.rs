@@ -4,6 +4,7 @@
 //! §5); core only states the capability and the deterministic matching rule.
 
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 
 use crate::store::BoxError;
 
@@ -26,21 +27,15 @@ pub fn token_matches(records: &[String], token: &str) -> bool {
     !token.is_empty() && records.iter().any(|r| ct_eq(r.trim(), token))
 }
 
-/// Constant-time byte-equality (no early return on first mismatch). Length is
-/// not secret here (token lengths are fixed and known), so an early
-/// length-mismatch return is fine. Shared by the ownership-proof match and the
-/// control-plane admin-token check (both compare a server-minted secret).
+/// Constant-time byte-equality, backed by the vetted `subtle` crate
+/// (`ConstantTimeEq`) rather than a hand-rolled loop. Length is not secret here
+/// (token lengths are fixed and known), so `subtle`'s early length-mismatch
+/// return is fine; the byte comparison itself carries no data-dependent branch.
+/// Shared by the ownership-proof match and the control-plane admin-token check
+/// (both compare a server-minted secret).
 #[must_use]
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Resolve the ownership-proof records published at a name (RFC C4). Implemented

@@ -40,6 +40,10 @@ use store_postgres::PgProfileStore;
 
 type HmacSha256 = Hmac<Sha256>;
 const SIG_HEADER: &str = "zitadel-signature";
+/// Replay window for webhook signatures: a signature whose authenticated
+/// timestamp is more than this far from now (either direction, for clock skew) is
+/// rejected. 5 minutes matches common webhook providers and bounds replay reuse.
+const MAX_SIG_AGE_SECS: f64 = 300.0;
 
 #[derive(Clone)]
 struct App {
@@ -68,8 +72,10 @@ fn verify_signature(headers: &HeaderMap, body: &[u8], signing_key: &str) -> bool
     for part in sig.split(',') {
         if let Some((k, v)) = part.split_once('=') {
             match k.trim() {
-                "t" => t = Some(v.trim().to_owned()),
-                "v1" => v1 = Some(v.trim().to_owned()),
+                // First occurrence wins: a duplicate key can't override the value
+                // that is folded into the signed bytes below.
+                "t" if t.is_none() => t = Some(v.trim().to_owned()),
+                "v1" if v1.is_none() => v1 = Some(v.trim().to_owned()),
                 _ => {}
             }
         }
@@ -81,7 +87,15 @@ fn verify_signature(headers: &HeaderMap, body: &[u8], signing_key: &str) -> bool
     };
     mac.update(format!("{t}.").as_bytes());
     mac.update(body);
-    mac.verify_slice(&expected).is_ok()
+    if mac.verify_slice(&expected).is_err() {
+        return false;
+    }
+    // Replay guard: the timestamp is authenticated (folded into the HMAC above), so
+    // it can't be forged — but a *captured* valid webhook could be replayed forever
+    // without a freshness window. Reject signatures whose timestamp is outside
+    // ±MAX_SIG_AGE_SECS of now (covers both stale replays and far-future clock skew).
+    let Ok(ts) = t.parse::<f64>() else { return false };
+    (now_secs() - ts).abs() <= MAX_SIG_AGE_SECS
 }
 
 // --------------------------------------------------------------------------- //
@@ -260,4 +274,78 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use hmac::Mac;
+
+    /// Build headers carrying a VALID HMAC signature for `(t, body)` under `key`.
+    fn signed(t: &str, body: &[u8], key: &str) -> HeaderMap {
+        let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
+        mac.update(format!("{t}.").as_bytes());
+        mac.update(body);
+        let v1 = hex::encode(mac.finalize().into_bytes());
+        let mut h = HeaderMap::new();
+        h.insert(SIG_HEADER, HeaderValue::from_str(&format!("t={t},v1={v1}")).unwrap());
+        h
+    }
+
+    fn ts(offset: i64) -> String {
+        (now_secs() as i64 + offset).to_string()
+    }
+
+    #[test]
+    fn fresh_valid_signature_accepted() {
+        let body = b"{}";
+        assert!(verify_signature(&signed(&ts(0), body, "k"), body, "k"));
+    }
+
+    #[test]
+    fn stale_signature_rejected_even_though_hmac_is_valid() {
+        // The HMAC is correct, but the timestamp is an hour old -> replay window
+        // rejects it. This is the whole point of the freshness guard.
+        let body = b"{}";
+        assert!(!verify_signature(&signed(&ts(-3600), body, "k"), body, "k"));
+    }
+
+    #[test]
+    fn far_future_signature_rejected() {
+        let body = b"{}";
+        assert!(!verify_signature(&signed(&ts(3600), body, "k"), body, "k"));
+    }
+
+    #[test]
+    fn wrong_key_rejected() {
+        let body = b"{}";
+        assert!(!verify_signature(&signed(&ts(0), body, "k"), body, "wrong-key"));
+    }
+
+    #[test]
+    fn tampered_body_rejected() {
+        let h = signed(&ts(0), b"{}", "k");
+        assert!(!verify_signature(&h, b"{\"x\":1}", "k"));
+    }
+
+    #[test]
+    fn non_numeric_timestamp_rejected() {
+        // A signature whose `t` is not parseable can't be freshness-checked.
+        let mut mac = HmacSha256::new_from_slice(b"k").unwrap();
+        mac.update(b"notanumber.");
+        mac.update(b"{}");
+        let v1 = hex::encode(mac.finalize().into_bytes());
+        let mut h = HeaderMap::new();
+        h.insert(SIG_HEADER, HeaderValue::from_str(&format!("t=notanumber,v1={v1}")).unwrap());
+        assert!(!verify_signature(&h, b"{}", "k"));
+    }
+
+    #[test]
+    fn missing_or_malformed_header_rejected() {
+        assert!(!verify_signature(&HeaderMap::new(), b"{}", "k"));
+        let mut h = HeaderMap::new();
+        h.insert(SIG_HEADER, HeaderValue::from_static("garbage"));
+        assert!(!verify_signature(&h, b"{}", "k"));
+    }
 }

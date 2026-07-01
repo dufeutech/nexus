@@ -222,24 +222,41 @@ fn enrich_response(
     };
     set.push(header("x-user-roles", &roles));
     set.push(header("x-user-roles-source", roles_source));
-    match &profile {
-        Some(p) => {
-            set.push(header("x-user-org", p.org_id.as_deref().unwrap_or("")));
-            set.push(header("x-user-entitlements", &p.entitlements.join(",")));
-            // Revocation-sensitive: ALWAYS from the live Profile, never the token,
-            // so a suspension takes effect within seconds without a token refresh.
-            set.push(header(
-                "x-user-suspended",
-                if p.is_suspended { "true" } else { "false" },
-            ));
-            set.push(header("x-user-enriched-by", "identity-sidecar-rs"));
-        }
-        None => set.push(header("x-user-enriched-by", "identity-sidecar-rs:miss")),
+    // Defense-in-depth strip (RFC C3, belt-and-suspenders vs. the edge strip):
+    // the sidecar removes any client-supplied identity header it does NOT itself
+    // author on THIS path, so a forged value can't reach the backend even if the
+    // sidecar is somehow reached without the stripping edge in front. Headers we
+    // DO set below are overwritten authoritatively (OverwriteIfExistsOrAdd), so
+    // they are deliberately kept OUT of this remove list — that keeps the result
+    // independent of Envoy's set-vs-remove apply order (a header in both lists
+    // could otherwise be wiped after we set it).
+    // `x-auth-required` is consumed by jwt_authn upstream and never authored
+    // here, so it is always stripped before forwarding to the backend.
+    let mut remove = vec!["x-auth-required".to_owned()];
+    if let Some(p) = &profile {
+        set.push(header("x-user-org", p.org_id.as_deref().unwrap_or("")));
+        set.push(header("x-user-entitlements", &p.entitlements.join(",")));
+        // Revocation-sensitive: ALWAYS from the live Profile, never the token,
+        // so a suspension takes effect within seconds without a token refresh.
+        set.push(header(
+            "x-user-suspended",
+            if p.is_suspended { "true" } else { "false" },
+        ));
+        set.push(header("x-user-enriched-by", "identity-sidecar-rs"));
+    } else {
+        // No profile: this response does NOT author org/entitlements/suspended,
+        // so strip any client copies. Suspension especially — an absent
+        // x-user-suspended must mean "unknown", never a client-asserted "false"
+        // that would slip a suspended user through.
+        remove.push("x-user-org".to_owned());
+        remove.push("x-user-entitlements".to_owned());
+        remove.push("x-user-suspended".to_owned());
+        set.push(header("x-user-enriched-by", "identity-sidecar-rs:miss"));
     }
     let common = CommonResponse {
         header_mutation: Some(HeaderMutation {
             set_headers: set,
-            ..Default::default()
+            remove_headers: remove,
         }),
         ..Default::default()
     };
@@ -697,6 +714,47 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Collect the response's removed header names.
+    fn remove_headers(resp: &ProcessingResponse) -> Vec<String> {
+        let Some(processing_response::Response::RequestHeaders(h)) = &resp.response else {
+            panic!("expected RequestHeaders response");
+        };
+        h.response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .map(|m| m.remove_headers.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn strips_unauthored_identity_headers_defense_in_depth() {
+        // x-auth-required is consumed by jwt_authn upstream and is never authored
+        // by the sidecar -> always stripped before the backend, on every path.
+        let some = enrich_response(
+            "u1",
+            &[],
+            Some(Arc::new(Profile { sub: "u1".into(), ..Default::default() })),
+            true,
+        );
+        let r_some = remove_headers(&some);
+        assert!(r_some.contains(&"x-auth-required".to_owned()));
+        // On the profile-present path the sidecar AUTHORS org/entitlements/
+        // suspended, so it must NOT also remove them (that would risk wiping the
+        // value it just set, depending on Envoy's apply order).
+        assert!(!r_some.contains(&"x-user-suspended".to_owned()));
+        assert!(!r_some.contains(&"x-user-org".to_owned()));
+
+        // On a profile MISS the sidecar authors none of those, so any client copy
+        // must be stripped — suspension especially (absent == unknown).
+        let miss = enrich_response("u1", &[], None, true);
+        let r_miss = remove_headers(&miss);
+        for h in ["x-auth-required", "x-user-org", "x-user-entitlements", "x-user-suspended"] {
+            assert!(r_miss.contains(&h.to_owned()), "miss path must strip {h}");
+        }
+        // And it must still not ASSERT a suspension on the miss path.
+        assert!(!set_headers(&miss).contains_key("x-user-suspended"));
     }
 
     fn is_immediate_503(resp: &ProcessingResponse) -> bool {
