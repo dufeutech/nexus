@@ -106,6 +106,27 @@ nexus-owned and transferable; ZITADEL authenticates only.
   `x-user-id`. `x-requested-workspace` is a client hint (non-authoritative). All are
   edge-stripped from client input (C3) — see the `edge-auth-gate` delta.
 
+### Decision: A versioned `x-identity-contract` stamp gates the edge→backend header contract
+- **Status**: approved
+- **Why**: the backend needs to know the identity headers it receives were produced by
+  the current, trusted edge — not by a bypass and not under a drifted shape. Two shapes
+  were weighed: a narrow semantic sentinel (`x-workspace-scope: acting`, trips only on the
+  acting-org gap) vs. a versioned contract stamp (`x-identity-contract: vN`, trips on ANY
+  drift). Adopt the **versioned stamp** as the primary guard: one gate covers all future
+  drift, it doubles as a bypass detector (absent header → reject), and it directly
+  de-risks the breaking header rename (a version bump makes a half-deployed rename fail
+  closed instead of silently misread — see Migration / task 5.2).
+- **Acting-scope is folded INTO the contract**, not a separate header: a well-formed `vN`
+  request carries the authoritative `x-workspace-id`/`x-user-type`, so a same-version
+  request missing acting scope is not a valid `vN` request and is rejected. This closes
+  the one gap a version stamp alone misses (a same-version semantic bug) without a
+  standalone sentinel that rots.
+- **Trust**: emitted by the identity sidecar; added to the edge C3 strip list (same rule
+  as `x-auth-required`/`x-workspace-id`) so a client can neither forge a version nor
+  present its own by bypassing the edge.
+- **Shared contract**: the version number is the coordination primitive between nexus and
+  the consuming backend/box — both sides must agree on it (cross-repo).
+
 ### Decision: Non-member policy is derived from the route auth policy, not a separate knob
 - **Status**: approved (settles open question 0.2)
 - **Why**: "reject vs. anonymous vs. self-signup" is the same question the N4 per-route

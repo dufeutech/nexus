@@ -147,13 +147,23 @@
   pre-existing required-value guards: postgres.url / patSecret / control-auth token);
   both plain-YAML Envoy configs parse. Caught+fixed a Go-template pitfall: `x-user-*/`
   inside the umbrella's `{{/* */}}` comment closed it early.
+- [ ] 4.3 Versioned `x-identity-contract` stamp (see design.md Decision + the
+  `identity-workspace-authz` / `edge-auth-gate` deltas). Identity sidecar emits
+  `x-identity-contract: v1` on every enriched request; add `x-identity-contract` to the
+  C3 strip family across all 5 Envoy configs (unforgeable, like `x-auth-required`); the
+  consuming backend/box requires a version it accepts and rejects absent/unrecognized.
+  Acting-scope presence is part of the `v1` contract (a `v1` request missing the
+  authoritative `x-workspace-id`/`x-user-type` is invalid) — no standalone scope
+  sentinel. NOTE: `v1` is a shared cross-repo contract; coordinate the number with the box.
 
 ## 5. Migration
 
 - [ ] 5.1 Backfill: one account per existing owner; one `staff` membership per user for
   their `org_id`'s workspace; `tenant_id → workspace_id` data migration.
 - [ ] 5.2 Cut-over plan for the header rename (data-plane contract change coordinated
-  with the running edge).
+  with the running edge). MECHANISM: the versioned `x-identity-contract` stamp (4.3) is
+  the coordination gate — bump the version when the header shape changes so a
+  half-deployed rename fails closed rather than being silently misread by the backend.
 
 ## 6. Verify
 
@@ -163,6 +173,9 @@
 - [ ] 6.2 Real edge test (extend the Envoy harness): member → authoritative
   `x-workspace-id`+role reaches the backend; non-member → fail-closed; forged
   `x-workspace-id`/`x-user-type` on a non-member request → stripped, no access.
+  Also assert the contract stamp (4.3): enriched request carries `x-identity-contract: v1`;
+  a client-supplied `x-identity-contract` is stripped; a request bypassing the edge lacks
+  it and the backend rejects.
 - [ ] 6.3 Transfer test: repoint account_id; confirm routing + customer memberships +
   data intact.
 

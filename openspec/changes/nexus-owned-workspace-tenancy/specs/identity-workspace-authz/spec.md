@@ -59,3 +59,46 @@ emitted scope.
   for a workspace the subject is not a member of
 - **THEN** the emitted authoritative scope SHALL NOT grant that workspace; the client
   value SHALL be discarded before resolution
+
+### Requirement: The identity enrichment is stamped with a versioned contract
+
+The identity plane SHALL stamp every enriched request with an `x-identity-contract`
+header carrying the version of the edge→backend identity-header contract it emits
+(e.g. `v1`). The backend SHALL require an `x-identity-contract` value it understands
+and reject any request whose value is absent or unrecognized. This is the single
+coordination gate for the whole `x-workspace-*`/`x-user-*` header family: any drift in
+that family's shape (a rename, a removed/added field, a changed meaning) is a version
+bump, so a partially-deployed contract change fails closed instead of feeding the
+backend headers it silently misreads.
+
+The acting-scope guarantee is PART of the versioned contract, not a separate sentinel:
+a well-formed `vN` request SHALL carry the authoritative acting `x-workspace-id`
+(and `x-user-type`), so a same-version request missing the acting scope is not a valid
+`vN` request and the backend SHALL reject it. There is NO standalone acting-scope
+marker header.
+
+`x-identity-contract` is trusted-emitted and therefore MUST be stripped from client
+input at the edge (the same C3 rule that makes `x-auth-required`/`x-workspace-id`
+unforgeable), so a client can neither forge a version nor bypass the edge and present
+its own.
+
+#### Scenario: Backend rejects a stale or absent contract version
+- **WHEN** a request reaches the backend with `x-identity-contract` absent, or set to a
+  version the backend does not accept (e.g. the edge still emits `v1` after the backend
+  moved to require `v2`)
+- **THEN** the backend SHALL reject the request rather than interpret the identity
+  headers under an assumed shape
+
+#### Scenario: Version bump gates a breaking header rename
+- **WHEN** the `x-workspace-*`/`x-user-*` header shape changes (e.g. a field rename) and
+  only one side of edge/backend has been rolled out
+- **THEN** the contract version emitted by the edge and the version required by the
+  backend SHALL NOT match, and the request SHALL fail closed until both sides are
+  rolled to the same version
+
+#### Scenario: Client cannot forge or bypass the contract stamp
+- **WHEN** an inbound request carries a client-set `x-identity-contract`, or reaches the
+  backend without traversing the edge enrichment
+- **THEN** the edge SHALL strip any client-supplied value before the trusted stage emits
+  the authoritative one, and a request that never traversed the edge SHALL lack the
+  header and be rejected by the backend
