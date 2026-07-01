@@ -43,3 +43,14 @@ COPY --from=build /app/target/release/reconciler /usr/local/bin/reconciler
 USER 10001
 EXPOSE 9000
 CMD ["reconciler"]
+
+# --- membership-sync (routing membership NOTIFY -> Profile projection; metrics 9000) ---
+FROM debian:bookworm-slim AS membership-sync
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 app
+COPY --from=build /app/target/release/membership-sync /usr/local/bin/membership-sync
+USER 10001
+EXPOSE 9000
+CMD ["membership-sync"]

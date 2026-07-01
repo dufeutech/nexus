@@ -33,6 +33,11 @@ images:
     repository: REGISTRY/identity-reconciler
     tag: ""
     pullPolicy: IfNotPresent
+  #   docker build --target membership-sync -t REGISTRY/identity-membership-sync:0.1.0 ../../identity-rs
+  membershipSync:
+    repository: REGISTRY/identity-membership-sync
+    tag: ""
+    pullPolicy: IfNotPresent
   # Stock upstream edge proxy. PIN to a concrete patch version in production.
   envoy:
     repository: envoyproxy/envoy
@@ -165,6 +170,25 @@ reconciler:
     limits: { cpu: "500m", memory: "128Mi" }
 
 # -------------------------------------------------------------------------- #
+# Membership-sync — projects routing-plane membership changes into the identity
+# Profile store. LISTENs on the routing `routing_membership_changes` NOTIFY channel
+# (real-time) and runs a periodic backstop that re-derives every subject's
+# memberships from the routing source of record (heals a missed signal; backfills
+# on first run). Needs the read-only routing connection in `routingPg:` below.
+# -------------------------------------------------------------------------- #
+membershipSync:
+  # Set false to skip the worker (and its required routingPg connection) — e.g. if
+  # memberships are projected out-of-band. Default true: live authz needs it.
+  enabled: true
+  replicas: 1                   # singleton; idempotent but avoids redundant writes
+  backstopIntervalSeconds: 600
+  logFormat: "json"
+  logLevel: "INFO"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "128Mi" }
+
+# -------------------------------------------------------------------------- #
 # Postgres — the single Durable State Store AND change feed (RFC §3.5 + C4 via a
 # seq-cursor feed over LISTEN/NOTIFY). EXTERNAL by design: this chart does not run
 # a database. Point it at a managed service or an HA operator cluster. The app
@@ -188,6 +212,21 @@ postgres:
   # ENCRYPTION IN TRANSIT: append `?sslmode=verify-full` in production (encrypt +
   # verify the server cert; profile rows are PII). `require` only encrypts.
   url: ""                       # e.g. postgres://user:pass@host:5432/identitydb?sslmode=verify-full
+
+# -------------------------------------------------------------------------- #
+# Routing-plane membership store — a READ-ONLY connection the membership-sync
+# worker holds to the ROUTING database (a SEPARATE database from `postgres:` above
+# in production). It only LISTENs on `routing_membership_changes` and SELECTs
+# routing.memberships — grant the credential least privilege (SELECT + LISTEN, no
+# write). Like the identity store, this MUST be a DIRECT/session URL (a
+# transaction-mode pooler swallows LISTEN). Provide via existingSecret (preferred)
+# or an inline URL the chart wraps in a managed Secret.
+# -------------------------------------------------------------------------- #
+routingPg:
+  existingSecret: ""            # Secret name; key below
+  existingSecretKey: "url"
+  # Inline fallback (discouraged). Read-only routing DB URL.
+  url: ""                       # e.g. postgres://ro_user:pass@routing-host:5432/routingdb?sslmode=verify-full
 
 # -------------------------------------------------------------------------- #
 # Observability — emit a ServiceMonitor per component if you run the Prometheus

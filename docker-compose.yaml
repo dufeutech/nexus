@@ -114,6 +114,26 @@ services:
       postgres:
         condition: service_healthy
 
+  # Projects routing-plane membership changes into the identity Profile store: it
+  # LISTENs on the routing `routing_membership_changes` NOTIFY channel, re-reads the
+  # source of record, and read-merge-writes Profile.memberships (the sidecar then
+  # refreshes via the identity change feed). In this lab both planes share one
+  # Postgres, so ROUTING_PG_RO_URL points at the same server; in prod it is a
+  # separate, read-only routing connection.
+  membership-sync:
+    build:
+      context: ./identity-rs
+      target: membership-sync
+    container_name: zitadel-lab-membership-sync
+    restart: unless-stopped
+    environment:
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      ROUTING_PG_RO_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      MEMBERSHIP_BACKSTOP_INTERVAL: "30"   # ~600 in prod; short here to observe
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # --- edge path: Envoy (tenant routing -> jwt_authn -> enrichment) -> pools --
   # Backend pools are a SMALL, FINITE set (RFC C15 / decision 13). The routing
   # plane selects one via x-route-pool; the data plane forwards. In the lab the

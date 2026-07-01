@@ -4,6 +4,9 @@ Components:
   - edge        : Envoy + identity sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
   - sync-worker : {{ .Values.syncWorker.replicas }} replica (single webhook owner)
   - reconciler  : {{ .Values.reconciler.replicas }} replica, interval {{ .Values.reconciler.intervalSeconds }}s
+{{- if .Values.membershipSync.enabled }}
+  - membership-sync : {{ .Values.membershipSync.replicas }} replica — projects routing memberships into Profile.memberships (LISTEN routing_membership_changes + backstop {{ .Values.membershipSync.backstopIntervalSeconds }}s). Reads the routing DB read-only via Secret {{ include "identity-plane.routingPgSecretName" . }} (key {{ include "identity-plane.routingPgSecretKey" . }}).
+{{- end }}
   - postgres    : external (Secret {{ include "identity-plane.pgSecretName" . }}, key {{ include "identity-plane.pgSecretKey" . }}) — operated outside this chart
 
 Edge entry point:
@@ -29,5 +32,11 @@ External dependencies (operated OUTSIDE this chart): see deploy/README.md
   - PostgreSQL (identity store + LISTEN/NOTIFY change feed on channel
     `identity_changes`; PROFILE_PG_URL must be a direct/session connection, not a
     txn-mode pooler; the app creates the `identity` schema. No replica set needed.)
+{{- if .Values.membershipSync.enabled }}
+  - The ROUTING plane's PostgreSQL (SEPARATE database), reached READ-ONLY by
+    membership-sync via ROUTING_PG_RO_URL for LISTEN `routing_membership_changes` +
+    SELECT `routing.memberships`. Grant least privilege (SELECT + LISTEN, no write);
+    it MUST be a direct/session connection (a txn-mode pooler swallows LISTEN).
+{{- end }}
   - ZITADEL (the IdP) + its database; re-verify event + claim contracts (RFC §6.6)
   - The protected backend the edge forwards to (backend.host/port)

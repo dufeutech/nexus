@@ -60,12 +60,15 @@
 
 ## 5. Wiring & config
 
-- [ ] 5.1 Add the identity plane's read-only routing DB input (env var, e.g.
-  `ROUTING_PG_RO_URL`) + the new worker to docker-compose and the identity-plane Helm chart
-  (deployment, values, secret ref). Least-privilege: `SELECT` on `memberships` + `LISTEN`,
-  no write grant.
-- [ ] 5.2 Document the new cross-plane connection + channel in the deploy README /
-  identity-plane NOTES.
+- [x] 5.1 Wired `ROUTING_PG_RO_URL` + the worker everywhere: Dockerfile `membership-sync`
+  stage; docker-compose `membership-sync` service; identity-plane Helm — `membership-sync.yaml`
+  (deployment+service, gated on `membershipSync.enabled`), `secret-routing-ro.yaml`, `routingPg`
+  helpers, values (`images.membershipSync`, `membershipSync`, `routingPg`), ServiceMonitor
+  entry. `helm lint`+`template` clean; toggle verified both ways (disabled → 0 objects, no
+  routingPg required).
+- [x] 5.2 Documented the cross-plane read-only connection + `routing_membership_changes`
+  channel in deploy/README.md (new subsection) + identity-plane NOTES.txt; umbrella
+  values.yaml points identity-plane `routingPg` at the routing subchart's pg Secret.
 
 ## 6. Verify
 

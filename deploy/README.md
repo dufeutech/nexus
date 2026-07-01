@@ -207,6 +207,27 @@ connection to the primary (never a transaction-mode pooler), and the identity
 role needs `CREATE` so the app can run `CREATE SCHEMA IF NOT EXISTS identity` on
 startup. No replica set is required.)
 
+### Cross-plane: membership-sync reads the routing store (read-only)
+
+The identity plane's **membership-sync** worker is the one component that reaches
+**across** planes: it holds a **read-only** connection to the ROUTING database
+(`ROUTING_PG_RO_URL`) to `LISTEN` on channel **`routing_membership_changes`** and
+`SELECT routing.memberships`, projecting them into `Profile.memberships` (which the
+sidecar resolves the acting workspace against). Notes:
+
+- **Direction is one-way and least-privilege.** The identity plane only READS
+  routing; the routing store stays the single writer/source of record. Grant the
+  credential `SELECT` on `routing.memberships` + `LISTEN` only — no write, no other
+  tables. Routing never writes identity profiles.
+- **Same pooler caveat.** `ROUTING_PG_RO_URL` must be a direct/session connection
+  (a txn-mode pooler swallows `LISTEN`). In production this is a **separate
+  database** from `PROFILE_PG_URL`; in the dev compose both collapse onto one server.
+- **Best-effort + backstop.** A dropped `routing_membership_changes` NOTIFY is not a
+  correctness problem: a periodic backstop (`MEMBERSHIP_BACKSTOP_INTERVAL`) re-derives
+  every subject's memberships from the source of record (and backfills on first run).
+- Wire it in Helm via `routingPg.existingSecret`/`routingPg.url` (identity-plane
+  chart), or set `membershipSync.enabled: false` to skip the worker entirely.
+
 ## The non-negotiables still apply
 
 When you add a trusted header, add it to the C3 strip list in **every** edge
