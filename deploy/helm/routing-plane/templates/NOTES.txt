@@ -29,8 +29,8 @@ Register routing config via the control plane (administrative boundary — NOT p
        -d '{"domain":"app.acme.example.com","tenant_id":"acme","verified":true}'
 
 Smoke test (from inside the cluster, once a verified domain is registered):
-  curl -s -H 'Host: app.acme.example.com' http://{{ include "routing-plane.fullname" . }}-edge.{{ .Release.Namespace }}.svc/ | grep -i '^x-tenant'
-  # expect x-tenant-id / x-tenant-plan / x-route-pool injected, routed to its pool
+  curl -s -H 'Host: app.acme.example.com' http://{{ include "routing-plane.fullname" . }}-edge.{{ .Release.Namespace }}.svc/ | grep -i '^x-workspace'
+  # expect x-workspace-id / x-workspace-plan / x-route-pool injected, routed to its pool
 
 For the tenant-first composition WITH the identity plane (routing -> auth ->
 enrichment on one edge), use the ../edge-platform umbrella chart instead.

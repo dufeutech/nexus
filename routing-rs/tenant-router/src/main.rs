@@ -7,7 +7,7 @@
 //!
 //! Surface over one invalidation-updated decision cache:
 //!   - `ext_proc` gRPC (hot path): read the request host, normalize it, resolve the
-//!     owning tenant + config, and inject trusted `x-tenant-*` + `x-route-pool`
+//!     owning workspace + config, and inject trusted `x-workspace-*` + `x-route-pool`
 //!     (C14/C15) which the edge data plane uses to forward. An unknown/unverified
 //!     host is REJECTED at the edge (immediate 404) before any backend is
 //!     selected — never defaulted to a tenant (C18).
@@ -350,15 +350,16 @@ fn header(key: &str, value: &str) -> HeaderValueOption {
 /// `x-route-pool`; the backend trusts every header we set here. Client-supplied
 /// copies were stripped before this filter ran (C3-equivalent).
 //
-// NOTE: the emitted header *names* are still the legacy `x-tenant-*` wire contract.
-// Renaming them to `x-workspace-*` is the coordinated edge cut-over (tasks 4.1/4.2),
-// done after the identity plane resolves the acting workspace — kept stable here so
-// the running edge/backends aren't broken by this internal rename.
+// The emitted names are the `x-workspace-*` wire contract (task 4.1 cut-over).
+// `x-workspace-id` is the domain's RESOLVED workspace; the identity sidecar runs
+// after this filter and either re-asserts it (authoritative, member) or strips it
+// (non-member), so the value the backend sees is membership-authorized. The C3 edge
+// strip removes any client-forged copy before this filter sets the trusted one.
 fn route_response(d: &RoutingDecision, extra: &[(&'static str, String)]) -> ProcessingResponse {
     let mut set = vec![
-        header("x-tenant-id", &d.workspace_id),
-        header("x-tenant-plan", &d.plan),
-        header("x-tenant-features", &d.features.join(",")),
+        header("x-workspace-id", &d.workspace_id),
+        header("x-workspace-plan", &d.plan),
+        header("x-workspace-features", &d.features.join(",")),
         header("x-route-pool", d.pool.as_str()),
         header("x-routed-by", "tenant-router"),
     ];

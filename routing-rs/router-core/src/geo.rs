@@ -14,7 +14,7 @@
 //! as untrusted-shaped text (it transited the network), so a field that does not
 //! pass its rule is simply dropped, never forwarded raw. The output header names
 //! are the only trusted ones; client-supplied copies MUST be stripped at the edge
-//! before resolution runs (RFC C3), exactly as for `x-tenant-*` / `x-user-*`.
+//! before resolution runs (RFC C3), exactly as for `x-workspace-*` / `x-user-*`.
 
 /// Free-text geo fields are capped to a sane length so a hostile/garbage upstream
 /// value cannot bloat the forwarded header set.

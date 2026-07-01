@@ -4,8 +4,8 @@ ROUTING-ONLY Envoy edge config, parameterized from values. Mirrors
 router cluster driven by config, and the router reached over loopback (per-pod).
 
 Filter order is load-bearing (RFC C14/C17/C18):
-  header_mutation (strip client x-tenant-* and x-route-pool, RFC C3)
-    -> tenant-router ext_proc (host -> tenant -> x-route-pool; reject unknown, C18)
+  header_mutation (strip client x-workspace-* and x-route-pool, RFC C3)
+    -> tenant-router ext_proc (host -> workspace -> x-route-pool; reject unknown, C18)
     -> router (forward to the pool the decision chose)
 
 This Envoy has NO jwt_authn and NO identity ext_proc. For the tenant-first
@@ -73,7 +73,7 @@ data:
                               authority: "%REQ(:AUTHORITY)%"
                               upstream_host: "%UPSTREAM_HOST%"
                               route_pool: "%REQ(X-ROUTE-POOL)%"
-                              tenant_id: "%REQ(X-TENANT-ID)%"
+                              workspace_id: "%REQ(X-WORKSPACE-ID)%"
                               user_agent: "%REQ(USER-AGENT)%"
                               request_id: "%REQ(X-REQUEST-ID)%"
                     route_config:
@@ -99,9 +99,9 @@ data:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                           mutations:
                             request_mutations:
-                              - remove: "x-tenant-id"
-                              - remove: "x-tenant-plan"
-                              - remove: "x-tenant-features"
+                              - remove: "x-workspace-id"
+                              - remove: "x-workspace-plan"
+                              - remove: "x-workspace-features"
                               - remove: "x-route-pool"
                               - remove: "x-routed-by"
                               # Edge geo (x-geo-*) normalized + injected by
@@ -137,6 +137,12 @@ data:
                               - remove: "x-user-entitlements"
                               - remove: "x-user-suspended"
                               - remove: "x-user-enriched-by"
+                              # Workspace-scoped acting identity (nexus-owned tenancy);
+                              # authored by the identity sidecar in the full stack.
+                              # Stripped here too (defense-in-depth) so a client copy
+                              # never survives even if this plane is exposed standalone.
+                              - remove: "x-user-type"
+                              - remove: "x-user-role"
                               - remove: "x-auth-anonymous"
                               - remove: "x-auth-method"
                               - remove: "x-auth-required"

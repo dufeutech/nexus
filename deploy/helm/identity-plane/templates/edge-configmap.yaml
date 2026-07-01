@@ -107,6 +107,15 @@ data:
                               - remove: "x-user-entitlements"
                               - remove: "x-user-suspended"
                               - remove: "x-user-enriched-by"
+                              # Workspace-scoped acting identity (nexus-owned tenancy):
+                              # authored authoritatively by the identity sidecar after a
+                              # live membership check — strip client copies so a client
+                              # cannot self-assert an acting workspace/type/role (C3).
+                              # (This plane has no tenant-router, so the acting workspace
+                              # is only present when an upstream stage sets it.)
+                              - remove: "x-workspace-id"
+                              - remove: "x-user-type"
+                              - remove: "x-user-role"
                               # Trusted auth-state from the identity sidecar; strip
                               # client copies so is-anonymous is unforgeable (C3).
                               - remove: "x-auth-anonymous"

@@ -117,11 +117,35 @@
 
 ## 4. Header contract & edge
 
-- [ ] 4.1 Retire `x-tenant-*`; add `x-workspace-id`/`x-user-type`/`x-user-role` to the
+- [x] 4.1 Retire `x-tenant-*`; add `x-workspace-id`/`x-user-type`/`x-user-role` to the
   emitted set and to the C3 strip family (+ treat `x-requested-workspace` as a hint).
-  Update every Envoy edge/compose/Helm config (strip lists + any `x-tenant-*` refs).
-- [ ] 4.2 Reconcile with the shipped auth-gate wiring (the gate keys on
-  `x-auth-required`; ensure the rename/strip changes don't regress it).
+  DONE: tenant-router `route_response` now emits `x-workspace-id`/`x-workspace-plan`/
+  `x-workspace-features` (was `x-tenant-*`); the identity sidecar already authors
+  `x-user-type`/`x-user-role` (3.2). Every Envoy C3 strip list updated across all 5
+  configs (`edge/envoy.yaml`, `deploy/compose/envoy/envoy.yaml`, and the routing-plane
+  / edge-platform / identity-plane Helm `edge-configmap.yaml`s): renamed the three
+  `x-tenant-*` strips → `x-workspace-*` and ADDED `x-user-type`/`x-user-role` (and
+  `x-workspace-id` to the identity-plane list). `x-requested-workspace` is deliberately
+  NOT stripped — it stays an allowed non-authoritative hint (v1 consumes nothing; the
+  authoritative `x-workspace-id` is what's stripped+re-authored). Access-log keys
+  (`tenant_id`→`workspace_id`, sourcing `X-WORKSPACE-ID`), filter-order comments, and
+  the two NOTES.txt smoke-test greps updated; `x-user-org` retired in the
+  identity-plane NOTES.
+  - **Header handoff (the resolved-`x-workspace-id` collision, by design)**: filter
+    order is C3-strip → tenant-router → jwt_authn → identity-sidecar → router. The
+    router PROPOSES `x-workspace-id` (the domain's resolved workspace); the sidecar,
+    running after, OVERWRITES it authoritatively for a member or STRIPS it for a
+    non-member — so the value the backend sees is always membership-authorized. The
+    sidecar's `x-tenant-id` fallback (3.2) is kept for mid-rollout compat.
+- [x] 4.2 Reconcile with the shipped auth-gate wiring: `x-auth-required` emit
+  (tenant-router), strip (every C3 list), and jwt_authn branch are UNTOUCHED — the
+  rename only moved `x-tenant-*` and the additions are new strip entries, so the N4
+  gate is preserved. Verified: routing-rs clippy `--all-targets` 0-deny + 43 tests;
+  `helm lint` + `helm template` clean on all three charts (routing-plane,
+  identity-plane, edge-platform umbrella — the only template failures were
+  pre-existing required-value guards: postgres.url / patSecret / control-auth token);
+  both plain-YAML Envoy configs parse. Caught+fixed a Go-template pitfall: `x-user-*/`
+  inside the umbrella's `{{/* */}}` comment closed it early.
 
 ## 5. Migration
 

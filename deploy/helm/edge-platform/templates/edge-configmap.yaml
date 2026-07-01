@@ -4,10 +4,10 @@ values: ZITADEL config + sidecar cache from identity-plane; pools from
 routing-plane. Mirrors the verified ../../kind/full-stack/manifests/edge.yaml.
 
 Filter order is load-bearing:
-  header_mutation  strip client x-tenant-* and x-user-*           (C3)
-    tenant-router ext_proc   host -> tenant -> x-route-pool; reject unknown (C18)
+  header_mutation  strip client x-workspace-* and x-user-*        (C3)
+    tenant-router ext_proc   host -> workspace -> x-route-pool; reject unknown (C18)
     jwt_authn                verify the bearer credential                    (C1)
-    identity ext_proc        inject x-user-* from the verified subject       (C2)
+    identity ext_proc        inject x-user-* and x-workspace-id from verified sub (C2)
     router                   forward to the pool the decision chose
 */ -}}
 {{- $iv := index .Values "identity-plane" -}}
@@ -74,7 +74,7 @@ data:
                               authority: "%REQ(:AUTHORITY)%"
                               upstream_host: "%UPSTREAM_HOST%"
                               route_pool: "%REQ(X-ROUTE-POOL)%"
-                              tenant_id: "%REQ(X-TENANT-ID)%"
+                              workspace_id: "%REQ(X-WORKSPACE-ID)%"
                               auth_required: "%REQ(X-AUTH-REQUIRED)%"
                               user_agent: "%REQ(USER-AGENT)%"
                               request_id: "%REQ(X-REQUEST-ID)%"
@@ -109,9 +109,9 @@ data:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                           mutations:
                             request_mutations:
-                              - remove: "x-tenant-id"
-                              - remove: "x-tenant-plan"
-                              - remove: "x-tenant-features"
+                              - remove: "x-workspace-id"
+                              - remove: "x-workspace-plan"
+                              - remove: "x-workspace-features"
                               - remove: "x-route-pool"
                               - remove: "x-routed-by"
                               # Edge geo (x-geo-*) normalized + injected by
@@ -141,6 +141,12 @@ data:
                               - remove: "x-user-entitlements"
                               - remove: "x-user-suspended"
                               - remove: "x-user-enriched-by"
+                              # Workspace-scoped acting identity (nexus-owned tenancy):
+                              # authored authoritatively by the identity sidecar after a
+                              # live membership check — strip client copies (C3).
+                              # `x-requested-workspace` stays an allowed non-auth hint.
+                              - remove: "x-user-type"
+                              - remove: "x-user-role"
                               # Trusted auth-state from the identity sidecar; strip
                               # client copies so is-anonymous is unforgeable (C3).
                               - remove: "x-auth-anonymous"

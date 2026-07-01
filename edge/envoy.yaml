@@ -1,9 +1,9 @@
 # Edge data plane for BOTH planes (lab). Composition is tenant-first (RFC C17):
 # Filter order is load-bearing:
-#   header_mutation (strip client x-tenant-*/x-user-*, RFC C3)
-#   -> ext_proc:tenant-router (host -> tenant -> x-route-pool, reject unknown C18)
+#   header_mutation (strip client x-workspace-*/x-user-*, RFC C3)
+#   -> ext_proc:tenant-router (host -> workspace -> x-route-pool, reject unknown C18)
 #   -> jwt_authn (verify + write claims to metadata)
-#   -> ext_proc:identity (sidecar reads verified sub, injects x-user-*)
+#   -> ext_proc:identity (sidecar reads verified sub, injects x-user-*/x-workspace-id)
 #   -> router (forwards to the pool the routing decision selected).
 # Each plane is an independent resolution hook; the data plane enacts the result
 # (it forwards — the planes never proxy). Tenant resolution runs first so that
@@ -53,7 +53,7 @@ static_resources:
                           authority: "%REQ(:AUTHORITY)%"
                           upstream_host: "%UPSTREAM_HOST%"
                           route_pool: "%REQ(X-ROUTE-POOL)%"
-                          tenant_id: "%REQ(X-TENANT-ID)%"
+                          workspace_id: "%REQ(X-WORKSPACE-ID)%"
                           auth_required: "%REQ(X-AUTH-REQUIRED)%"
                           user_agent: "%REQ(USER-AGENT)%"
                           request_id: "%REQ(X-REQUEST-ID)%"
@@ -131,9 +131,9 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                       mutations:
                         request_mutations:
-                          - remove: "x-tenant-id"
-                          - remove: "x-tenant-plan"
-                          - remove: "x-tenant-features"
+                          - remove: "x-workspace-id"
+                          - remove: "x-workspace-plan"
+                          - remove: "x-workspace-features"
                           - remove: "x-route-pool"
                           - remove: "x-routed-by"
                           # Edge geo (x-geo-*) is normalized + injected by
@@ -165,6 +165,14 @@ static_resources:
                           - remove: "x-user-entitlements"
                           - remove: "x-user-suspended"
                           - remove: "x-user-enriched-by"
+                          # Workspace-scoped acting identity (nexus-owned tenancy):
+                          # authored authoritatively by the identity sidecar after a
+                          # live membership check. Strip client copies so a client
+                          # cannot self-assert an acting workspace/type/role (C3).
+                          # `x-requested-workspace` is deliberately NOT stripped — it
+                          # is an allowed non-authoritative hint only.
+                          - remove: "x-user-type"
+                          - remove: "x-user-role"
                           # Trusted auth-state set by the identity sidecar; strip
                           # client copies so is-anonymous is unforgeable (C3).
                           - remove: "x-auth-anonymous"
@@ -175,8 +183,8 @@ static_resources:
                           # public (C3) — tenant-router runs AFTER this filter, so
                           # its emit is authoritative.
                           - remove: "x-auth-required"
-                  # TENANT-FIRST (RFC C17): resolve host -> tenant -> pool before
-                  # auth/enrichment. Sets x-tenant-* + x-route-pool, or rejects an
+                  # TENANT-FIRST (RFC C17): resolve host -> workspace -> pool before
+                  # auth/enrichment. Sets x-workspace-* + x-route-pool, or rejects an
                   # unknown/unverified host with an immediate 404 (C18). A distinct
                   # filter name keeps it independent of the identity ext_proc, so
                   # one plane can fail without the other (failure_mode_allow:false

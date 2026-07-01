@@ -35,8 +35,8 @@ identity-plane:
 
 # -------------------------------------------------------------------------- #
 # The combined tenant-first edge (RFC C17). Filter order:
-#   strip client x-tenant-* / x-user-*        (C3)
-#   -> tenant-router ext_proc  (host -> tenant -> x-route-pool; reject unknown C18)
+#   strip client x-workspace-* / x-user-*     (C3)
+#   -> tenant-router ext_proc  (host -> workspace -> x-route-pool; reject unknown C18)
 #   -> jwt_authn               (verify the bearer credential against ZITADEL, C1)
 #   -> identity ext_proc       (inject x-user-* from the verified subject, C2)
 #   -> router                  (forward to the pool the routing decision chose)

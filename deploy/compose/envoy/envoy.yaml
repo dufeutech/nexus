@@ -5,10 +5,10 @@
 # ext_proc clusters below dial them by their compose service DNS names.
 #
 # Filter order is load-bearing (see ../../INFO.md §2):
-#   header_mutation  strip client x-tenant-* / x-user-* / x-geo-* / ...   (C3)
-#     tenant-router ext_proc   host -> tenant -> x-route-pool; reject unknown (C18)
+#   header_mutation  strip client x-workspace-* / x-user-* / x-geo-* / ...  (C3)
+#     tenant-router ext_proc   host -> workspace -> x-route-pool; reject unknown (C18)
 #     jwt_authn                verify the bearer credential vs ZITADEL JWKS  (C1)
-#     identity ext_proc        inject x-user-* from the verified subject     (C2)
+#     identity ext_proc        inject x-user-*/x-workspace-id from verified sub (C2)
 #     router                   forward to the pool the routing decision chose
 #
 # EXTERNAL upstreams you MUST point at your own infrastructure (this project does
@@ -58,7 +58,7 @@ static_resources:
                           authority: "%REQ(:AUTHORITY)%"
                           upstream_host: "%UPSTREAM_HOST%"
                           route_pool: "%REQ(X-ROUTE-POOL)%"
-                          tenant_id: "%REQ(X-TENANT-ID)%"
+                          workspace_id: "%REQ(X-WORKSPACE-ID)%"
                           auth_required: "%REQ(X-AUTH-REQUIRED)%"
                           user_agent: "%REQ(USER-AGENT)%"
                           request_id: "%REQ(X-REQUEST-ID)%"
@@ -98,9 +98,9 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                       mutations:
                         request_mutations:
-                          - remove: "x-tenant-id"
-                          - remove: "x-tenant-plan"
-                          - remove: "x-tenant-features"
+                          - remove: "x-workspace-id"
+                          - remove: "x-workspace-plan"
+                          - remove: "x-workspace-features"
                           - remove: "x-route-pool"
                           - remove: "x-routed-by"
                           - remove: "x-geo-source"
@@ -126,6 +126,12 @@ static_resources:
                           - remove: "x-user-entitlements"
                           - remove: "x-user-suspended"
                           - remove: "x-user-enriched-by"
+                          # Workspace-scoped acting identity (nexus-owned tenancy):
+                          # authored authoritatively by the identity sidecar after a
+                          # live membership check — strip client copies (C3).
+                          # `x-requested-workspace` stays an allowed non-auth hint.
+                          - remove: "x-user-type"
+                          - remove: "x-user-role"
                           - remove: "x-auth-anonymous"
                           - remove: "x-auth-method"
                           # The per-route auth gate (RFC N4): the tenant-router
