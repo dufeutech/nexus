@@ -951,6 +951,11 @@ async fn upsert_membership(
     if let Err(e) = s.store.upsert_membership(&m).await {
         return internal(e);
     }
+    // Best-effort signal to the identity plane's membership-sync worker. A failed
+    // notify must NOT fail the committed write — the reconcile backstop heals it.
+    if let Err(e) = s.store.notify_membership_change(&m.user_sub).await {
+        warn!(error = %e, user = %m.user_sub, "membership-change notify failed; backstop will heal");
+    }
     counter!("control_mutations_total", "op" => "upsert_membership").increment(1);
     info!(workspace = %workspace_id, user = %m.user_sub, member_type = %m.member_type, "membership granted");
     (
@@ -966,6 +971,11 @@ async fn delete_membership(
 ) -> Response {
     if let Err(e) = s.store.delete_membership(&user_sub, &workspace_id).await {
         return internal(e);
+    }
+    // Best-effort signal (see upsert_membership) — the consumer re-reads the
+    // subject's remaining memberships, so a revoke propagates without the workspace.
+    if let Err(e) = s.store.notify_membership_change(&user_sub).await {
+        warn!(error = %e, user = %user_sub, "membership-change notify failed; backstop will heal");
     }
     counter!("control_mutations_total", "op" => "delete_membership").increment(1);
     (StatusCode::OK, Json(json!({ "result": "ok", "workspace_id": workspace_id, "user_sub": user_sub })))

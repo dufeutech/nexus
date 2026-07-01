@@ -84,3 +84,21 @@ pub trait MembershipResolver: Send + Sync {
         workspace_id: &str,
     ) -> Result<Option<ResolvedMembership>, BoxError>;
 }
+
+/// Read the **source-of-record** memberships that back the `Profile.memberships`
+/// projection. Implemented by a read-only adapter over the routing plane's
+/// membership store; consumed by the membership-sync worker (real-time path) and
+/// its reconcile backstop. Read-only by contract — the routing store remains the
+/// single writer/source of record; the identity plane only projects it.
+#[async_trait]
+pub trait SourceMembershipReader: Send + Sync {
+    /// The subject's currently-authorized memberships (the fail-closed projection
+    /// set — an adapter MUST exclude non-active rows). An empty vec means "member of
+    /// nothing" (e.g. every membership revoked), which clears the projection.
+    async fn memberships_for(&self, sub: &str) -> Result<Vec<Membership>, BoxError>;
+
+    /// Every subject that currently holds at least one membership. The backstop's
+    /// enumeration input so it can converge/backfill all projections (paired with a
+    /// scan of profiles that still carry stale memberships, to heal revoke-to-zero).
+    async fn all_member_subjects(&self) -> Result<Vec<String>, BoxError>;
+}

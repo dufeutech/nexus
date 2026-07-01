@@ -74,6 +74,36 @@ used when postgres.existingSecret is supplied.
 {{- end -}}
 
 {{/*
+Routing-plane membership store — a READ-ONLY connection the membership-sync worker
+holds to LISTEN on `routing_membership_changes` and SELECT routing.memberships. A
+SEPARATE database from PROFILE_PG in production; least privilege (SELECT + LISTEN).
+Same existingSecret-vs-inline pattern as the pg Secret above.
+*/}}
+{{- define "identity-plane.routingPgSecretName" -}}
+{{- if .Values.routingPg.existingSecret -}}
+{{- .Values.routingPg.existingSecret -}}
+{{- else -}}
+{{- printf "%s-routing-ro" (include "identity-plane.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.routingPgSecretKey" -}}
+{{- if .Values.routingPg.existingSecret -}}
+{{- .Values.routingPg.existingSecretKey -}}
+{{- else -}}
+url
+{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.ownsRoutingPgSecret" -}}
+{{- if .Values.routingPg.existingSecret -}}false{{- else -}}true{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.routingPgUrl" -}}
+{{- required "routingPg.url is required (read-only routing DB URL) when routingPg.existingSecret is not set" .Values.routingPg.url -}}
+{{- end -}}
+
+{{/*
 Issuer authority (host[:port]) — used as the JWKS Host header default.
 */}}
 {{- define "identity-plane.jwksHost" -}}

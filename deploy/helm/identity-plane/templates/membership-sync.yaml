@@ -1,0 +1,92 @@
+{{- if .Values.membershipSync.enabled -}}
+{{- $fullName := include "identity-plane.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-membership-sync
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 4 }}
+spec:
+  # Singleton: LISTEN + backstop are idempotent, but one replica avoids redundant
+  # projection writes. Scale via sharding later if the population demands it.
+  replicas: {{ .Values.membershipSync.replicas }}
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity-plane.labels" . | nindent 8 }}
+        {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: membership-sync
+          image: {{ include "identity-plane.image" (dict "repo" .Values.images.membershipSync.repository "tag" .Values.images.membershipSync.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.membershipSync.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Identity store (this plane writes the Profile projection here).
+            - name: PROFILE_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "identity-plane.pgSecretName" . }}
+                  key: {{ include "identity-plane.pgSecretKey" . }}
+            # Read-only routing connection (source of record; LISTEN + SELECT only).
+            - name: ROUTING_PG_RO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "identity-plane.routingPgSecretName" . }}
+                  key: {{ include "identity-plane.routingPgSecretKey" . }}
+            - name: MEMBERSHIP_BACKSTOP_INTERVAL
+              value: {{ .Values.membershipSync.backstopIntervalSeconds | quote }}
+            - name: METRICS_PORT
+              value: "9000"
+            - name: LOG_FORMAT
+              value: {{ .Values.membershipSync.logFormat | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.membershipSync.logLevel | quote }}
+          ports:
+            - { name: metrics, containerPort: 9000 }
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources: {{- toYaml .Values.membershipSync.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-membership-sync
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9000, targetPort: metrics, protocol: TCP }
+{{- end }}

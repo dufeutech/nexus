@@ -35,6 +35,22 @@ spec:
       {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "reconciler") | nindent 6 }}
   endpoints:
     - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
+{{- if .Values.membershipSync.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullName }}-membership-sync
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 6 }}
+  endpoints:
+    - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
+{{- end }}
 ---
 # Edge metrics live on pod ports that are deliberately off the Service (sidecar
 # :9202, Envoy admin :9901), so they are scraped as pod targets.

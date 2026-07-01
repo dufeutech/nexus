@@ -1,0 +1,28 @@
+[package]
+name = "membership-sync"
+edition.workspace = true
+version.workspace = true
+description = "Projects routing-plane membership changes into the identity Profile store"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "membership-sync"
+path = "src/main.rs"
+
+[dependencies]
+identity-core = { path = "../core" }
+store-postgres = { path = "../store-postgres" }
+# PgListener for the routing-plane membership NOTIFY channel.
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
+
+[lints]
+workspace = true

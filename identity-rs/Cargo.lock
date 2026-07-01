@@ -878,6 +878,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1068,6 +1069,20 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest",
+]
+
+[[package]]
+name = "membership-sync"
+version = "0.1.0"
+dependencies = [
+ "identity-core",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "sqlx",
+ "store-postgres",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

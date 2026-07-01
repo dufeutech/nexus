@@ -32,6 +32,12 @@ identity-plane:
     enabled: false        # umbrella owns the combined edge
   # postgres:
   #   existingSecret: identity-pg     # or postgres.url
+  # The membership-sync worker needs a READ-ONLY connection to the routing plane's
+  # DB (LISTEN routing_membership_changes + SELECT routing.memberships). Point it at
+  # the routing subchart's pg Secret (default name <release>-routing-plane-pg), or
+  # set membershipSync.enabled: false to skip it.
+  # routingPg:
+  #   existingSecret: <release>-routing-plane-pg    # or routingPg.url
 
 # -------------------------------------------------------------------------- #
 # The combined tenant-first edge (RFC C17). Filter order:

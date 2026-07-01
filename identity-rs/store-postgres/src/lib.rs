@@ -44,6 +44,9 @@ use identity_core::store::{
 };
 use identity_core::Profile;
 
+mod source_memberships;
+pub use source_memberships::PgSourceMembershipReader;
+
 /// The NOTIFY channel every profile mutation publishes a wakeup on.
 pub const CHANGE_CHANNEL: &str = "identity_changes";
 

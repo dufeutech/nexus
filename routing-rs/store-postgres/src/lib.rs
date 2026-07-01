@@ -30,6 +30,13 @@ use router_core::store::{
 /// The NOTIFY channel the control plane publishes invalidations on.
 pub const INVALIDATION_CHANNEL: &str = "routing_invalidations";
 
+/// The NOTIFY channel the control plane publishes membership changes on. The
+/// identity plane's membership-sync worker LISTENs here to refresh its Profile
+/// projection. Best-effort (like invalidations): the payload is just the affected
+/// `user_sub` — a hint to re-read the source of record, never the authoritative
+/// state — and a missed signal self-heals via the reconcile backstop.
+pub const MEMBERSHIP_CHANNEL: &str = "routing_membership_changes";
+
 #[derive(Clone)]
 pub struct PgRoutingStore {
     pool: PgPool,
@@ -279,6 +286,21 @@ impl PgRoutingStore {
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(INVALIDATION_CHANNEL)
             .bind(domain)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Publish a membership-change signal for a subject on [`MEMBERSHIP_CHANNEL`].
+    /// Called by the control plane after a membership upsert/delete commits. The
+    /// payload carries only `user_sub` (a hint); the identity consumer re-reads the
+    /// source of record to derive the subject's full membership set, so a coalesced
+    /// or lost signal costs latency, never correctness (the reconcile backstop heals
+    /// it). Best-effort by design — never blocks or fails the CRUD write.
+    pub async fn notify_membership_change(&self, user_sub: &str) -> Result<(), BoxError> {
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(MEMBERSHIP_CHANNEL)
+            .bind(user_sub)
             .execute(&self.pool)
             .await?;
         Ok(())

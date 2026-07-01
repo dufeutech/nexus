@@ -21,10 +21,11 @@ use std::env;
 use std::time::Duration;
 
 use futures::StreamExt;
+use identity_core::membership::{MemberType, SourceMembershipReader};
 use identity_core::store::{Change, ProfileStore};
 use identity_core::Profile;
 use sqlx::postgres::PgPoolOptions;
-use store_postgres::PgProfileStore;
+use store_postgres::{PgProfileStore, PgSourceMembershipReader};
 use tokio::time::{sleep, timeout};
 
 /// Connect + clean the shared table, or `None` if the test DB isn't configured.
@@ -65,6 +66,18 @@ macro_rules! skip_if_no_db {
     ($store:ident) => {
         match setup().await {
             Some(s) => s,
+            None => {
+                eprintln!("SKIP: set STORE_PG_TEST_URL to run this integration test");
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! skip_if_no_routing_db {
+    ($reader:ident) => {
+        match setup_routing_memberships().await {
+            Some(r) => r,
             None => {
                 eprintln!("SKIP: set STORE_PG_TEST_URL to run this integration test");
                 return;
@@ -199,6 +212,82 @@ async fn watch_delivers_live_changes_after_open() {
     assert!(matches!(&kinds[0], Change::Upsert(p) if !p.is_suspended));
     assert!(matches!(&kinds[1], Change::Upsert(p) if p.is_suspended), "suspension lands as an upsert");
     assert!(matches!(&kinds[2], Change::Delete(sub) if sub == "live1"));
+}
+
+/// Create a minimal `routing.memberships` table (subset of the routing store's
+/// DDL — the columns the reader selects) and seed it, or `None` if no test DB.
+/// Returns a read-only reader over the same URL.
+async fn setup_routing_memberships() -> Option<PgSourceMembershipReader> {
+    let url = env::var("STORE_PG_TEST_URL").ok()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("aux pool");
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS routing")
+        .execute(&pool)
+        .await
+        .expect("routing schema");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS routing.memberships (\
+             user_sub text, workspace_id text, member_type text, role text, \
+             status text, PRIMARY KEY (user_sub, workspace_id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("memberships table");
+    sqlx::query("TRUNCATE routing.memberships")
+        .execute(&pool)
+        .await
+        .expect("truncate memberships");
+    // u1: an active staff + active customer membership, plus one INACTIVE row that
+    // must be excluded from the projection. u2: one active membership.
+    for (sub, ws, mt, role, status) in [
+        ("u1", "ws-a", "staff", "admin", "active"),
+        ("u1", "ws-b", "customer", "pro", "active"),
+        ("u1", "ws-x", "staff", "owner", "suspended"),
+        ("u2", "ws-c", "customer", "free", "active"),
+    ] {
+        sqlx::query(
+            "INSERT INTO routing.memberships \
+                 (user_sub, workspace_id, member_type, role, status) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(sub)
+        .bind(ws)
+        .bind(mt)
+        .bind(role)
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+    }
+    Some(
+        PgSourceMembershipReader::connect(&url)
+            .await
+            .expect("connect reader"),
+    )
+}
+
+#[tokio::test]
+async fn reader_projects_active_memberships_only() {
+    let reader = skip_if_no_routing_db!(reader);
+    let mut m = reader.memberships_for("u1").await.unwrap();
+    m.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
+    // Only the two ACTIVE rows project; the suspended ws-x is excluded (fail-closed).
+    assert_eq!(m.len(), 2, "inactive membership must be excluded");
+    assert_eq!(m[0].workspace_id, "ws-a");
+    assert_eq!(m[0].member_type, MemberType::Staff);
+    assert_eq!(m[1].workspace_id, "ws-b");
+    assert_eq!(m[1].member_type, MemberType::Customer);
+
+    // all_member_subjects returns the distinct ACTIVE subjects.
+    let mut subs = reader.all_member_subjects().await.unwrap();
+    subs.sort();
+    assert_eq!(subs, vec!["u1".to_owned(), "u2".to_owned()]);
+
+    // A subject with no rows is a member of nothing.
+    assert!(reader.memberships_for("ghost").await.unwrap().is_empty());
 }
 
 #[tokio::test]
