@@ -10,8 +10,9 @@
   `MembershipResolver` port** (v1 adapter = denormalized-into-Profile lookup; adopt
   OpenFGA/SpiceDB later only if nexus needs resource-level/graph authz); ownership +
   workspace store = **Extend the existing Postgres store**. See design.md Decisions.
-- [ ] 0.2 Still open (settle in apply): the non-member policy per surface (reject vs
-  self-signup-as-customer vs anonymous).
+- [x] 0.2 Non-member policy per surface — **derived from the route auth policy** (N4),
+  not a separate knob: anonymous pass-through on public routes, fail-closed 403 on
+  protected routes; self-signup out of scope for the edge. See design.md Decisions.
 
 ## 1. Data model & stores
 
@@ -156,8 +157,9 @@
 
 ## 6. Verify
 
-- [ ] 6.1 Both workspaces: clippy `--all-targets --locked` 0-deny, cargo-deny, tests
-  (identity-rs needs `PROTOC`).
+- [x] 6.1 Both workspaces: clippy `--all-targets --locked` 0-deny, cargo-deny, tests
+  (identity-rs needs `PROTOC`). DONE 2026-07-01: routing-rs clippy+tests+deny green;
+  identity-rs clippy+deny green, 35 tests pass (PROTOC=libprotoc 35.0).
 - [ ] 6.2 Real edge test (extend the Envoy harness): member → authoritative
   `x-workspace-id`+role reaches the backend; non-member → fail-closed; forged
   `x-workspace-id`/`x-user-type` on a non-member request → stripped, no access.

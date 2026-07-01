@@ -106,6 +106,23 @@ nexus-owned and transferable; ZITADEL authenticates only.
   `x-user-id`. `x-requested-workspace` is a client hint (non-authoritative). All are
   edge-stripped from client input (C3) — see the `edge-auth-gate` delta.
 
+### Decision: Non-member policy is derived from the route auth policy, not a separate knob
+- **Status**: approved (settles open question 0.2)
+- **Why**: "reject vs. anonymous vs. self-signup" is the same question the N4 per-route
+  auth policy (`routing.auth_routes`) already answers — adding a second setting would be
+  an overlapping source of truth for the same decision. Bind non-member behavior to the
+  resolved route policy instead:
+  - **Public route** (`auth_required: false`, the N4 default `auth: none`): a non-member
+    (including anonymous) **passes through** with no workspace-scope headers emitted —
+    the website case. One domain can serve a public marketing surface this way.
+  - **Protected route** (`auth_required: true`, or `requires_role`/`requires_entitlement`):
+    a non-member **fails closed (403)**, matching the fail-closed authz this change
+    enforces everywhere else — the app case.
+- The same domain therefore serves "websites and web apps alike," decided per-surface by
+  the auth-routes config the tenant already controls; no new column, one policy resolver.
+- **Self-signup-as-customer is out of scope for the edge** — it is an onboarding/product
+  flow (couples the data plane to membership provisioning/billing), not an edge policy.
+
 ## Migration (BREAKING)
 
 - Rename routing `tenant_id → workspace_id`: the routing store column/queries, the
@@ -119,8 +136,9 @@ nexus-owned and transferable; ZITADEL authenticates only.
 
 ## Open questions (carry into decide/apply)
 
-- Non-member policy on a resolved workspace: hard reject vs. self-signup-as-customer
-  vs. anonymous — per surface (customer app vs staff admin).
+- ~~Non-member policy on a resolved workspace~~ — **RESOLVED** (see the Decision above):
+  derived from the route auth policy (anonymous on public routes, fail-closed on
+  protected routes; self-signup out of scope for the edge).
 - Whether customer surface and staff surface are distinct domains/paths (routing can
   then hint the expected membership type).
 - `AccountMember` roles beyond `owner` (admin/billing) — additive; owner-only in v1.
