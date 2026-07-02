@@ -13,7 +13,12 @@ name: zitadel-lab
 
 services:
   zitadel:
-    image: ghcr.io/zitadel/zitadel:${ZITADEL_VERSION:-latest}
+    # PINNED (not :latest): this file is the reference topology the e2e release
+    # gate runs against, so it must boot deterministically — the 42/42 e2e pass
+    # was verified on this version, and a floating tag broke the CI boot
+    # (v4.15.3 died mid-init where v4.12.2 initializes cleanly). Bump
+    # deliberately, re-running the gate.
+    image: ghcr.io/zitadel/zitadel:${ZITADEL_VERSION:-v4.12.2}
     container_name: zitadel-lab
     restart: unless-stopped
     # start-from-init runs DB setup + instance init, then serves the API.
