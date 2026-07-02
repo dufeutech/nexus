@@ -199,7 +199,12 @@ jobs:
 
       - name: Boot the reference stack
         run: |
-          mkdir -p machinekey
+          # World-writable: ZITADEL (container uid 1000) must WRITE the admin
+          # PAT into this bind mount; the runner user is uid 1001, and a 755
+          # dir makes ZITADEL's first-instance init die mid-flight — after
+          # which start-from-init is not crash-idempotent (AlreadyExists on
+          # every restart) and the stack can never come up.
+          mkdir -p machinekey && chmod 777 machinekey
           # `|| true`: compose's dependency wait can flag a service whose FIRST
           # start attempt fails even though restart: unless-stopped self-heals it
           # (e.g. an IdP init racing its database). The readiness poll below is
