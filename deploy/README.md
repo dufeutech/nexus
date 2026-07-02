@@ -43,6 +43,11 @@ deploy/
 > reference under `../deploy_old/` (Helm with in-chart Mongo/Postgres/Redis, plus
 > the `kind/` and `load/` harnesses).
 
+Before a first production rollout, walk the **[Production deployment
+checklist](#production-deployment-checklist)** below — the repo's CI gate
+certifies the platform's behavior; the checklist covers the operator-owned
+half (real origin enforcement, secrets, pins, stores, monitoring).
+
 ---
 
 ## Build the images
@@ -198,6 +203,71 @@ identity enrichment now require one of:
   chart (backends in another namespace/cluster/network you police). The
   absence of any origin control is a misconfiguration, never a default-safe
   state.
+
+## Production deployment checklist
+
+The platform itself is gated: every spec-asserted security boundary is enforced
+and regression-tested (render guards, unit/integration, and the CI e2e release
+gate against the reference topology). What the gate can NOT certify is *your*
+deployment of it — these are the operator-owned items to walk before the first
+production rollout. Each is a one-line check; the details live in the section
+or values comment referenced.
+
+**Security invariants you must make true (the charts enforce the *choice*, you
+supply the *truth*):**
+
+- [ ] **Origin enforcement is real, not asserted.** If the backends run in the
+      chart's namespace, use `originEnforcement.networkPolicy.*` and verify your
+      CNI enforces NetworkPolicy by probing: a direct-to-backend request bearing
+      forged `x-workspace-id`/`x-identity-contract` must be REFUSED (see
+      `../scripts/tenancy-edge-e2e.sh` §6 for the shape of the probe). If you set
+      `originEnforcement.external=true`, that is an assertion — you own the
+      network control (policy/mesh/firewall) that makes it true, and you should
+      run the same probe against it.
+- [ ] **JWKS over verified TLS.** `zitadel.jwksTls.enabled=true` with a CA the
+      Envoy pod can read (`jwksTls.caFile`) and the right `jwksTls.sni`. Use
+      `jwksPlaintextTrustedPath=true` ONLY for a genuinely in-cluster hop you
+      have assessed — it is an acknowledgment, not a control.
+- [ ] **The consuming backend implements its half of the stamp contract.** Nexus
+      emits `x-identity-contract` and the spec scopes the rule, but rejecting an
+      absent/unknown stamp on identity-enriched routes is the BACKEND's code
+      (deliberately out of this repo's test surface). If you own the backend,
+      that check is its backlog item, not an assumption.
+- [ ] **Control-plane reachability matches C16.** Broker-only NetworkPolicy on
+      :9400 (`controlPlane.networkPolicy.*`), scrapers/kubelet on the ops port
+      :9401 only; `CONTROL_AUTH_TOKEN` from a Secret, never `CONTROL_AUTH_DISABLED`.
+
+**Config hygiene:**
+
+- [ ] **Secrets via `existingSecret` everywhere** (postgres, routingPg, ZITADEL
+      PAT, control token) — inline `*.url`/`value` land in the release manifest.
+- [ ] **Pin every image.** First-party images to a concrete tag you built; the
+      Envoy image to a concrete patch version (`images.envoy.tag` floats on
+      `v1.34-latest` by default — the values file says pin it; do). The lab
+      pins ZITADEL for the same reason (a floating tag broke the CI gate).
+- [ ] **Issuer single-sourced (D7).** `zitadel.issuer` must equal the `iss`
+      ZITADEL mints AND the value the workers derive — drift is silent-but-fatal
+      (sync works, every authenticated request 401s). The lab guards this in
+      `../scripts/helm-guards-test.sh`; re-check it for your values file.
+- [ ] **TLS/ingress values are real**: `edge.ingress.host(s)`, cert-manager
+      issuer annotations, TLS secret names.
+- [ ] **Postgres URLs follow the session-connection rules** — see “External
+      Postgres requirements” below (txn-mode poolers silently swallow the
+      LISTEN feeds); `?sslmode=verify-full` on both stores.
+
+**Operations (never exercised by the repo's gate):**
+
+- [ ] **Store lifecycle is owned**: HA, backups, restore-tested, failover for
+      the routing + identity databases (external by design — see below).
+- [ ] **Monitoring wired**: `metrics.serviceMonitor.*` per chart; alert at least
+      on edge 5xx/`ext_proc` failures, sidecar/router invalidation-feed staleness
+      (`*_last_apply` metrics), and control-plane auth failures.
+- [ ] **Load/scale validated for your traffic** — the gate proves correctness,
+      not capacity. Size sidecar memory to the resident profile population and
+      revisit `edge.replicas`/HPA.
+- [ ] **Upgrades from pre-gate versions scheduled** — the fail-closed guards are
+      BREAKING by design; see the section above for the two choices every
+      existing deployment must make before it renders again.
 
 ## Why no in-app TLS / no bundled stores
 
