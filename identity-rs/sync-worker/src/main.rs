@@ -40,6 +40,30 @@ use identity_core::store::ProfileStore;
 use identity_core::sync::{apply, classify, Apply, Classify};
 use store_postgres::PgProfileStore;
 
+/// Total per-request timeout for the HTTP surface (http-request-resilience):
+/// operator-tunable via `HTTP_REQUEST_TIMEOUT_SECS` with a finite 30s default —
+/// never unbounded.
+fn request_timeout() -> Duration {
+    Duration::from_secs(
+        var("HTTP_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+    )
+}
+
+/// Bound the router with the resilience layers (http-request-resilience): a
+/// request-body cap plus a total per-request timeout answering 408 — the
+/// /webhook endpoint is externally reachable, so a slow/stalled client must not
+/// hold a connection/task. The body cap is deliberately tight: the webhook body
+/// is buffered and HMAC'd before the signature is checked, so bound it rather
+/// than lean on axum's implicit 2 MB (ZITADEL events are well under 64 KiB).
+fn resilient<S>(router: Router<S>, timeout: Duration) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
+}
+
 type HmacSha256 = Hmac<Sha256>;
 const SIG_HEADER: &str = "zitadel-signature";
 /// Replay window for webhook signatures: a signature whose authenticated
@@ -265,22 +289,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("webhook registered; signing key acquired; store ready");
 
     let app = App { store, signing_key: Arc::new(signing_key), metrics: handle };
-    // Per-request timeout (408): the /webhook endpoint is externally reachable, so
-    // a slow/stalled client must not hold a connection/task. Tunable via
-    // HTTP_REQUEST_TIMEOUT_SECS; default 30s.
-    let req_timeout = Duration::from_secs(
-        var("HTTP_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
-    );
-    let router = Router::new()
-        .route("/webhook", post(webhook))
-        .route("/metrics", get(metrics_handler))
-        .route("/healthz", get(healthz))
-        // Cap the (unauthenticated) webhook body: it is buffered and HMAC'd before
-        // the signature is checked, so bound it tightly rather than lean on axum's
-        // implicit 2 MB. ZITADEL webhook events are well under 64 KiB.
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
-        .with_state(app);
+    let router = resilient(
+        Router::new()
+            .route("/webhook", post(webhook))
+            .route("/metrics", get(metrics_handler))
+            .route("/healthz", get(healthz)),
+        request_timeout(),
+    )
+    .with_state(app);
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
     info!("listening on :8080 (/webhook, /metrics, /healthz)");
@@ -365,5 +381,60 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(SIG_HEADER, HeaderValue::from_static("garbage"));
         assert!(!verify_signature(&h, b"{}", "k"));
+    }
+
+    // ---- http-request-resilience -------------------------------------------- //
+
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::util::ServiceExt;
+
+    /// A handler that outlives the timeout must be terminated with 408 rather
+    /// than pinning the task (the real layering the webhook server uses).
+    #[tokio::test]
+    async fn slow_request_is_terminated_with_408() {
+        let app = resilient(
+            Router::new().route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_secs(30)).await;
+                    "too late"
+                }),
+            ),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT, "slow handler must yield 408");
+    }
+
+    /// A request completing within the timeout is unaffected by the layer.
+    #[tokio::test]
+    async fn fast_request_is_unaffected_by_the_timeout() {
+        let app = resilient(
+            Router::new().route("/fast", get(|| async { "ok" })),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/fast").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "fast handler must pass through");
+    }
+
+    /// Unconfigured, the timeout applies a finite safe default — never unbounded.
+    /// (Relies on HTTP_REQUEST_TIMEOUT_SECS being unset in the test environment.)
+    #[test]
+    fn request_timeout_defaults_to_a_finite_30s() {
+        if var("HTTP_REQUEST_TIMEOUT_SECS").is_ok() {
+            return; // SKIP: the environment overrides the default under test
+        }
+        assert_eq!(
+            request_timeout(),
+            Duration::from_secs(30),
+            "default request timeout must be the documented finite 30s",
+        );
     }
 }

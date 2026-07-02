@@ -117,8 +117,11 @@ helm install identity ./helm/identity-plane -n identity --create-namespace \
   --set images.reconciler.repository=REGISTRY/identity-reconciler \
   --set postgres.existingSecret=identity-pg \
   --set zitadel.issuer=https://auth.example.com \
-  --set zitadel.internalUrl=http://zitadel.zitadel.svc.cluster.local:8080 \
+  --set zitadel.internalUrl=https://zitadel.zitadel.svc.cluster.local:8443 \
   --set zitadel.patSecret.existingSecret=zitadel-pat \
+  --set zitadel.jwksTls.enabled=true \
+  --set originEnforcement.networkPolicy.enabled=true \
+  --set originEnforcement.networkPolicy.backendSelector.app=myapp \
   --set backend.host=myapp.default.svc.cluster.local \
   --set edge.ingress.host=api.example.com
 
@@ -148,6 +151,53 @@ chart's `values.yaml` for every tunable and its `NOTES.txt` for post-install
 checks.
 
 ---
+
+## BREAKING — upgrading to the fail-closed edge guards
+
+Two guards now make previously-implicit security choices explicit. A chart
+render that used to succeed will **refuse to render** until each choice is
+made — that refusal is the feature (fail closed), not a packaging bug.
+
+### 1. JWKS trust-anchor integrity (`edge-trust-anchor-integrity`)
+
+Earlier versions fetched the ZITADEL JWKS — the keys ALL token verification
+rests on — over plaintext HTTP, silently. An on-path attacker who substitutes
+that response owns every "verified" identity. Now the stamping edges
+(identity-plane, edge-platform umbrella) require one of:
+
+- **`zitadel.jwksTls.enabled=true`** (preferred): the JWKS is fetched over TLS
+  with server-cert verification (trusted CA + SNI + SAN pin). Point
+  `zitadel.internalUrl` at a TLS port; for a private CA, mount your bundle
+  into the Envoy pod and set `zitadel.jwksTls.caFile`; set
+  `zitadel.jwksTls.sni` when the cert is issued for a name other than the
+  dialed host.
+- **`zitadel.jwksPlaintextTrustedPath=true`**: an explicit assertion that the
+  edge→ZITADEL hop is a trusted path (e.g. genuinely in-cluster and assessed).
+  This is an acknowledgment, not a control — prefer TLS.
+
+Migration for a deployment currently on plaintext JWKS over an untrusted hop:
+enable TLS on ZITADEL's serving endpoint (or front it with a TLS hop you
+trust), then set `zitadel.jwksTls.enabled=true`. Until then, upgrading the
+chart without either value is a hard render error by design.
+
+(On the umbrella, both values live under the `identity-plane:` block.)
+
+### 2. Origin enforcement (`edge-origin-trust`)
+
+The `x-workspace-*`/`x-user-*`/`x-identity-contract` headers are unforgeable
+ONLY because backends accept requests exclusively via the edge — the stamp is
+a drift/version signal, not an authentication boundary. Topologies rendering
+identity enrichment now require one of:
+
+- **`originEnforcement.networkPolicy.enabled=true`** plus
+  `originEnforcement.networkPolicy.backendSelector.<label>=<value>`: ships a
+  NetworkPolicy restricting the backend pods' ingress to the edge pods (same
+  namespace; the CNI must enforce NetworkPolicy — probe it with a
+  direct-to-backend request, which must be refused).
+- **`originEnforcement.external=true`**: the invariant is enforced outside the
+  chart (backends in another namespace/cluster/network you police). The
+  absence of any origin control is a misconfiguration, never a default-safe
+  state.
 
 ## Why no in-app TLS / no bundled stores
 

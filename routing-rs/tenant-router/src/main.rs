@@ -564,25 +564,44 @@ mod api {
     use axum::{Json, Router as AxumRouter};
     use tower_http::timeout::TimeoutLayer;
 
-    pub(crate) fn router(state: AppState) -> AxumRouter {
-        // Per-request timeout (408): the externally-reachable /authorize (CA
-        // on-demand-TLS ask) must not let a slow client pin a task. Tunable via
-        // HTTP_REQUEST_TIMEOUT_SECS; default 30s.
-        let req_timeout = Duration::from_secs(
+    /// Total per-request timeout for the HTTP surfaces (http-request-resilience):
+    /// operator-tunable via `HTTP_REQUEST_TIMEOUT_SECS` with a finite 30s default —
+    /// never unbounded.
+    pub(crate) fn request_timeout() -> Duration {
+        Duration::from_secs(
             var("HTTP_REQUEST_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
-        );
-        AxumRouter::new()
-            .route("/healthz", get(healthz))
-            .route("/resolve/{host}", get(resolve))
-            .route("/authorize", get(authorize))
+        )
+    }
+
+    /// Bound a router with the resilience layers (http-request-resilience): a
+    /// request-body cap plus a total per-request timeout answering 408 — the
+    /// externally-reachable /authorize (CA on-demand-TLS ask) must not let a
+    /// slow client pin a task. The ext_proc gRPC server deliberately does NOT
+    /// pass through here — a per-request deadline would sever its healthy
+    /// long-lived streams (the spec's streaming exemption).
+    pub(crate) fn resilient<S>(router: AxumRouter<S>, timeout: Duration) -> AxumRouter<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        router
             // GET-only API; cap any request body as defense-in-depth (this router
             // otherwise relies on axum's implicit 2 MB extractor limit).
             .layer(DefaultBodyLimit::max(64 * 1024))
-            .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
-            .with_state(state)
+            .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
+    }
+
+    pub(crate) fn router(state: AppState) -> AxumRouter {
+        resilient(
+            AxumRouter::new()
+                .route("/healthz", get(healthz))
+                .route("/resolve/{host}", get(resolve))
+                .route("/authorize", get(authorize)),
+            request_timeout(),
+        )
+        .with_state(state)
     }
 
     #[derive(serde::Deserialize)]
@@ -838,4 +857,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = http.await;
     info!("stopped");
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// http-request-resilience tests: exercise the REAL resilience layering the API
+// server uses. The ext_proc gRPC server is exempt BY CONSTRUCTION (no timeout
+// layer is ever attached to the tonic server above); the streaming-exemption
+// scenario is exercised end-to-end in identity-rs/sidecar.
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+mod tests {
+    use super::{api, sleep};
+    use std::env::var;
+    use std::time::Duration;
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use axum::routing::get;
+    use axum::Router as AxumRouter;
+    use tower::util::ServiceExt;
+
+    /// A handler that outlives the timeout must be terminated with 408 rather
+    /// than pinning the task.
+    #[tokio::test]
+    async fn slow_request_is_terminated_with_408() {
+        let app = api::resilient(
+            AxumRouter::new().route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_secs(30)).await;
+                    "too late"
+                }),
+            ),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT, "slow handler must yield 408");
+    }
+
+    /// A request completing within the timeout is unaffected by the layer.
+    #[tokio::test]
+    async fn fast_request_is_unaffected_by_the_timeout() {
+        let app = api::resilient(
+            AxumRouter::new().route("/fast", get(|| async { "ok" })),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/fast").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "fast handler must pass through");
+    }
+
+    /// Unconfigured, the timeout applies a finite safe default — never unbounded.
+    /// (Relies on HTTP_REQUEST_TIMEOUT_SECS being unset in the test environment.)
+    #[test]
+    fn request_timeout_defaults_to_a_finite_30s() {
+        if var("HTTP_REQUEST_TIMEOUT_SECS").is_ok() {
+            return; // SKIP: the environment overrides the default under test
+        }
+        assert_eq!(
+            api::request_timeout(),
+            Duration::from_secs(30),
+            "default request timeout must be the documented finite 30s",
+        );
+    }
 }

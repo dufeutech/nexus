@@ -16,23 +16,37 @@
 #   4. Non-member fail-closed on a PROTECTED route: with an auth-route requiring a
 #      credential, the anonymous request is rejected (401) before the backend
 #      (the non-member policy derived from the route auth policy, design 0.2).
+#   5. Explicit non-enriched designation (identity-workspace-authz): /public is
+#      served anonymous + UNSTAMPED by design (never rejected for the missing
+#      stamp), and forged scope headers are stripped there too — a request can
+#      never reach the backend with scope headers but no stamp.
+#   6. Fail-closed default: an UNDESIGNATED (enriched) route with enrichment
+#      unavailable is refused, never forwarded stampless as anonymous, while the
+#      designated /public route keeps serving (C10).
+#   7. Origin enforcement (edge-origin-trust): a direct-to-backend request from
+#      off the edge, carrying a forged stamp + scope, fails to CONNECT — the
+#      network path, not any header value, is the anti-forgery control.
 #
 # NOT covered here (requires the full identity stack — a real ZITADEL-minted JWT
 # plus a seeded membership Profile): the POSITIVE member path, where a member's
 # request yields an AUTHORITATIVE `x-workspace-id`+`x-user-type`+`x-user-role`
-# sourced from the live membership check. Procedure for that live run is in the
-# change's design.md (Migration / cut-over) — it layers a bearer token onto the
-# same assertions below and additionally checks the emitted scope equals the
-# resolved workspace. The backend's rejection of an ABSENT stamp (a request that
-# bypassed the edge) is the consuming box's contract, not nexus's to emit.
+# sourced from the live membership check — that is scripts/tenancy-edge-auth-e2e.sh.
+# The backend's rejection of an ABSENT stamp (a request that bypassed the edge)
+# is the consuming box's contract, not nexus's to emit.
 set -u
 
 EDGE=http://localhost:10000
 CP=http://localhost:9400
 HOST=localhost          # seeded + verified -> workspace `acme` (public by default)
 JSON='-H content-type:application/json'
-CPAUTH=""
-[ -n "${CONTROL_AUTH_TOKEN:-}" ] && CPAUTH="-H Authorization:Bearer ${CONTROL_AUTH_TOKEN}"
+# Control-plane admin auth (RFC C16): the lab control plane runs with auth
+# ENABLED (production parity); default to the documented lab token from
+# docker-compose.yaml, override via env for a real deployment.
+CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
+# curl wrapper carrying the control-plane bearer as ONE quoted header arg - an
+# unquoted $CPAUTH-style expansion would word-split "Bearer <token>" into two
+# args and silently send an invalid header (unauthenticated 401s).
+cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
 pass=0; fail=0
 
 # Fetch the whoami echo body for a request carrying the given extra `-H` args.
@@ -45,8 +59,8 @@ ok()   { if [ "$1" = "1" ]; then echo "  PASS  $2"; pass=$((pass+1)); else echo 
 settle() { sleep 2; }   # let an invalidation NOTIFY evict the router's cache
 
 echo "== reset: ensure the site is public (no auth-route) =="
-curl -s $JSON $CPAUTH -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
-  || curl -s $JSON $CPAUTH -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
+cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
 settle
 
 echo "== 1. enriched anonymous request carries the contract stamp, forged copies stripped =="
@@ -80,14 +94,65 @@ echo "== 2. public route: the anonymous request passes through (200) =="
 ok "$([ "$(code)" = "200" ] && echo 1 || echo 0)" "anonymous / is public -> 200"
 
 echo "== 3. protected route: a non-member (anonymous) is fail-closed BEFORE the backend =="
-curl -s $JSON $CPAUTH -X PUT "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1 \
-  || curl -s $JSON $CPAUTH -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1
-settle
-ok "$([ "$(code)" = "401" ] && echo 1 || echo 0)" "anonymous non-member on a protected route -> 401 (fail-closed)"
+cpcurl $JSON -X PUT "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1
+# Poll rather than a fixed settle: the invalidation NOTIFY usually evicts the
+# router's cached decision within a beat, but the assertion must not race it.
+i=0; C=$(code)
+while [ "$C" != "401" ] && [ "$i" -lt 10 ]; do sleep 1; C=$(code); i=$((i+1)); done
+ok "$([ "$C" = "401" ] && echo 1 || echo 0)" "anonymous non-member on a protected route -> 401 (fail-closed, got $C)"
 
 echo "== cleanup =="
-curl -s $JSON $CPAUTH -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
-  || curl -s $JSON $CPAUTH -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
+cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
+settle
+
+echo "== 4. explicitly designated non-enriched route: unstamped + anonymous BY DESIGN =="
+# identity-workspace-authz: /public is on the lab's explicit non-enriched
+# allowlist (identity ext_proc disabled per-route), so it reaches the backend
+# with NO stamp and NO identity attribution and is served as anonymous — NOT
+# rejected for the missing stamp. Forged headers are still stripped; the only
+# x-workspace-id that may appear is the ROUTING plane's re-authored tenant
+# context (the route stays tenant-routed, C10) — never the client's value, and
+# never the identity acting scope (x-user-*), which requires the stamp.
+PBODY=$(curl -s --path-as-is -H "Host: $HOST" -H "x-workspace-id: ws_forged" -H "x-user-type: staff" -H "x-identity-contract: vFORGED" "$EDGE/public")
+PCODE=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -H "Host: $HOST" "$EDGE/public")
+ok "$([ "$PCODE" = "200" ] && echo 1 || echo 0)" "non-enriched /public served anonymous -> 200, not rejected for a missing stamp"
+ok "$(has_hdr "$PBODY" "X-Identity-Contract" && echo 0 || echo 1)" "non-enriched /public reaches the backend UNSTAMPED (by design)"
+PWS=$(hdr_val "$PBODY" "X-Workspace-Id")
+ok "$([ "$PWS" != "ws_forged" ] && echo 1 || echo 0)" "forged x-workspace-id stripped on /public (got '${PWS:-<none>}' — routing context, not the client value)"
+ok "$(has_hdr "$PBODY" "X-User-Type" && echo 0 || echo 1)" "no identity attribution without a stamp: forged x-user-type never reaches /public"
+ok "$(has_hdr "$PBODY" "X-User-Id" && echo 0 || echo 1)" "no identity attribution without a stamp: no x-user-id on the unstamped route"
+
+echo "== 5. undesignated route with enrichment unavailable FAILS CLOSED, never anonymous =="
+# identity-workspace-authz fail-closed default: a route NOT on the non-enriched
+# allowlist requires enrichment (failure_mode_allow: false). With the sidecar
+# down, the enriched route must be REFUSED — not forwarded stampless and served
+# as anonymous — while the designated /public route keeps serving (C10).
+if command -v docker >/dev/null 2>&1; then
+  docker compose stop identity-sidecar-rs >/dev/null 2>&1
+  FCODE=$(code)
+  ok "$([ "$FCODE" != "200" ] && echo 1 || echo 0)" "enriched route with enrichment down is refused (got $FCODE, not 200)"
+  PCODE=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -H "Host: $HOST" "$EDGE/public")
+  ok "$([ "$PCODE" = "200" ] && echo 1 || echo 0)" "designated non-enriched /public still serves during the outage (got $PCODE)"
+  docker compose start identity-sidecar-rs >/dev/null 2>&1
+  i=0; until [ "$(code)" = "200" ] || [ "$i" -ge 30 ]; do sleep 2; i=$((i+1)); done
+  ok "$([ "$(code)" = "200" ] && echo 1 || echo 0)" "stack recovered after sidecar restart"
+else
+  echo "  SKIP  docker unavailable: fail-closed outage probe not run"
+fi
+
+echo "== 6. origin enforcement: a direct-to-backend request is REFUSED (edge-origin-trust) =="
+# The backends live only on the internal edge-backend network. A peer on the
+# default network presenting a forged stamp + scope headers must fail to
+# connect at all — the header values are irrelevant, the PATH is the control.
+if command -v docker >/dev/null 2>&1; then
+  DCODE=$(docker compose run --rm --no-deps --quiet-pull --entrypoint sh routing-seed -c \
+    "curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'x-identity-contract: v1' -H 'x-workspace-id: ws_forged' http://backend:80/" 2>/dev/null || true)
+  ok "$([ "${DCODE:-000}" = "000" ] && echo 1 || echo 0)" "direct-to-backend with forged stamp+scope refused before backend logic (got '${DCODE:-000}')"
+else
+  echo "  SKIP  docker unavailable: direct-to-backend origin probe not run"
+fi
 
 echo
 echo "RESULT: $pass passed, $fail failed"

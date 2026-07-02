@@ -17,7 +17,10 @@ services:
     container_name: zitadel-lab
     restart: unless-stopped
     # start-from-init runs DB setup + instance init, then serves the API.
-    command: 'start-from-init --masterkey "${ZITADEL_MASTERKEY}" --tlsMode disabled'
+    # The masterkey default keeps a CLEAN CHECKOUT bootable (`docker compose up`
+    # with no .env — the reference-topology contract); it is a documented lab
+    # credential like the rest of this deliberately-insecure file.
+    command: 'start-from-init --masterkey "${ZITADEL_MASTERKEY:-MasterkeyNeedsToHave32Characters}" --tlsMode disabled'
     environment:
       # --- external addressing -------------------------------------------------
       ZITADEL_PORT: 8080
@@ -83,7 +86,12 @@ services:
     environment:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       ZITADEL_INTERNAL_URL: http://zitadel:8080
-      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8088}
+      # D7 single source: derives from ZITADEL_EXTERNALPORT with the SAME default
+      # (8080) the zitadel service uses — and the edge's issuer literal in
+      # edge/envoy.yaml must equal it. A mismatch is silent-but-fatal: sync works
+      # while every authenticated request 401s at the edge (the old 8088 default
+      # was exactly that drift). scripts/helm-guards-test.sh asserts consistency.
+      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
       WEBHOOK_SELF_URL: http://sync-worker:8080/webhook
       PAT_FILE: /machinekey/zitadel-admin-sa.pat
     volumes:
@@ -103,7 +111,8 @@ services:
     environment:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       ZITADEL_INTERNAL_URL: http://zitadel:8080
-      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8088}
+      # D7: same default as the zitadel service + edge issuer (see sync-worker).
+      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
       PAT_FILE: /machinekey/zitadel-admin-sa.pat
       RECONCILE_INTERVAL: "30"   # ~600 in prod (RFC §6.2); short here to observe
     volumes:
@@ -140,17 +149,28 @@ services:
   # finite pools collapse onto two whoami instances (application/checkout/assets
   # -> backend, api -> backend-api) — the pool-SELECTION mechanism is what's
   # demonstrated, not per-tenant clusters.
+  # edge-origin-trust: the pool backends consume the trusted x-workspace-*/
+  # x-user-*/x-identity-contract header family, so they live ONLY on the
+  # internal `edge-backend` network, shared exclusively with the edge. No other
+  # container (and no published port) can deliver a request bearing forged
+  # trusted headers to them — the lab twin of the Helm charts' backend-origin
+  # NetworkPolicy. The e2e suite probes this with a direct-to-backend request
+  # from the default network and expects refusal.
   backend:
     image: traefik/whoami:latest
     container_name: zitadel-lab-backend
     command: ["--port", "80", "--name", "backend-application"]
     restart: unless-stopped
+    networks:
+      - edge-backend
 
   backend-api:
     image: traefik/whoami:latest
     container_name: zitadel-lab-backend-api
     command: ["--port", "80", "--name", "backend-api"]
     restart: unless-stopped
+    networks:
+      - edge-backend
 
   # --- routing plane: tenant resolution (host -> tenant -> pool) --------------
   # The routing-plane twin of the identity sidecar: same Resolution Engine
@@ -179,9 +199,22 @@ services:
     restart: unless-stopped
     environment:
       ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      # C16 fail-closed guard, satisfied WITH AUTH ENABLED — production parity,
+      # NOT CONTROL_AUTH_DISABLED: the e2e release gate runs against this stack,
+      # and validating against an auth-disabled control plane would give false
+      # confidence. The default is a documented lab credential (this file is the
+      # deliberately-insecure loopback lab — same posture as Password1! above);
+      # override via the CONTROL_AUTH_TOKEN env for anything beyond loopback.
+      CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}
     ports:
       - "9400:9400"   # admin API (domains/tenants) + healthz
       - "9401:9401"   # ops: /metrics + /healthz (scraped by Prometheus)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9400/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy
@@ -199,13 +232,19 @@ services:
     ports:
       - "9300:9300"   # resolve debug API + healthz
       - "9302:9302"   # metrics
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9300/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       control-plane:
-        condition: service_started
+        condition: service_healthy
 
   # One-shot: seed a baseline tenant + verified domains via the control plane so
   # the lab is end-to-end without manual steps (RFC C13). Crucially it verifies
@@ -216,23 +255,57 @@ services:
     image: curlimages/curl:latest
     container_name: zitadel-lab-routing-seed
     restart: "no"
+    environment:
+      # Same lab default as the control-plane service — the admin API now runs
+      # with auth ENABLED (production parity), so the seed must present it.
+      CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}
     depends_on:
       control-plane:
-        condition: service_started
+        condition: service_healthy
     entrypoint:
       - sh
       - -c
       - >-
         until curl -sf http://control-plane:9400/healthz >/dev/null; do echo 'waiting for control-plane'; sleep 2; done;
         H='-H content-type:application/json';
-        curl -sf $$H -X POST http://control-plane:9400/tenants -d '{"tenant_id":"acme","plan":"pro","target_pool":"application","features":["beta"]}';
-        curl -sf $$H -X POST http://control-plane:9400/tenants -d '{"tenant_id":"globex","plan":"enterprise","target_pool":"api"}';
-        curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"localhost","tenant_id":"acme","verified":true}';
-        curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"app.acme.test","tenant_id":"acme","verified":true}';
-        curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"acme.test","tenant_id":"acme","wildcard":true,"verified":true}';
-        curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"api.globex.test","tenant_id":"globex","verified":true}';
-        curl -sf $$H -X POST http://control-plane:9400/domains -d '{"domain":"unverified.test","tenant_id":"acme","verified":false}';
+        A="authorization: Bearer $$CONTROL_AUTH_TOKEN";
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/tenants -d '{"tenant_id":"acme","plan":"pro","target_pool":"application","features":["beta"]}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/tenants -d '{"tenant_id":"globex","plan":"enterprise","target_pool":"api"}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"localhost","tenant_id":"acme","verified":true}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"app.acme.test","tenant_id":"acme","verified":true}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"acme.test","tenant_id":"acme","wildcard":true,"verified":true}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"api.globex.test","tenant_id":"globex","verified":true}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"unverified.test","tenant_id":"acme","verified":false}';
         echo; echo 'routing seed complete'
+
+  # One-shot lab companion to routing-seed: the control plane (correctly,
+  # fail-closed) NEVER honors an inline `verified:true` — routing verification
+  # is granted only by the DNS ownership-proof flow (declare → TXT → verify),
+  # which `localhost`/`*.test` can never pass. The lab therefore flips its
+  # fixture domains verified DIRECTLY in the store (the same trust position as
+  # the proof system's own writer) and emits the invalidation NOTIFY the
+  # control plane would have, so resolvers converge. `unverified.test` stays
+  # unverified on purpose (the negative fixture for C18).
+  routing-verify-seed:
+    image: postgres:${POSTGRES_VERSION:-16-alpine}
+    container_name: zitadel-lab-routing-verify-seed
+    restart: "no"
+    environment:
+      PGPASSWORD: postgres
+    depends_on:
+      routing-seed:
+        condition: service_completed_successfully
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        psql -h postgres -U postgres -d zitadel -v ON_ERROR_STOP=1 -c
+        "UPDATE routing.domains SET verified = true
+           WHERE domain IN ('localhost','app.acme.test','acme.test','api.globex.test');
+         SELECT pg_notify('routing_invalidations', domain)
+           FROM routing.domains
+          WHERE domain IN ('localhost','app.acme.test','acme.test','api.globex.test');";
+        echo 'routing verify seed complete'
 
   # Identity sidecar (Rust: tonic + envoy-types + sqlx/Postgres + moka). The one
   # Envoy calls. Built from the identity-rs workspace (shares the core crate with
@@ -252,6 +325,12 @@ services:
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9200/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy
@@ -266,13 +345,22 @@ services:
     ports:
       - "10000:10000"   # edge listener
       - "9901:9901"     # envoy admin
+    networks:
+      # Default network for ZITADEL/sidecar/router/JWKS + the internal
+      # edge-backend network — the edge is the ONLY bridge to the backends
+      # (edge-origin-trust).
+      - default
+      - edge-backend
+    # Health-gated startup order so a clean `docker compose up` comes up
+    # deterministically (the authenticated e2e depends on it): both ext_proc
+    # stages and the backends must be serving before the edge accepts traffic.
     depends_on:
       zitadel:
         condition: service_healthy
       identity-sidecar-rs:
-        condition: service_started
+        condition: service_healthy
       tenant-router:
-        condition: service_started
+        condition: service_healthy
       backend:
         condition: service_started
       backend-api:
@@ -324,6 +412,14 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+networks:
+  # edge-origin-trust: the internal network that makes "backends accept requests
+  # only via the edge" a real, probe-able control in the lab (no host published
+  # ports, no default-network path — only the edge bridges in). internal: true
+  # additionally blocks any outbound path; whoami needs none.
+  edge-backend:
+    internal: true
 
 volumes:
   postgres-data:

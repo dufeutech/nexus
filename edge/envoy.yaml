@@ -68,9 +68,13 @@ static_resources:
                       # before routing (C18), so a request reaching here always
                       # carries a pool selector.
                       routes:
-                        # C10: a degradable route. Identity ext_proc is disabled
-                        # here (fail-open: served without x-user-* even if the
-                        # sidecar is down). Tenant routing + auth still apply.
+                        # C10: a degradable route — the lab's EXPLICIT non-enriched
+                        # designation (identity-workspace-authz): identity ext_proc
+                        # is disabled here (fail-open: served without x-user-* even
+                        # if the sidecar is down) and the request reaches the
+                        # backend unstamped BY DESIGN. Tenant routing + auth still
+                        # apply. Fail-closed default: every route NOT listed with
+                        # this per-route disable keeps enrichment.
                         - match: { prefix: "/public" }
                           route: { cluster: pool_application }
                           typed_per_filter_config:
@@ -184,11 +188,12 @@ static_resources:
                           # its emit is authoritative.
                           - remove: "x-auth-required"
                           # Versioned edge->backend identity-contract stamp: authored
-                          # by the identity sidecar so the backend can prove the
-                          # identity headers came from the current trusted edge. Strip
-                          # any client copy so a client can neither forge a version nor
-                          # mask a bypass of the enrichment (C3, same rule as
-                          # x-auth-required/x-workspace-id).
+                          # by the identity sidecar as a DRIFT/version signal for the
+                          # x-workspace-*/x-user-* header shape — NOT proof of edge
+                          # origin (that guarantee is edge-origin-trust origin
+                          # enforcement: the backends are reachable only via this
+                          # edge). Strip any client copy so a version cannot be forged
+                          # (C3, same rule as x-auth-required/x-workspace-id).
                           - remove: "x-identity-contract"
                   # TENANT-FIRST (RFC C17): resolve host -> workspace -> pool before
                   # auth/enrichment. Sets x-workspace-* + x-route-pool, or rejects an
@@ -215,18 +220,29 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
                       providers:
                         zitadel:
-                          issuer: "http://localhost:8088"
+                          # D7 single source: this authority MUST equal the iss
+                          # ZITADEL mints, i.e. localhost:${ZITADEL_EXTERNALPORT}
+                          # (default 8080 in docker-compose.yaml) — the same value
+                          # the workers' ZITADEL_HOST derives from. Drift here is
+                          # silent-but-fatal (sync works, every authenticated
+                          # request 401s); scripts/helm-guards-test.sh asserts the
+                          # two stay equal.
+                          issuer: "http://localhost:8080"
                           remote_jwks:
                             # uri authority -> Host header (must match ZITADEL's
                             # external domain, which validates Host); cluster ->
                             # the actual in-network upstream (zitadel:8080).
-                            # This reference/lab config fetches over trusted loopback,
-                            # so plaintext is fine. SECURITY (production): if ZITADEL
-                            # is reached over an untrusted network, use HTTPS + give
-                            # the zitadel_jwks cluster a TLS transport_socket (a
-                            # plaintext JWKS lets a MITM swap keys → auth bypass).
+                            # edge-trust-anchor-integrity: this lab fetches the
+                            # trust anchor in plaintext ONLY because the path is
+                            # the compose-internal hop to the lab's own ZITADEL —
+                            # the explicitly asserted trusted path (the Helm charts
+                            # call it zitadel.jwksPlaintextTrustedPath). On any
+                            # untrusted path this fails the spec: use HTTPS + give
+                            # the zitadel_jwks cluster a TLS transport_socket
+                            # (trusted CA + SNI + SAN match — a plaintext JWKS lets
+                            # a MITM swap keys → full auth bypass).
                             http_uri:
-                              uri: "http://localhost:8088/oauth/v2/keys"
+                              uri: "http://localhost:8080/oauth/v2/keys"
                               cluster: zitadel_jwks
                               timeout: 5s
                             cache_duration: { seconds: 600 }

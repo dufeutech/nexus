@@ -93,6 +93,37 @@ edge:
       enabled: true
       secretName: "edge-platform-tls"
 
+# -------------------------------------------------------------------------- #
+# Origin enforcement (edge-origin-trust). The x-workspace-*/x-user-*/
+# x-identity-contract header family is unforgeable ONLY because the pool
+# backends are reachable exclusively through this edge — the stamp itself is an
+# unsigned drift signal, NOT an authentication boundary. This umbrella always
+# renders the identity-enriched edge, so an explicit origin-enforcement choice
+# is REQUIRED: rendering with neither option set FAILS (fail closed).
+#
+# BREAKING (vs. earlier chart versions, which rendered without any origin
+# control): set exactly one of the two options below.
+# -------------------------------------------------------------------------- #
+originEnforcement:
+  networkPolicy:
+    # Ship a NetworkPolicy restricting the pool backend pods' ingress to the
+    # combined edge pods (same pattern as the routing-plane control-plane
+    # policy). Requires the backends to run in THIS namespace and a CNI that
+    # enforces NetworkPolicy — the direct-to-backend e2e probe verifies it does.
+    enabled: false
+    # matchLabels of the pool backend pods the policy protects. REQUIRED when
+    # enabled (an empty selector would select every pod in the namespace).
+    backendSelector: {}
+    # Backend ports the edge is allowed to reach (union across pools).
+    backendPorts: [80]
+    # Additional ingress peers (e.g. kubelet probe CIDRs on CNIs that police
+    # node-origin traffic).
+    extraAllowFrom: []
+  # Explicit assertion that the invariant is enforced OUTSIDE this chart (the
+  # backends live in another namespace/cluster/network you police). An
+  # acknowledgment the chart records, not a control it ships.
+  external: false
+
 # Store connection overrides for the combined edge. Empty => derived from the
 # subchart release names (the normal case). Set these only if a subchart points at
 # an external store via an existingSecret whose name the umbrella can't derive.

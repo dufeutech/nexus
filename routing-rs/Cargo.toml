@@ -41,6 +41,9 @@ axum = "0.8"
 headers = "0.4"
 # HTTP-aware per-request timeout layer (returns 408) for the axum servers.
 tower-http = { version = "0.6", features = ["timeout"] }
+# Test-only (dev-dependencies): ServiceExt::oneshot to drive a router in the
+# http-request-resilience tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
 

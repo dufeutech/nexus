@@ -30,6 +30,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = "0.8"
 # HTTP-aware per-request timeout layer (returns 408) for the axum servers.
 tower-http = { version = "0.6", features = ["timeout"] }
+# Test-only (dev-dependencies): ServiceExt::oneshot to drive a router in the
+# http-request-resilience tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hmac = "0.12"
 sha2 = "0.10"

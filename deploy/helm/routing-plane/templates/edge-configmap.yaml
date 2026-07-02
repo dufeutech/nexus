@@ -147,9 +147,10 @@ data:
                               - remove: "x-auth-method"
                               - remove: "x-auth-required"
                               # Versioned identity-contract stamp (authored by the
-                              # identity sidecar in the full stack); strip client copies
-                              # so a client can neither forge a version nor mask a
-                              # bypass (C3, same rule as x-auth-required).
+                              # identity sidecar in the full stack) — a drift/version
+                              # signal, NOT proof of edge origin (edge-origin-trust
+                              # owns that); strip client copies so a version cannot
+                              # be forged (C3, same rule as x-auth-required).
                               - remove: "x-identity-contract"
                       # Tenant routing (C14/C15/C18). fail-closed: a routing failure
                       # must not silently default a route.
