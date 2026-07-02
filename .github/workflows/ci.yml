@@ -26,6 +26,26 @@ jobs:
           # routing workspace does not (envoy-types ships pre-generated code).
           - { workspace: identity-rs, protoc: true }
           - { workspace: routing-rs,  protoc: false }
+    # Throwaway Postgres so the store integration tests actually run — they
+    # silently skip when STORE_PG_TEST_URL is unset, which made "integration
+    # coverage" skipped-green (production-readiness-gate D6). Both workspaces
+    # create their own schema (identity / routing) inside this one database.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nexus_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nexus_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      STORE_PG_TEST_URL: postgres://postgres:postgres@localhost:5432/nexus_test
     steps:
       - uses: actions/checkout@v4
 
@@ -121,7 +141,12 @@ jobs:
         run: |
           # routingPg.url is required whenever membershipSync is enabled (default) and
           # no existingSecret is set — it feeds the read-only routing DB Secret.
-          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set zitadel.patSecret.value=dummy --set routingPg.url=postgres://u:p@h:5432/routing"
+          # jwksTls + originEnforcement are fail-closed guards: rendering an
+          # identity-enriched edge requires an explicit choice for each
+          # (edge-trust-anchor-integrity / edge-origin-trust).
+          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set zitadel.patSecret.value=dummy --set routingPg.url=postgres://u:p@h:5432/routing \
+                --set zitadel.jwksTls.enabled=true \
+                --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint identity-plane $ARGS
           helm template rel identity-plane $ARGS >/dev/null
 
@@ -144,6 +169,55 @@ jobs:
                 --set identity-plane.zitadel.patSecret.value=dummy \
                 --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.postgres.url=postgres://u:p@h:5432/routing \
-                --set routing-plane.controlPlane.auth.token=ci-dummy"
+                --set routing-plane.controlPlane.auth.token=ci-dummy \
+                --set identity-plane.zitadel.jwksTls.enabled=true \
+                --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint edge-platform $ARGS
           helm template rel edge-platform $ARGS >/dev/null
+
+      # Fail-closed guard matrix (production-readiness-gate): asserts that a
+      # topology missing an origin-enforcement or JWKS-integrity choice REFUSES
+      # to render, that valid renders carry the enforcing config (NetworkPolicy,
+      # UpstreamTlsContext + CA + SAN pin), that the publicPaths allowlist is the
+      # single source of the non-enriched designation, and that the lab issuer
+      # does not drift from the compose default (D7).
+      - name: Guard assertions (origin trust + JWKS integrity + designation)
+        working-directory: .
+        run: bash scripts/helm-guards-test.sh
+
+  # Release gate (production-readiness-gate 6.4): boot the reference topology
+  # from a CLEAN checkout (no .env, auth ENABLED — production parity) and run
+  # every edge e2e suite against it: the anonymous trust-contract assertions,
+  # the N4 per-route auth gate (incl. encoded-traversal), and the
+  # authenticated-member positive path (real ZITADEL JWT + seeded membership).
+  e2e-gate:
+    name: e2e release gate (reference stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Boot the reference stack
+        run: |
+          mkdir -p machinekey
+          docker compose up -d --build
+          # Deterministic readiness: the edge only starts after its health-gated
+          # dependencies, so a served request proves the whole chain is up.
+          for i in $(seq 1 90); do
+            curl -sf -H 'Host: localhost' http://localhost:10000/ >/dev/null && exit 0
+            sleep 5
+          done
+          echo 'edge never became ready'; docker compose ps; exit 1
+
+      - name: Anonymous edge e2e (tenancy trust contract)
+        run: sh scripts/tenancy-edge-e2e.sh
+
+      - name: Anonymous edge e2e (N4 per-route auth gate + traversal)
+        run: sh scripts/n4-e2e.sh
+
+      - name: Authenticated-member e2e (positive scope path)
+        run: sh scripts/tenancy-edge-auth-e2e.sh
+
+      - name: Stack logs (on failure)
+        if: failure()
+        run: docker compose logs --tail 150

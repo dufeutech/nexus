@@ -15,8 +15,10 @@
 //!   STORE_PG_TEST_URL=postgres://postgres:postgres@localhost:5433/postgres \
 //!     cargo test -p store-postgres --test integration -- --test-threads=1
 //!
-//! Run single-threaded (`--test-threads=1`): all tests share the one `routing`
-//! schema and each begins by truncating it, so they must not interleave.
+//! All tests share the one `routing` schema and each begins by truncating it, so
+//! they must not interleave: `setup()` serializes them behind a process-wide lock
+//! (held via the returned guard), so a plain `cargo test` — CI included — is safe
+//! without `--test-threads=1`.
 
 use std::env;
 
@@ -27,10 +29,18 @@ use router_core::store::{
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use store_postgres::PgRoutingStore;
+use tokio::sync::{Mutex, MutexGuard};
+
+/// Serializes the tests: they share one schema and truncate it in `setup()`, so
+/// two running at once would eat each other's rows. tokio's Mutex works across
+/// the per-test runtimes (`#[tokio::test]` builds one per test).
+static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Connect + clean every `routing` table, or `None` if the test DB isn't set.
-async fn setup() -> Option<(PgRoutingStore, sqlx::PgPool)> {
+/// The returned guard holds the schema for the duration of the test.
+async fn setup() -> Option<(PgRoutingStore, sqlx::PgPool, MutexGuard<'static, ()>)> {
     let url = env::var("STORE_PG_TEST_URL").ok()?;
+    let guard = DB_LOCK.lock().await;
     let store = PgRoutingStore::connect(&url)
         .await
         .expect("connect to STORE_PG_TEST_URL");
@@ -52,7 +62,7 @@ async fn setup() -> Option<(PgRoutingStore, sqlx::PgPool)> {
     .execute(&pool)
     .await
     .expect("truncate");
-    Some((store, pool))
+    Some((store, pool, guard))
 }
 
 macro_rules! skip_if_no_db {
@@ -100,7 +110,7 @@ async fn workspace_account(pool: &sqlx::PgPool, ws: &str) -> Option<String> {
 
 #[tokio::test]
 async fn transfer_repoints_ownership_and_resets_staff_only() {
-    let (store, pool) = skip_if_no_db!();
+    let (store, pool, _guard) = skip_if_no_db!();
 
     // Two owning accounts; ws_1 starts owned by the old account.
     assert!(store.create_account("acct_old", "Old", None).await.unwrap());
@@ -137,15 +147,91 @@ async fn transfer_repoints_ownership_and_resets_staff_only() {
 }
 
 #[tokio::test]
+async fn transfer_preserves_plan_and_switches_payer_to_the_new_account() {
+    let (store, pool, _guard) = skip_if_no_db!();
+
+    // workspace-tenancy R4: plan lives on the WORKSPACE (it travels with a
+    // transfer); payer lives on the ACCOUNT (it switches with a transfer). Two
+    // accounts with distinct payers of record; ws_pro starts on the old one.
+    assert!(store.create_account("acct_old", "Old", Some("payer_old")).await.unwrap());
+    assert!(store.create_account("acct_new", "New", Some("payer_new")).await.unwrap());
+    let mut ws = workspace("ws_pro");
+    ws.plan = "pro".to_owned();
+    store.upsert_workspace(&ws).await.unwrap();
+    assert!(store.set_workspace_account("ws_pro", "acct_old").await.unwrap());
+
+    store.transfer_workspace("ws_pro", "acct_new").await.unwrap();
+
+    // Plan travels: the workspace still carries `pro` — a transfer must never
+    // reset or re-derive it from the receiving account.
+    let after = store.get_workspace("ws_pro").await.unwrap().expect("workspace survives");
+    assert_eq!(after.plan, "pro", "plan travels with the workspace");
+
+    // Payer switches: the workspace is now owned by the account whose payer of
+    // record is `payer_new`; the old payer is no longer on the hook.
+    assert_eq!(workspace_account(&pool, "ws_pro").await.as_deref(), Some("acct_new"));
+    let payer = store
+        .get_account("acct_new")
+        .await
+        .unwrap()
+        .expect("new owning account")
+        .payer_ref;
+    assert_eq!(payer.as_deref(), Some("payer_new"), "payer switches to the new account's");
+    // The transfer mutates ownership only — it must not clobber either
+    // account's payer of record.
+    let old_payer = store.get_account("acct_old").await.unwrap().expect("old account").payer_ref;
+    assert_eq!(old_payer.as_deref(), Some("payer_old"));
+}
+
+#[tokio::test]
+async fn domains_are_aliases_and_removal_leaves_the_workspace_intact() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // workspace-tenancy R1: the workspace_id is the stable identity; domains are
+    // detachable aliases. Several domains resolve to ONE workspace…
+    let mut ws = workspace("ws_alias");
+    ws.plan = "pro".to_owned();
+    store.upsert_workspace(&ws).await.unwrap();
+    store.upsert_domain("a.example.com", "ws_alias", false, true).await.unwrap();
+    store.upsert_domain("b.example.com", "ws_alias", false, true).await.unwrap();
+    assert_eq!(store.lookup_domain("a.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
+    assert_eq!(store.lookup_domain("b.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
+
+    // …and removing one alias leaves the workspace (and its config) untouched
+    // while the other alias keeps resolving.
+    store.delete_domain("a.example.com", false).await.unwrap();
+    assert_eq!(store.lookup_domain("a.example.com", false).await.unwrap(), None, "removed alias stops resolving");
+    assert_eq!(store.lookup_domain("b.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
+    let survivor = store.get_workspace("ws_alias").await.unwrap().expect("workspace survives alias removal");
+    assert_eq!(survivor.plan, "pro", "workspace config rides through the alias change");
+}
+
+#[tokio::test]
+async fn create_account_is_idempotent_and_never_clobbers() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // workspace-tenancy R2: a repeat provision for an existing account is a
+    // no-op — it must never overwrite the account's name or payer of record.
+    assert!(store.create_account("acct_1", "First", Some("payer_1")).await.unwrap());
+    assert!(
+        !store.create_account("acct_1", "Imposter", Some("payer_2")).await.unwrap(),
+        "second provision reports no-op"
+    );
+    let acct = store.get_account("acct_1").await.unwrap().expect("account exists");
+    assert_eq!(acct.name, "First", "name not clobbered by a repeat provision");
+    assert_eq!(acct.payer_ref.as_deref(), Some("payer_1"), "payer not clobbered");
+}
+
+#[tokio::test]
 async fn transfer_of_unknown_workspace_is_none() {
-    let (store, _pool) = skip_if_no_db!();
+    let (store, _pool, _guard) = skip_if_no_db!();
     store.create_account("acct_new", "New", None).await.unwrap();
     assert_eq!(store.transfer_workspace("ghost", "acct_new").await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn init_schema_backfills_a_solo_account_for_an_ownerless_workspace() {
-    let (store, pool) = skip_if_no_db!();
+    let (store, pool, _guard) = skip_if_no_db!();
 
     // A legacy row: a workspace with no owning account (upsert_workspace does not
     // set account_id — create-time ownership is a separate call, and a migrated

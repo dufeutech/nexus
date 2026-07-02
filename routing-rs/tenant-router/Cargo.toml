@@ -32,5 +32,9 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 
+[dev-dependencies]
+# http-request-resilience tests: oneshot a router without binding a socket.
+tower.workspace = true
+
 [lints]
 workspace = true

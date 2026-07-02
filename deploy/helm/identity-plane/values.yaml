@@ -65,6 +65,34 @@ zitadel:
   # JWKS path on ZITADEL.
   jwksPath: "/oauth/v2/keys"
   jwksCacheSeconds: 600
+  # ---- Trust-anchor transport integrity (edge-trust-anchor-integrity) ------ #
+  # The JWKS fetch is the root of ALL token verification: an on-path attacker
+  # who substitutes signing keys owns every "verified" identity. The edge
+  # therefore REQUIRES an explicit transport choice — rendering an edge with
+  # neither option below set FAILS (fail closed), it does not silently ship a
+  # plaintext fetch.
+  #
+  # BREAKING (vs. earlier chart versions, which rendered plaintext silently):
+  # existing deployments must either enable jwksTls (preferred) or explicitly
+  # assert the plaintext path is trusted via jwksPlaintextTrustedPath.
+  jwksTls:
+    # Fetch the JWKS over TLS with server-certificate verification (Envoy
+    # UpstreamTlsContext on the zitadel_jwks cluster: trusted CA + SNI + SAN
+    # match). zitadel.internalUrl must then point at a TLS port.
+    enabled: false
+    # SNI + certificate SAN the server must present. Defaults to the dialed
+    # host (zitadel.internalUrl authority) when empty; set it when the cert is
+    # issued for a different name (e.g. the public issuer host).
+    sni: ""
+    # CA bundle (inside the Envoy container) used to verify the server chain.
+    # The stock Envoy image ships the Debian system bundle at this path; mount
+    # your own Secret/ConfigMap and point here for a private CA.
+    caFile: "/etc/ssl/certs/ca-certificates.crt"
+  # Explicit assertion that the network path between the edge and ZITADEL is
+  # trusted (same host/loopback, or an in-cluster hop you have assessed), so a
+  # plaintext JWKS fetch is acceptable. This is an ACKNOWLEDGMENT, not a
+  # control — prefer jwksTls. One of the two must be set or rendering fails.
+  jwksPlaintextTrustedPath: false
   # Admin service-account PAT used by sync-worker (register webhook) and
   # reconciler (list users/grants). Provide via an existing Secret (recommended)
   # or inline (discouraged — ends up in the release manifest).
@@ -82,6 +110,39 @@ zitadel:
 backend:
   host: "backend.default.svc.cluster.local"
   port: 80
+
+# -------------------------------------------------------------------------- #
+# Origin enforcement (edge-origin-trust). The x-workspace-*/x-user-*/
+# x-identity-contract header family is unforgeable ONLY because the backend is
+# reachable exclusively through the edge that emits it — the stamp itself is an
+# unsigned drift signal, NOT an authentication boundary. A topology that renders
+# identity enrichment MUST therefore make an explicit origin-enforcement choice;
+# rendering with neither option set FAILS (fail closed) instead of shipping open.
+#
+# BREAKING (vs. earlier chart versions, which rendered without any origin
+# control): set exactly one of the two options below.
+# -------------------------------------------------------------------------- #
+originEnforcement:
+  networkPolicy:
+    # Ship a NetworkPolicy (same pattern as the routing-plane control-plane
+    # policy) restricting the backend pods' ingress to this chart's edge pods.
+    # Requires the backend to run in THIS namespace and the cluster CNI to
+    # enforce NetworkPolicy — the direct-to-backend e2e probe verifies it does.
+    enabled: false
+    # matchLabels of the tenant backend pods the policy protects. REQUIRED when
+    # enabled (an empty selector would select every pod in the namespace).
+    backendSelector: {}
+    # Backend ports the edge is allowed to reach.
+    backendPorts: [80]
+    # Additional ingress peers (e.g. kubelet probe CIDRs on CNIs that police
+    # node-origin traffic — see the control-plane allowProbesFrom note).
+    extraAllowFrom: []
+  # Explicit assertion that the invariant is enforced OUTSIDE this chart (the
+  # backend lives in another namespace/cluster/network you police, e.g. via
+  # your own NetworkPolicy, mesh authorization, or firewall). This is an
+  # ACKNOWLEDGMENT the chart records, not a control it ships — the absence of
+  # any origin control is a misconfiguration, never a default-safe state.
+  external: false
 
 # -------------------------------------------------------------------------- #
 # Edge: Envoy + the identity sidecar. Topology (RFC rules §1.4):
@@ -102,6 +163,15 @@ edge:
   # ext_proc behaviour on the default (protected) route: fail-closed (RFC §6.1).
   failureModeAllow: false
   extProcTimeout: "5s"
+  # The EXPLICIT non-enriched allowlist (identity-workspace-authz): path
+  # prefixes that intentionally skip identity enrichment (public/degradable
+  # routes, C10) and so reach the backend unstamped BY DESIGN. This list is the
+  # single source the per-route ext_proc config is rendered from, so the
+  # designation and the edge behavior cannot drift. Fail-closed default: any
+  # route NOT listed here gets enrichment and the backend's "reject an absent
+  # stamp" rule — omission never silently downgrades a route to anonymous.
+  publicPaths:
+    - "/public"
   # Sidecar upstream Envoy's ext_proc dials. Per-pod default = loopback.
   sidecarCluster: "127.0.0.1:50051"
   resources:

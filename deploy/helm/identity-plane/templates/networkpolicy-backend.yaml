@@ -1,0 +1,62 @@
+{{- /*
+Origin enforcement for the identity-enriched backend (edge-origin-trust).
+
+The x-workspace-* / x-user-* / x-identity-contract header family is trustworthy
+ONLY because no party other than the edge can deliver a request bearing it to
+the backend. The stamp is an unsigned drift signal — it cannot provide this.
+This policy is the control that does: default-deny ingress on the backend
+pods; only this chart's edge may connect.
+
+Required-by-default: rendering an identity-enriched edge without an explicit
+origin-enforcement choice FAILS (see the guard below) rather than shipping
+open. Mirrors the routing-plane control-plane NetworkPolicy pattern.
+*/ -}}
+{{- if .Values.edge.enabled }}
+{{- $oe := .Values.originEnforcement }}
+{{- if and $oe.networkPolicy.enabled $oe.external }}
+{{- fail "originEnforcement.networkPolicy.enabled and originEnforcement.external are both set — pick ONE origin-enforcement choice (the chart-shipped NetworkPolicy, or the explicit external assertion)" }}
+{{- end }}
+{{- if and (not $oe.networkPolicy.enabled) (not $oe.external) }}
+{{- fail "this topology renders identity enrichment but makes no origin-enforcement choice — the trusted-header family (x-workspace-*/x-user-*/x-identity-contract) is unforgeable ONLY when the backend accepts requests exclusively via the edge (edge-origin-trust). Set originEnforcement.networkPolicy.enabled=true (+ backendSelector) to ship the NetworkPolicy, or originEnforcement.external=true to assert the invariant is enforced outside this chart. Rendering without either would ship open." }}
+{{- end }}
+{{- if $oe.networkPolicy.enabled }}
+{{- if not $oe.networkPolicy.backendSelector }}
+{{- fail "originEnforcement.networkPolicy.enabled but originEnforcement.networkPolicy.backendSelector is empty — an empty podSelector would select EVERY pod in the namespace. Set it to the matchLabels of the tenant backend pods (or use originEnforcement.external=true if the backend lives outside this namespace)" }}
+{{- end }}
+# Edge-only reachability for the identity-enriched backend (edge-origin-trust).
+# Default-deny ingress on the backend pods; only the edge that strips-and-emits
+# the trusted header family may connect. This — not the x-identity-contract
+# stamp (a drift signal) — is what makes the header family unforgeable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-backend-origin
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml $oe.networkPolicy.backendSelector | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    # The edge pods of this release — the ONLY permitted request path.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 14 }}
+      ports:
+        {{- range $oe.networkPolicy.backendPorts }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    {{- with $oe.networkPolicy.extraAllowFrom }}
+    # Additional explicitly-granted peers (e.g. kubelet probes on CNIs that
+    # police node-origin traffic).
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        {{- range $oe.networkPolicy.backendPorts }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

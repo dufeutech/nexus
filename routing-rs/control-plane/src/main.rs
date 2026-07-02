@@ -51,6 +51,32 @@ use store_postgres::{LeaderLease, PgRoutingStore};
 /// Stable advisory-lock id electing the single verification-poll leader (RFC C4).
 const VERIFY_POLL_LOCK_KEY: i64 = 9_204_001;
 
+/// Total per-request timeout for both HTTP surfaces (http-request-resilience):
+/// operator-tunable via `HTTP_REQUEST_TIMEOUT_SECS` with a finite 30s default —
+/// never unbounded (and well above the 5s DB statement cap).
+fn request_timeout() -> Duration {
+    Duration::from_secs(
+        var("HTTP_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    )
+}
+
+/// Bound a router with the resilience layers (http-request-resilience): a
+/// request-body cap plus a total per-request timeout answering 408, so a
+/// slow/stalled client cannot hold a connection/task indefinitely. The admin
+/// bodies are small JSON — cap them so a malformed or hostile caller can't
+/// force an unbounded buffer (defense-in-depth).
+fn resilient<S>(router: Router<S>, timeout: Duration) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
+}
+
 #[derive(Clone)]
 struct App {
     store: Arc<PgRoutingStore>,
@@ -1140,29 +1166,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // hole in the broker-only guarantee (RFC C16) for every metrics peer. /metrics
     // moves to the separate ops port below so the policy can gate the two
     // independently (admin = broker-only; ops = scrapers + kubelet).
-    // Per-request timeout for both servers (returns 408): bounds a slow/stalled
-    // client so it cannot hold a connection/task indefinitely. Operator-tunable via
-    // HTTP_REQUEST_TIMEOUT_SECS; default 30s (well above the 5s DB statement cap).
-    let req_timeout = Duration::from_secs(
-        var("HTTP_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30),
-    );
+    let req_timeout = request_timeout();
 
-    let admin = data
-        // Liveness stays open (no token), kept on the admin port so existing
-        // tooling/healthchecks that target :9400 keep working.
-        .route("/healthz", get(healthz))
-        // These are small JSON admin bodies; cap the request body so a malformed
-        // or hostile caller can't force an unbounded buffer (defense-in-depth).
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
-        .with_state(app.clone());
+    let admin = resilient(
+        data
+            // Liveness stays open (no token), kept on the admin port so existing
+            // tooling/healthchecks that target :9400 keep working.
+            .route("/healthz", get(healthz)),
+        req_timeout,
+    )
+    .with_state(app.clone());
 
     // Ops surface (:9401) — /metrics for scrapers and /healthz for kubelet probes.
     // Carries nothing sensitive and no mutation, so the NetworkPolicy can open it
     // to Prometheus (and the node, for probes) without exposing the admin API.
+    // (No body cap needed on GET-only ops, so only the timeout layer applies.)
     let ops = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
@@ -1185,4 +1203,67 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     info!("stopped");
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// http-request-resilience tests: exercise the REAL resilience layering both
+// servers (:9400 admin, :9401 ops) are built from.
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+mod resilience_tests {
+    use super::{request_timeout, resilient, var, Duration, Router, StatusCode};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use tokio::time::sleep;
+    use tower::util::ServiceExt;
+
+    /// A handler that outlives the timeout must be terminated with 408 rather
+    /// than pinning the task.
+    #[tokio::test]
+    async fn slow_request_is_terminated_with_408() {
+        let app = resilient(
+            Router::new().route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_secs(30)).await;
+                    "too late"
+                }),
+            ),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT, "slow handler must yield 408");
+    }
+
+    /// A request completing within the timeout is unaffected by the layer.
+    #[tokio::test]
+    async fn fast_request_is_unaffected_by_the_timeout() {
+        let app = resilient(
+            Router::new().route("/fast", get(|| async { "ok" })),
+            Duration::from_millis(100),
+        );
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/fast").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "fast handler must pass through");
+    }
+
+    /// Unconfigured, the timeout applies a finite safe default — never unbounded.
+    /// (Relies on HTTP_REQUEST_TIMEOUT_SECS being unset in the test environment.)
+    #[test]
+    fn request_timeout_defaults_to_a_finite_30s() {
+        if var("HTTP_REQUEST_TIMEOUT_SECS").is_ok() {
+            return; // SKIP: the environment overrides the default under test
+        }
+        assert_eq!(
+            request_timeout(),
+            Duration::from_secs(30),
+            "default request timeout must be the documented finite 30s",
+        );
+    }
 }

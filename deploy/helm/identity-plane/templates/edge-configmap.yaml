@@ -18,6 +18,14 @@ C2) -> router.
 {{- $scHost := first (splitList ":" $sc) -}}
 {{- $scPort := last (splitList ":" $sc) -}}
 {{- if .Values.edge.enabled -}}
+{{- /* edge-trust-anchor-integrity: the JWKS fetch is the root of ALL token
+verification — refuse to render an edge whose trust anchor would travel an
+unprotected channel nobody has vouched for (fail closed, not silently open). */ -}}
+{{- if and (not .Values.zitadel.jwksTls.enabled) (not .Values.zitadel.jwksPlaintextTrustedPath) -}}
+{{- fail "the edge fetches its JWT trust anchor (JWKS) but no transport-integrity choice is set — an on-path attacker substituting signing keys is a FULL auth bypass (edge-trust-anchor-integrity). Set zitadel.jwksTls.enabled=true to fetch over TLS with server-cert verification (preferred), or zitadel.jwksPlaintextTrustedPath=true to explicitly assert the edge→ZITADEL path is trusted (loopback / assessed in-cluster hop). Rendering without either would silently trust unauthenticated keys." -}}
+{{- end -}}
+{{- $jwksScheme := ternary "https" "http" .Values.zitadel.jwksTls.enabled -}}
+{{- $jwksSni := .Values.zitadel.jwksTls.sni | default $zHost -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -80,16 +88,23 @@ data:
                         - name: backend
                           domains: ["*"]
                           routes:
-                            # C10: degradable route — ext_proc disabled, so it is
-                            # served (fail-open) even if the sidecar is down. Auth
-                            # is still enforced by jwt_authn below.
-                            - match: { prefix: "/public" }
+                            {{- range .Values.edge.publicPaths }}
+                            # C10: EXPLICITLY designated non-enriched route
+                            # (identity-workspace-authz): ext_proc disabled, so it
+                            # is served (fail-open) even if the sidecar is down and
+                            # reaches the backend unstamped BY DESIGN. Auth is still
+                            # enforced by jwt_authn below. Rendered from the ONE
+                            # edge.publicPaths allowlist, so designation and edge
+                            # behavior cannot drift.
+                            - match: { prefix: {{ . | quote }} }
                               route: { cluster: backend }
                               typed_per_filter_config:
                                 envoy.filters.http.ext_proc:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
                                   disabled: true
-                            # Default route requires enrichment: fail-closed.
+                            {{- end }}
+                            # Fail-closed default: every route NOT on the explicit
+                            # publicPaths allowlist requires enrichment.
                             - match: { prefix: "/" }
                               route: { cluster: backend }
                     http_filters:
@@ -129,10 +144,12 @@ data:
                               # combined-edge-per-route-auth-gate change, design.md).
                               - remove: "x-auth-required"
                               # Versioned identity-contract stamp: authored by THIS
-                              # plane's identity sidecar so the backend can prove the
-                              # identity headers are edge-produced. Strip client copies
-                              # so a client can neither forge a version nor mask a
-                              # bypass (C3, same rule as x-workspace-id).
+                              # plane's identity sidecar as a DRIFT/version signal for
+                              # the x-workspace-*/x-user-* header shape — NOT proof of
+                              # edge origin (that guarantee is edge-origin-trust's
+                              # origin enforcement). Strip client copies so a client
+                              # cannot forge a version (C3, same rule as
+                              # x-workspace-id).
                               - remove: "x-identity-contract"
                       - name: envoy.filters.http.jwt_authn
                         typed_config:
@@ -144,15 +161,16 @@ data:
                                 # uri authority -> Host header (must equal the
                                 # issuer's external domain, which ZITADEL checks);
                                 # cluster -> the in-cluster ZITADEL upstream.
-                                # SECURITY (production): the JWKS gates ALL token
-                                # verification — a MITM substituting keys is a full
-                                # auth bypass. Over an untrusted network, fetch via
-                                # HTTPS with cert validation. Scheme alone is not
-                                # enough — Envoy uses TLS only if the `zitadel_jwks`
-                                # cluster has a `transport_socket` (validation_context
-                                # + SNI). TODO(hardening): gate behind zitadel.jwksTls.
+                                # SECURITY: the JWKS gates ALL token verification —
+                                # a MITM substituting keys is a full auth bypass
+                                # (edge-trust-anchor-integrity). The scheme follows
+                                # zitadel.jwksTls; the actual protection is the
+                                # `transport_socket` on the `zitadel_jwks` cluster
+                                # below (trusted CA + SNI + SAN match). A render
+                                # guard refuses plaintext without an explicit
+                                # trusted-path assertion.
                                 http_uri:
-                                  uri: "http://{{ include "identity-plane.jwksHost" . }}{{ .Values.zitadel.jwksPath }}"
+                                  uri: "{{ $jwksScheme }}://{{ include "identity-plane.jwksHost" . }}{{ .Values.zitadel.jwksPath }}"
                                   cluster: zitadel_jwks
                                   timeout: 5s
                                 cache_duration: { seconds: {{ .Values.zitadel.jwksCacheSeconds }} }
@@ -204,6 +222,24 @@ data:
                   - endpoint:
                       address:
                         socket_address: { address: {{ $zHost | quote }}, port_value: {{ $zPort }} }
+          {{- if .Values.zitadel.jwksTls.enabled }}
+          # edge-trust-anchor-integrity: authenticate the key source and protect
+          # the JWKS response against on-path substitution — verify the server
+          # chain against the trusted CA AND pin the presented SAN, so a valid
+          # cert for the wrong host cannot serve keys either.
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: {{ $jwksSni | quote }}
+              common_tls_context:
+                validation_context:
+                  trusted_ca:
+                    filename: {{ .Values.zitadel.jwksTls.caFile | quote }}
+                  match_typed_subject_alt_names:
+                    - san_type: DNS
+                      matcher: { exact: {{ $jwksSni | quote }} }
+          {{- end }}
 
         - name: identity_sidecar
           type: STRICT_DNS

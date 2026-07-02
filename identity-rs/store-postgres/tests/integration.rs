@@ -14,8 +14,10 @@
 //!   `STORE_PG_TEST_URL=postgres://postgres:postgres@localhost:5433/postgres` \
 //!     cargo test -p store-postgres --test integration -- --test-threads=1
 //!
-//! Run single-threaded (`--test-threads=1`): all tests share the one `identity`
-//! schema and each begins by truncating it, so they must not interleave.
+//! All tests share the one `identity` schema and each begins by truncating it, so
+//! they must not interleave: `setup()` serializes them behind a process-wide lock
+//! (held via the returned guard), so a plain `cargo test` — CI included — is safe
+//! without `--test-threads=1`.
 
 use std::env;
 use std::time::Duration;
@@ -26,11 +28,19 @@ use identity_core::store::{Change, ProfileStore};
 use identity_core::Profile;
 use sqlx::postgres::PgPoolOptions;
 use store_postgres::{PgProfileStore, PgSourceMembershipReader};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, timeout};
 
+/// Serializes the tests: they share one database and truncate shared tables in
+/// their setup, so two running at once would eat each other's rows. tokio's
+/// Mutex works across the per-test runtimes (`#[tokio::test]` builds one each).
+static DB_LOCK: Mutex<()> = Mutex::const_new(());
+
 /// Connect + clean the shared table, or `None` if the test DB isn't configured.
-async fn setup() -> Option<PgProfileStore> {
+/// The returned guard holds the database for the duration of the test.
+async fn setup() -> Option<(PgProfileStore, MutexGuard<'static, ()>)> {
     let url = env::var("STORE_PG_TEST_URL").ok()?;
+    let guard = DB_LOCK.lock().await;
     let store = PgProfileStore::connect(&url)
         .await
         .expect("connect to STORE_PG_TEST_URL");
@@ -50,7 +60,7 @@ async fn setup() -> Option<PgProfileStore> {
         .execute(&pool)
         .await
         .expect("reset seq");
-    Some(store)
+    Some((store, guard))
 }
 
 fn profile(sub: &str, suspended: bool) -> Profile {
@@ -88,7 +98,7 @@ macro_rules! skip_if_no_routing_db {
 
 #[tokio::test]
 async fn put_get_roundtrip() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     assert!(store.get("u1").await.unwrap().is_none(), "absent before put");
 
     let p = profile("u1", false);
@@ -101,7 +111,7 @@ async fn put_get_roundtrip() {
 
 #[tokio::test]
 async fn put_is_an_upsert() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     store.put(&profile("u1", false)).await.unwrap();
     store.put(&profile("u1", true)).await.unwrap();
     let got = store.get("u1").await.unwrap().unwrap();
@@ -110,7 +120,7 @@ async fn put_is_an_upsert() {
 
 #[tokio::test]
 async fn delete_tombstones_and_hides_from_reads() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     store.put(&profile("u1", false)).await.unwrap();
     store.delete("u1").await.unwrap();
     assert!(store.get("u1").await.unwrap().is_none(), "get hides tombstone");
@@ -125,7 +135,7 @@ async fn delete_tombstones_and_hides_from_reads() {
 
 #[tokio::test]
 async fn scan_all_returns_live_only() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     store.put(&profile("a", false)).await.unwrap();
     store.put(&profile("b", false)).await.unwrap();
     store.put(&profile("c", false)).await.unwrap();
@@ -137,7 +147,7 @@ async fn scan_all_returns_live_only() {
 
 #[tokio::test]
 async fn watch_catches_up_on_existing_changes() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     // Two distinct keys written BEFORE the watch opens. `None` would start at the
     // high-water mark and skip them; resuming from token 0 replays from the start.
     store.put(&profile("u1", false)).await.unwrap();
@@ -162,7 +172,7 @@ async fn watch_catches_up_on_existing_changes() {
 
 #[tokio::test]
 async fn watch_catchup_is_compacted_per_key() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     // The feed is COMPACTED per key: there is one row per subject, so a catch-up
     // drain (`WHERE seq > last`) replays each key's CURRENT state, not its history.
     // put-then-delete of the same subject therefore surfaces ONCE, as the delete —
@@ -187,38 +197,48 @@ async fn watch_catchup_is_compacted_per_key() {
 
 #[tokio::test]
 async fn watch_delivers_live_changes_after_open() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     // `None` = from now: the feed should pick up only writes made AFTER it opens.
     let mut feed = store.watch(None).await.unwrap();
 
-    // Give the listener a moment to be established, then write.
+    // Give the listener a moment to be established.
     sleep(Duration::from_millis(200)).await;
-    let writer = store.clone();
-    tokio::spawn(async move {
-        writer.put(&profile("live1", false)).await.unwrap();
-        writer.put(&profile("live1", true)).await.unwrap(); // suspension upsert
-        writer.delete("live1").await.unwrap();
-    });
 
-    let mut kinds = Vec::new();
-    for _ in 0..3 {
-        let ev = timeout(Duration::from_secs(5), feed.next())
-            .await
-            .expect("live feed yields within 5s")
-            .expect("stream not ended")
-            .expect("change event ok");
-        kinds.push(ev.change);
+    // Write → observe, one state at a time. The feed is COMPACTED per key (one
+    // row per subject; a drain replays the row's CURRENT state), so firing all
+    // three writes first would legitimately collapse them into fewer events —
+    // sequencing each write behind the previous event keeps every intermediate
+    // state observable while still exercising live NOTIFY delivery.
+    macro_rules! next_change {
+        () => {
+            timeout(Duration::from_secs(5), feed.next())
+                .await
+                .expect("live feed yields within 5s")
+                .expect("stream not ended")
+                .expect("change event ok")
+                .change
+        };
     }
-    assert!(matches!(&kinds[0], Change::Upsert(p) if !p.is_suspended));
-    assert!(matches!(&kinds[1], Change::Upsert(p) if p.is_suspended), "suspension lands as an upsert");
-    assert!(matches!(&kinds[2], Change::Delete(sub) if sub == "live1"));
+
+    store.put(&profile("live1", false)).await.unwrap();
+    let created = next_change!();
+    assert!(matches!(&created, Change::Upsert(p) if p.sub == "live1" && !p.is_suspended));
+
+    store.put(&profile("live1", true)).await.unwrap(); // suspension upsert
+    let suspended = next_change!();
+    assert!(matches!(&suspended, Change::Upsert(p) if p.is_suspended), "suspension lands as an upsert");
+
+    store.delete("live1").await.unwrap();
+    let deleted = next_change!();
+    assert!(matches!(&deleted, Change::Delete(sub) if sub == "live1"));
 }
 
 /// Create a minimal `routing.memberships` table (subset of the routing store's
 /// DDL — the columns the reader selects) and seed it, or `None` if no test DB.
 /// Returns a read-only reader over the same URL.
-async fn setup_routing_memberships() -> Option<PgSourceMembershipReader> {
+async fn setup_routing_memberships() -> Option<(PgSourceMembershipReader, MutexGuard<'static, ()>)> {
     let url = env::var("STORE_PG_TEST_URL").ok()?;
+    let guard = DB_LOCK.lock().await;
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
@@ -262,16 +282,17 @@ async fn setup_routing_memberships() -> Option<PgSourceMembershipReader> {
         .await
         .expect("seed membership");
     }
-    Some(
+    Some((
         PgSourceMembershipReader::connect(&url)
             .await
             .expect("connect reader"),
-    )
+        guard,
+    ))
 }
 
 #[tokio::test]
 async fn reader_projects_active_memberships_only() {
-    let reader = skip_if_no_routing_db!(reader);
+    let (reader, _guard) = skip_if_no_routing_db!(reader);
     let mut m = reader.memberships_for("u1").await.unwrap();
     m.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
     // Only the two ACTIVE rows project; the suspended ws-x is excluded (fail-closed).
@@ -292,7 +313,7 @@ async fn reader_projects_active_memberships_only() {
 
 #[tokio::test]
 async fn watch_token_resumes_without_duplicates() {
-    let store = skip_if_no_db!(store);
+    let (store, _guard) = skip_if_no_db!(store);
     store.put(&profile("u1", false)).await.unwrap();
     store.put(&profile("u2", false)).await.unwrap();
 

@@ -139,9 +139,11 @@ static_resources:
                           # copy must never survive to forge the gate (C3).
                           - remove: "x-auth-required"
                           # Versioned identity-contract stamp: the identity sidecar
-                          # authors it so the backend can prove the identity headers
-                          # came from the current trusted edge — strip any client copy
-                          # (C3, same rule as x-auth-required/x-workspace-id).
+                          # authors it as a DRIFT/version signal for the
+                          # x-workspace-*/x-user-* header shape — NOT proof of edge
+                          # origin (that guarantee is edge-origin-trust origin
+                          # enforcement). Strip any client copy so a version cannot be
+                          # forged (C3, same rule as x-auth-required/x-workspace-id).
                           - remove: "x-identity-contract"
                   # Tenant routing (C14/C15/C18) — BEFORE auth so verification may
                   # be tenant-scoped (C17). fail-closed: a routing failure must not
@@ -173,14 +175,19 @@ static_resources:
                               # The Host header sent on the JWKS fetch must equal
                               # the issuer authority; the `cluster` is the in-
                               # cluster ZITADEL upstream (zitadel_jwks below).
-                              # SECURITY (production): fetch the JWKS over HTTPS with
-                              # cert validation. Plaintext JWKS lets a network MITM
-                              # substitute signing keys → full auth bypass. Changing
-                              # the scheme here is NOT enough — Envoy uses TLS only if
-                              # the `zitadel_jwks` CLUSTER has a `transport_socket`
-                              # (UpstreamTlsContext with a validation_context + SNI).
-                              # This dev/compose config talks to a bundled ZITADEL on
-                              # the trusted loopback network, so it stays plaintext.
+                              # edge-trust-anchor-integrity: fetch the JWKS over HTTPS
+                              # with cert validation on any untrusted path. Plaintext
+                              # JWKS lets a network MITM substitute signing keys →
+                              # full auth bypass. Changing the scheme here is NOT
+                              # enough — Envoy uses TLS only if the `zitadel_jwks`
+                              # CLUSTER has a `transport_socket` (UpstreamTlsContext
+                              # with validation_context + SNI + SAN match; see the
+                              # Helm charts' zitadel.jwksTls for the reference
+                              # wiring). This dev/compose config keeps plaintext ONLY
+                              # under the explicitly asserted trusted path (the
+                              # compose-internal hop to its bundled ZITADEL — the
+                              # charts call it zitadel.jwksPlaintextTrustedPath); on
+                              # any other topology this configuration fails the spec.
                               uri: "http://auth.example.com/oauth/v2/keys"
                               cluster: zitadel_jwks
                               timeout: 5s
