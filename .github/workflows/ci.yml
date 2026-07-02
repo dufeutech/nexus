@@ -200,14 +200,17 @@ jobs:
       - name: Boot the reference stack
         run: |
           mkdir -p machinekey
-          docker compose up -d --build
-          # Deterministic readiness: the edge only starts after its health-gated
-          # dependencies, so a served request proves the whole chain is up.
+          # `|| true`: compose's dependency wait can flag a service whose FIRST
+          # start attempt fails even though restart: unless-stopped self-heals it
+          # (e.g. an IdP init racing its database). The readiness poll below is
+          # the real gate — a served request proves the whole health-gated chain
+          # (postgres -> zitadel -> sidecar/router -> seed -> envoy) is up.
+          docker compose up -d --build || true
           for i in $(seq 1 90); do
             curl -sf -H 'Host: localhost' http://localhost:10000/ >/dev/null && exit 0
             sleep 5
           done
-          echo 'edge never became ready'; docker compose ps; exit 1
+          echo 'edge never became ready'; docker compose ps -a; exit 1
 
       - name: Anonymous edge e2e (tenancy trust contract)
         run: sh scripts/tenancy-edge-e2e.sh
@@ -220,4 +223,6 @@ jobs:
 
       - name: Stack logs (on failure)
         if: failure()
-        run: docker compose logs --tail 150
+        run: |
+          docker compose ps -a
+          docker compose logs --tail 150
