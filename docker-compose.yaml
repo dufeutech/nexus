@@ -341,10 +341,26 @@ services:
         condition: service_healthy
 
   envoy:
+    # v1.34 confirmed for N6 tracing: the native OTel tracer
+    # (envoy.tracers.opentelemetry), early_header_mutation_extensions, and
+    # tracing.spawn_upstream_span are all stable in this line. Bump minor
+    # versions deliberately — re-verify span export (the OTel tracer is still
+    # flagged work-in-progress upstream; see edge-rooted-tracing design.md).
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.34-latest}
     container_name: zitadel-lab-envoy
     restart: unless-stopped
-    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    command:
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - info
+      # N6 head-sampling knob, env-driven without templating the mounted
+      # config: the runtime key tracing.random_sampling overrides the
+      # stanza's random_sampling default. Whole percent, 0-100 (an integer
+      # runtime value uses legacy percent semantics — verified empirically:
+      # 50 => ~50% sampled). 100 = trace everything (lab default).
+      - --config-yaml
+      - '{"layered_runtime":{"layers":[{"name":"tracing-env","static_layer":{"tracing":{"random_sampling":${TRACE_SAMPLING_PCT:-100}}}}]}}'
     volumes:
       - ./edge/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
@@ -417,6 +433,44 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+      - tempo
+
+  # --- tracing (N6): edge --OTLP--> otel-collector --> tempo <-- grafana ------
+  # The collector is the SINGLE telemetry egress point: producers (the edge)
+  # know only the collector; only the collector's config knows Tempo. The edge
+  # deliberately does NOT depends_on the collector — trace export is fail-open
+  # (a telemetry outage must never affect request handling), and the boxes'
+  # bring-up-order contract stays flexible.
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: zitadel-lab-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/otel-collector.yaml"]
+    environment:
+      # The ONLY place the trace store's address enters the system (single-
+      # egress rule); the collector config reads it via ${env:...}.
+      TEMPO_OTLP_ENDPOINT: ${TEMPO_OTLP_ENDPOINT:-tempo:4317}
+    volumes:
+      - ./monitoring/otel-collector/otel-collector.yaml:/etc/otelcol/otel-collector.yaml:ro
+    ports:
+      # OTLP/HTTP on loopback for host-side test spans; the edge exports
+      # OTLP/gRPC in-network (otel-collector:4317, not published).
+      - "127.0.0.1:${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: zitadel-lab-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./monitoring/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo:rw
+    ports:
+      # Query API on loopback for operator/debug queries; Grafana reaches it
+      # in-network (tempo:3200).
+      - "127.0.0.1:${TEMPO_HTTP_PORT:-3200}:3200"
 
 networks:
   # edge-origin-trust: the internal network that makes "backends accept requests
@@ -428,3 +482,4 @@ networks:
 
 volumes:
   postgres-data:
+  tempo-data:

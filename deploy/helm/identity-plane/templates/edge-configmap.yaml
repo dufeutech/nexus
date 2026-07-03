@@ -60,6 +60,20 @@ data:
                     normalize_path: true
                     merge_slashes: true
                     path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                    # Trace-context integrity (N6/C3): strip client
+                    # traceparent/tracestate BEFORE Envoy's tracing decision.
+                    # This standalone edge configures no tracer today, but the
+                    # early strip keeps the integrity rule uniform across every
+                    # edge (a later tracer addition cannot silently join a
+                    # client-rooted trace). The filter-level strip below stays
+                    # as defense-in-depth for the backend-facing guarantee.
+                    early_header_mutation_extensions:
+                      - name: envoy.http.early_header_mutation.header_mutation
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.http.early_header_mutation.header_mutation.v3.HeaderMutation
+                          mutations:
+                            - remove: "traceparent"
+                            - remove: "tracestate"
                     # JSON access log (audit trail): method/path/status/host and the
                     # auth outcome. Deliberately NO Authorization header and NO
                     # x-user-* (PII/secret hygiene). response_flags shows WHY a
@@ -151,6 +165,12 @@ data:
                               # cannot forge a version (C3, same rule as
                               # x-workspace-id).
                               - remove: "x-identity-contract"
+                              # W3C trace context (N6): the edge is the ONLY origin of
+                              # trace context on the internal network. Boxes continue
+                              # an arriving trace (fail-open contract), so a client-
+                              # forged traceparent must never survive to be joined (C3).
+                              - remove: "traceparent"
+                              - remove: "tracestate"
                       - name: envoy.filters.http.jwt_authn
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication

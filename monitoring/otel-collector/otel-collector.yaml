@@ -1,0 +1,37 @@
+# OpenTelemetry Collector — the SINGLE telemetry egress point (N6).
+#
+# Every trace producer (the Envoy edge today; Rust services in a later phase)
+# exports OTLP to THIS collector and knows nothing else. Only this file knows
+# the trace store's address, so adding/changing/fanning-out destinations
+# (customer SIEM, vendor APM, a second store) is an edit HERE — never a
+# producer config change. Do not point any producer directly at Tempo.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # Envoy's OTel tracer exports OTLP/gRPC here (in-network :4317).
+        endpoint: 0.0.0.0:4317
+      http:
+        # OTLP/HTTP kept open for host-side test spans and future producers.
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch before export — standard back-pressure hygiene for the OTLP exporter.
+  batch: {}
+
+exporters:
+  otlp:
+    # The ONE place the trace store's address is known (single-egress rule).
+    # Set via the compose service env (TEMPO_OTLP_ENDPOINT), not a literal.
+    endpoint: ${env:TEMPO_OTLP_ENDPOINT}
+    tls:
+      # Lab/compose-internal hop; the deliberately-insecure lab posture.
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp]

@@ -1,0 +1,39 @@
+# Grafana Tempo — the trace store (N6). Reachable ONLY by the OTel Collector
+# (its sole writer, via OTLP/gRPC :4317) and Grafana (its sole reader, via the
+# query API :3200). No producer may know this address — trace egress goes
+# through the collector (see monitoring/otel-collector/otel-collector.yaml).
+
+server:
+  http_listen_port: 3200
+
+# Grafana's Tempo datasource streams TraceQL search results over HTTP.
+stream_over_http_enabled: true
+
+usage_report:
+  reporting_enabled: false
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    # Local-disk storage: minimal-ops lab default. Object storage is the
+    # production-scale option; swapping is a config change here only.
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+# Short retention on purpose: traces are a debugging signal, not the audit
+# record — the audit access log owns long retention (see the phase-4 roadmap
+# in openspec/changes/edge-rooted-tracing/design.md). Tempo 3 sets retention
+# as a per-tenant override (the standalone `compactor` block is gone).
+overrides:
+  defaults:
+    compaction:
+      block_retention: 48h

@@ -78,6 +78,28 @@ edge:
     minReplicas: 2
     maxReplicas: 20
     targetCPUUtilizationPercentage: 70
+  # ------------------------------------------------------------------------ #
+  # N6 edge-rooted tracing. The edge is the SOLE root of trace context: client
+  # traceparent/tracestate are stripped before the tracing decision (early
+  # header mutation), the edge head-samples at `samplingPercent`, and injects
+  # W3C trace context toward the backend pools. Export is OTLP/gRPC to
+  # `collectorHost:collectorPort` — the SINGLE telemetry egress (an OTel
+  # Collector; only its config may know the trace store). Like Prometheus in
+  # these charts (ServiceMonitors -> external operator), the collector and the
+  # trace store (e.g. Tempo) are EXTERNAL — point at your monitoring
+  # namespace's collector. Fail-open: an unreachable collector never affects
+  # request handling. Disabled by default ONLY because the endpoint is
+  # deployment-specific — a topology that can trace, should (running without
+  # tracing is a deployment gap, not a supported variant).
+  # ------------------------------------------------------------------------ #
+  tracing:
+    enabled: false
+    # OTLP/gRPC endpoint of your OTel Collector.
+    collectorHost: "otel-collector.monitoring.svc.cluster.local"
+    collectorPort: 4317
+    # Head-sampling rate in whole percent (0-100). 100 = trace every request.
+    samplingPercent: 100
+    serviceName: "nexus-edge"
   service:
     type: ClusterIP
     port: 80

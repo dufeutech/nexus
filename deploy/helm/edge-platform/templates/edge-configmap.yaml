@@ -62,6 +62,49 @@ data:
                     normalize_path: true
                     merge_slashes: true
                     path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                    # Trace-context integrity (N6/C3): Envoy makes its
+                    # join-vs-root tracing decision BEFORE the http_filters
+                    # run, so the header_mutation strip below is too late for
+                    # the tracer — a client-forged traceparent would be JOINED
+                    # (client-rooted trace). Early mutation runs before that
+                    # decision, so the edge always roots its own trace. Always
+                    # rendered (not gated on tracing.enabled): it is the
+                    # integrity half of the contract.
+                    early_header_mutation_extensions:
+                      - name: envoy.http.early_header_mutation.header_mutation
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.http.early_header_mutation.header_mutation.v3.HeaderMutation
+                          mutations:
+                            - remove: "traceparent"
+                            - remove: "tracestate"
+                    {{- if .Values.edge.tracing.enabled }}
+                    # Edge-rooted tracing (N6): head-sample here, export
+                    # OTLP/gRPC to the otel_collector cluster (the SINGLE
+                    # telemetry egress; only the collector knows the trace
+                    # store). Fail-open: the collector being down never
+                    # affects request handling.
+                    tracing:
+                      provider:
+                        name: envoy.tracers.opentelemetry
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                          grpc_service:
+                            envoy_grpc: { cluster_name: otel_collector }
+                            timeout: 0.250s
+                          service_name: {{ .Values.edge.tracing.serviceName | quote }}
+                      random_sampling: { value: {{ .Values.edge.tracing.samplingPercent }} }
+                      # Distinct child span for the upstream (backend) call.
+                      spawn_upstream_span: true
+                      # PII hygiene (same rule as the access log): default span
+                      # attributes only plus the two explicitly-allowed routing
+                      # tags below. NO Authorization, NO x-user-*, NO bodies —
+                      # do not add tags outside the access-log-allowed set.
+                      custom_tags:
+                        - tag: nexus.route_pool
+                          request_header: { name: x-route-pool }
+                        - tag: nexus.workspace_id
+                          request_header: { name: x-workspace-id }
+                    {{- end }}
                     # JSON access log (audit trail): method/path/status/host/tenant
                     # and the per-route gate decision. Deliberately NO Authorization
                     # header and NO x-user-* (PII/secret hygiene). response_flags
@@ -176,6 +219,12 @@ data:
                               # enforcement). Strip any client copy so a version cannot
                               # be forged (C3, same rule as x-auth-required/x-workspace-id).
                               - remove: "x-identity-contract"
+                              # W3C trace context (N6): the edge is the ONLY origin of
+                              # trace context on the internal network. Boxes continue
+                              # an arriving trace (fail-open contract), so a client-
+                              # forged traceparent must never survive to be joined (C3).
+                              - remove: "traceparent"
+                              - remove: "tracestate"
                       # Tenant routing (C14/C15/C18) — runs BEFORE auth so
                       # verification may be tenant-scoped (C17).
                       - name: tenant-router.ext_proc
@@ -323,4 +372,25 @@ data:
                   - endpoint:
                       address:
                         socket_address: { address: {{ $pool.host | quote }}, port_value: {{ $pool.port }} }
+        {{- end }}
+        {{- if .Values.edge.tracing.enabled }}
+        # OTel Collector (N6): the edge's ONLY telemetry egress — trace export
+        # goes here and nowhere else (the collector alone knows the trace
+        # store). EXTERNAL, like Prometheus. Fail-open: an unreachable
+        # collector never affects request handling.
+        - name: otel_collector
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: otel_collector
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: {{ .Values.edge.tracing.collectorHost | quote }}, port_value: {{ .Values.edge.tracing.collectorPort }} }
         {{- end }}

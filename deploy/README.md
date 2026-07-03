@@ -157,6 +157,36 @@ checks.
 
 ---
 
+## Tracing (edge-rooted, N6)
+
+The edge is the **sole root of trace context** on the internal network: client
+`traceparent`/`tracestate` are stripped before Envoy's tracing decision, the
+edge makes the head-sampling decision, and injects W3C trace context toward the
+backend pools (unsampled requests carry a *not-sampled* `traceparent`; boxes
+continue the trace when present, root their own when absent — **bring-up order
+stays flexible in either direction**). Export is OTLP/gRPC to an **OTel
+Collector — the single telemetry egress**: producers know only the collector;
+only the collector's config knows the trace store (Tempo → Grafana). Export is
+**fail-open**: an unreachable collector never affects request handling.
+
+- **Compose:** the `otel_collector` cluster in `compose/envoy/envoy.yaml` is an
+  EXTERNAL upstream like the pools — point it at your collector's OTLP/gRPC
+  endpoint. Sampling knob: `TRACE_SAMPLING_PCT` in `.env` (whole percent,
+  0–100; overrides at runtime via the compose command, no config edit). The
+  test lab (`../docker-compose.yaml` + `../monitoring/`) bundles a working
+  collector + Tempo + Grafana datasource to copy from.
+- **Helm:** `edge.tracing.*` on the `edge-platform` umbrella —
+  `enabled`, `collectorHost`/`collectorPort`, `samplingPercent`. The collector
+  and Tempo are EXTERNAL to the charts, exactly like Prometheus
+  (ServiceMonitors → your operator). Enable it: a topology that can trace,
+  should.
+- **Hygiene is enforced in the stanza, not by policy:** span attributes are the
+  access-log-allowed set only (method/path/status/durations, route pool,
+  workspace id). Adding a `custom_tags` entry for a credential or `x-user-*`
+  header is a spec violation (`edge-request-tracing`).
+- Roadmap (log↔trace correlation, service spans, retention/SLO policy — phases
+  2–4) is recorded in the `edge-rooted-tracing` change's `design.md`.
+
 ## BREAKING — upgrading to the fail-closed edge guards
 
 Two guards now make previously-implicit security choices explicit. A chart
@@ -358,3 +388,9 @@ sidecar resolves the acting workspace against). Notes:
 When you add a trusted header, add it to the C3 strip list in **every** edge
 config (`compose/envoy/envoy.yaml` and the three `helm/*/templates/edge-configmap.yaml`).
 A forgotten strip is a privilege-escalation bug. See `../INFO.md` §4.
+
+The trace-context headers (`traceparent`/`tracestate`) are stripped in **two**
+places per edge: the `early_header_mutation_extensions` (before Envoy's
+join-vs-root tracing decision — removing only the filter-level strip would let
+a client-forged trace be silently JOINED) and the C3 filter strip
+(defense-in-depth for the backend-facing guarantee). Keep both.

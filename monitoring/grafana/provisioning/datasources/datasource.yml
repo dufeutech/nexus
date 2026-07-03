@@ -8,3 +8,12 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+
+  # Trace store (N6 edge-rooted tracing): query traces by trace ID. Grafana is
+  # Tempo's only reader; producers export via the OTel Collector, never here.
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true

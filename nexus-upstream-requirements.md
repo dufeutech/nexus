@@ -12,7 +12,7 @@ both repos").
 
 ---
 
-## Status (2026-07-02 — verified against source)
+## Status (2026-07-03 — verified against source)
 
 | Req    | State                        | Where                                                                                                      |
 | ------ | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
@@ -21,7 +21,7 @@ both repos").
 | **N3** | finding only                 | no work — kept below in case wildcard tiers are ever wanted                                                |
 | **N4** | ✅ SHIPPED (both phases)     | phase 1 auth gate + phase 2 role/entitlement/AAL gate (change `edge-role-entitlement-gate`, 2026-07-02)    |
 | **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **open action is jsbox-side** |
-| **N6** | ⏳ open — enhancement        | no trace propagation anywhere yet (edge has no tracing config; monitoring is metrics-only)                 |
+| **N6** | ✅ SHIPPED                   | edge-rooted W3C tracing (change `edge-rooted-tracing`, 2026-07-03): Envoy OTel tracer → collector → Tempo; client trace context stripped at C3 |
 
 ---
 
@@ -119,18 +119,21 @@ Bump `v1` → `v2` in BOTH repos together on any future header-shape change.
 `x-tenant-id` survives only as a legacy read-fallback inside the sidecar. Boxes read
 `x-workspace-id` (their trusted-header names are configurable box-side).
 
-### N6 — W3C `traceparent` propagation (open, enhancement — not a gate)
+### N6 — W3C `traceparent` propagation
 
-The edge does not start or propagate a trace today: `edge/envoy.yaml` has no tracing
-stanza, no OTLP/OpenTelemetry config exists anywhere in the repo, and monitoring is
-metrics-only (Prometheus + Grafana, no collector). Boxes fail open — runlet starts its own
-root span when no `traceparent` arrives — so this is an observability enhancement, not a
-release gate.
-
-Work when picked up: Envoy tracing config (edge starts the trace, makes the head sampling
-decision, injects W3C `traceparent`/`tracestate` toward the box) + a collector in the
-monitoring stack. Boxes continue the trace and do no tail sampling. Bring-up order is
-flexible (boxes tolerate either order).
+**Shipped 2026-07-03** (change `edge-rooted-tracing`). The edge is the sole root of trace
+context on the internal network: client `traceparent`/`tracestate` are stripped BEFORE
+Envoy's join-vs-root tracing decision (early header mutation) and again in the C3 filter
+strip, the edge makes the head-sampling decision (env/values knob; unsampled requests
+carry a not-sampled `traceparent` to the box), and injects W3C trace context toward the
+pools. Export is OTLP/gRPC to an OTel Collector — the single telemetry egress; only the
+collector's config knows the trace store (Tempo, queryable in Grafana by trace ID).
+Tracing config lives in all edge topologies: `edge/envoy.yaml` +
+`deploy/compose/envoy/envoy.yaml` (compose) and the helm charts (`edge.tracing.*`
+values). Fail-open verified: a down collector never affects requests. Boxes continue the
+trace and do no tail sampling; bring-up order stays flexible (boxes tolerate either
+order). Span attributes observe the access-log PII hygiene (no credentials, no
+`x-user-*`, no bodies).
 
 ---
 
@@ -158,7 +161,7 @@ resource-ownership checks.
 | `x-user-roles`, `x-user-entitlements`, `x-auth-method` | enrichment inputs (also enforced at the edge per-route, N4 Phase 2) | shipped (injected + enforced) |
 | `x-auth-required`, `x-auth-requires-*`, `x-auth-min-aal` | edge-internal policy signals (jwt_authn branch + sidecar 403 gate); stripped, never reach boxes | shipped                       |
 | `x-identity-contract: v1`                          | versioned contract stamp = the acting-org tripwire (a valid `vN` carries acting `x-workspace-id` + `x-user-type`); boxes reject unknown/absent versions on enriched routes | shipped (jsbox must switch its check to this — N5) |
-| `traceparent`                                      | W3C trace context, edge-rooted                                     | open — N6, boxes fail open    |
+| `traceparent`                                      | W3C trace context, **always edge-rooted** (client copies stripped; sampled flag = the edge's head decision) | shipped (boxes still fail open when absent) |
 
 ---
 

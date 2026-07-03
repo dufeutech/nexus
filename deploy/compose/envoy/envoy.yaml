@@ -38,6 +38,52 @@ static_resources:
                 normalize_path: true
                 merge_slashes: true
                 path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD
+                # Trace-context integrity (N6/C3): Envoy makes its join-vs-root
+                # tracing decision BEFORE the http_filters run, so the
+                # header_mutation strip below is too late for the tracer — a
+                # client-forged traceparent would be JOINED (client-rooted
+                # trace). Early mutation runs before that decision, so the edge
+                # always roots its own trace. The filter-level strip stays as
+                # defense-in-depth for the backend-facing guarantee.
+                early_header_mutation_extensions:
+                  - name: envoy.http.early_header_mutation.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.http.early_header_mutation.header_mutation.v3.HeaderMutation
+                      mutations:
+                        - remove: "traceparent"
+                        - remove: "tracestate"
+                # Edge-rooted tracing (N6): the edge is the sole root of trace
+                # context — it head-samples here and injects W3C traceparent
+                # toward the box. Export is OTLP/gRPC to the OTel Collector
+                # cluster (the SINGLE telemetry egress; only the collector
+                # knows the trace store). Fail-open: the collector being down
+                # never affects request handling.
+                # random_sampling is the default; the runtime key
+                # tracing.random_sampling (set env-driven via --config-yaml in
+                # the compose command) overrides it without editing this file.
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      grpc_service:
+                        envoy_grpc: { cluster_name: otel_collector }
+                        timeout: 0.250s
+                      service_name: nexus-edge
+                  random_sampling: { value: 100 }
+                  # Distinct child span for the upstream (backend) call, so the
+                  # trace separates edge processing from backend time.
+                  spawn_upstream_span: true
+                  # PII hygiene (same rule as the access log): default span
+                  # attributes only (method/path/status/flags/durations) plus
+                  # the two explicitly-allowed routing tags below. NO
+                  # Authorization, NO x-user-*, NO bodies — do not add tags
+                  # outside the access-log-allowed set.
+                  custom_tags:
+                    - tag: nexus.route_pool
+                      request_header: { name: x-route-pool }
+                    - tag: nexus.workspace_id
+                      request_header: { name: x-workspace-id }
                 # JSON access log (audit trail): method/path/status/host/tenant and
                 # the per-route gate decision. Deliberately NO Authorization header
                 # and NO x-user-* (PII/secret hygiene). response_flags shows WHY a
@@ -145,6 +191,12 @@ static_resources:
                           # enforcement). Strip any client copy so a version cannot be
                           # forged (C3, same rule as x-auth-required/x-workspace-id).
                           - remove: "x-identity-contract"
+                          # W3C trace context (N6): the edge is the ONLY origin of
+                          # trace context on the internal network. Boxes continue an
+                          # arriving trace (fail-open contract), so a client-forged
+                          # traceparent must never survive to be joined (C3).
+                          - remove: "traceparent"
+                          - remove: "tracestate"
                   # Tenant routing (C14/C15/C18) — BEFORE auth so verification may
                   # be tenant-scoped (C17). fail-closed: a routing failure must not
                   # silently default a route.
@@ -271,6 +323,27 @@ static_resources:
                     socket_address: { address: identity-sidecar, port_value: 50051 }
 
     # ---- EXTERNAL upstreams — EDIT to point at YOUR infrastructure ----------
+    # OTel Collector (N6): the edge's ONLY telemetry egress — trace export goes
+    # here and nowhere else (the collector alone knows the trace store). This
+    # production stack bundles NO monitoring; point this at your collector's
+    # OTLP/gRPC endpoint. Fail-open: an unreachable collector never affects
+    # request handling (deliberately NOT a startup dependency).
+    - name: otel_collector
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: otel_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: otel-collector, port_value: 4317 }
+
     # ZITADEL (the IdP) — for the JWKS fetch. Address = the in-cluster/host
     # endpoint Envoy can reach; the Host header above stays the issuer authority.
     - name: zitadel_jwks

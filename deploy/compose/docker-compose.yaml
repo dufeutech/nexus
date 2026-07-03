@@ -132,9 +132,25 @@ services:
   # Envoy runs the tenant-first chain and forwards. The combined config lives in
   # ./envoy/envoy.yaml — edit its zitadel_jwks + pool_* upstreams for your infra.
   envoy:
+    # v1.34 confirmed for N6 tracing: the native OTel tracer
+    # (envoy.tracers.opentelemetry), early_header_mutation_extensions, and
+    # tracing.spawn_upstream_span are all stable in this line. Bump minor
+    # versions deliberately — re-verify span export (the OTel tracer is still
+    # flagged work-in-progress upstream; see edge-rooted-tracing design.md).
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.34-latest}
     restart: unless-stopped
-    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    command:
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - info
+      # N6 head-sampling knob, env-driven without templating the mounted
+      # config: the runtime key tracing.random_sampling overrides the
+      # stanza's random_sampling default. Whole percent, 0-100 (an integer
+      # runtime value uses legacy percent semantics — verified empirically:
+      # 50 => ~50% sampled). Set TRACE_SAMPLING_PCT in .env for production.
+      - --config-yaml
+      - '{"layered_runtime":{"layers":[{"name":"tracing-env","static_layer":{"tracing":{"random_sampling":${TRACE_SAMPLING_PCT:-100}}}}]}}'
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
