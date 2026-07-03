@@ -250,3 +250,33 @@ async fn init_schema_backfills_a_solo_account_for_an_ownerless_workspace() {
     store.init_schema().await.unwrap();
     assert_eq!(workspace_account(&pool, "legacy_ws").await.as_deref(), Some("legacy_ws"));
 }
+
+#[tokio::test]
+async fn auth_route_requirement_fields_round_trip() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+    store.upsert_workspace(&workspace("ws_auth")).await.unwrap();
+
+    // A phase-1 rule (no requirements) and a phase-2 gated rule.
+    let plain = router_core::auth::RouteAuth { required: true, ..router_core::auth::RouteAuth::PASS_THROUGH };
+    let gated = router_core::auth::RouteAuth {
+        required: true,
+        requires_role: Some("admin".to_owned()),
+        requires_entitlement: Some("pro".to_owned()),
+        min_aal: Some(2),
+    };
+    store.upsert_auth_route("ws_auth", "/", &plain).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/admin", &gated).await.unwrap();
+
+    let policy = store.get_auth_policy("ws_auth").await.unwrap();
+    let hit = policy.resolve("/admin/users");
+    assert_eq!(hit.requires_role.as_deref(), Some("admin"));
+    assert_eq!(hit.requires_entitlement.as_deref(), Some("pro"));
+    assert_eq!(hit.min_aal, Some(2));
+    let miss = policy.resolve("/pricing");
+    assert!(miss.required && !miss.has_requirements(), "phase-1 rule carries no requirements");
+
+    // Upserting the gated rule back to plain clears the requirement columns.
+    store.upsert_auth_route("ws_auth", "/admin", &plain).await.unwrap();
+    let policy = store.get_auth_policy("ws_auth").await.unwrap();
+    assert!(!policy.resolve("/admin").has_requirements());
+}

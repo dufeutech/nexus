@@ -38,6 +38,7 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
+use router_core::auth::RouteAuth;
 use router_core::domain::{PoolSet, WorkspaceConfig};
 use router_core::normalize::normalize_host;
 use router_core::plan::{DomainLimit, PlanLimits};
@@ -634,6 +635,14 @@ async fn delete_domain(
 struct AuthRouteBody {
     path_prefix: String,
     auth_required: bool,
+    /// Phase-2 requirements (N4): optional; any of them present demands
+    /// `auth_required = true` (validated at write time — see the handler).
+    #[serde(default)]
+    requires_role: Option<String>,
+    #[serde(default)]
+    requires_entitlement: Option<String>,
+    #[serde(default)]
+    min_aal: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -661,6 +670,14 @@ impl App {
     fn valid_prefix(prefix: &str) -> bool {
         prefix.starts_with('/')
     }
+
+    /// A rule combining a phase-2 requirement with `auth_required = false` is
+    /// contradictory (requirements imply authentication): the gate would leak
+    /// authorization policy as 403s to callers who were never asked to log in.
+    /// Rejected at write time so such a rule never enters the store.
+    fn inconsistent_requirements(auth: &RouteAuth) -> bool {
+        auth.has_requirements() && !auth.required
+    }
 }
 
 async fn upsert_auth_route(
@@ -675,6 +692,23 @@ async fn upsert_auth_route(
         )
             .into_response();
     }
+    let auth = RouteAuth {
+        required: body.auth_required,
+        requires_role: body.requires_role.clone(),
+        requires_entitlement: body.requires_entitlement.clone(),
+        min_aal: body.min_aal,
+    };
+    if App::inconsistent_requirements(&auth) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "requirements_need_auth",
+                "path_prefix": body.path_prefix,
+                "hint": "a rule with requires_role/requires_entitlement/min_aal must set auth_required = true",
+            })),
+        )
+            .into_response();
+    }
     // The FK would reject an unknown workspace as a 500; check first for a clean 404.
     match s.store.get_workspace(&tenant_id).await {
         Ok(Some(_)) => {}
@@ -684,14 +718,22 @@ async fn upsert_auth_route(
         }
         Err(e) => return internal(e),
     }
-    if let Err(e) = s.store.upsert_auth_route(&tenant_id, &body.path_prefix, body.auth_required).await {
+    if let Err(e) = s.store.upsert_auth_route(&tenant_id, &body.path_prefix, &auth).await {
         return internal(e);
     }
     s.invalidate_tenant(&tenant_id, "upsert_auth_route").await;
     counter!("control_mutations_total", "op" => "upsert_auth_route").increment(1);
     (
         StatusCode::OK,
-        Json(json!({ "result": "ok", "tenant_id": tenant_id, "path_prefix": body.path_prefix, "auth_required": body.auth_required })),
+        Json(json!({
+            "result": "ok",
+            "tenant_id": tenant_id,
+            "path_prefix": body.path_prefix,
+            "auth_required": auth.required,
+            "requires_role": auth.requires_role,
+            "requires_entitlement": auth.requires_entitlement,
+            "min_aal": auth.min_aal,
+        })),
     )
         .into_response()
 }
@@ -716,7 +758,15 @@ async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -
             let routes: Vec<_> = policy
                 .rules()
                 .iter()
-                .map(|r| json!({ "path_prefix": r.prefix, "auth_required": r.auth.required }))
+                .map(|r| {
+                    json!({
+                        "path_prefix": r.prefix,
+                        "auth_required": r.auth.required,
+                        "requires_role": r.auth.requires_role,
+                        "requires_entitlement": r.auth.requires_entitlement,
+                        "min_aal": r.auth.min_aal,
+                    })
+                })
                 .collect();
             (StatusCode::OK, Json(json!({ "tenant_id": tenant_id, "routes": routes }))).into_response()
         }
@@ -1203,6 +1253,36 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_route_validation_tests {
+    use super::{App, RouteAuth};
+
+    /// Spec "Inconsistent rule is rejected at write time": any requirement field
+    /// with `auth_required = false` is the rejected combination; the same fields
+    /// with `auth_required = true`, or no fields at all, are accepted.
+    /// (Persistence + NOTIFY of an accepted rule is covered by the store
+    /// integration round-trip and the shared `invalidate_tenant` path.)
+    #[test]
+    fn requirement_with_anonymous_route_is_inconsistent() {
+        let anonymous_gated = RouteAuth {
+            required: false,
+            requires_role: Some("admin".into()),
+            ..RouteAuth::PASS_THROUGH
+        };
+        assert!(App::inconsistent_requirements(&anonymous_gated));
+
+        let authed_gated = RouteAuth {
+            required: true,
+            min_aal: Some(2),
+            ..RouteAuth::PASS_THROUGH
+        };
+        assert!(!App::inconsistent_requirements(&authed_gated));
+
+        let phase1_public = RouteAuth::PASS_THROUGH;
+        assert!(!App::inconsistent_requirements(&phase1_public));
+    }
 }
 
 // --------------------------------------------------------------------------- //

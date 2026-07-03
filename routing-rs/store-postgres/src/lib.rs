@@ -257,6 +257,17 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
+        // Phase-2 requirement fields (N4): optional per-rule role / entitlement /
+        // minimum-AAL. NULL = no requirement = the phase-1 behavior, so the
+        // additive columns are inert for existing rows and phase-1 binaries.
+        sqlx::query(
+            "ALTER TABLE routing.auth_routes \
+                 ADD COLUMN IF NOT EXISTS requires_role text, \
+                 ADD COLUMN IF NOT EXISTS requires_entitlement text, \
+                 ADD COLUMN IF NOT EXISTS min_aal smallint",
+        )
+        .execute(&self.pool)
+        .await?;
         // Memberships — the live authz source of record (nexus-owned-workspace-
         // tenancy): who acts in a workspace, as which type (staff|customer) and
         // role. The identity plane resolves it fail-closed on the hot path (behind
@@ -541,7 +552,8 @@ impl RoutingStore for PgRoutingStore {
         // through) falls out of an empty `AuthPolicy`, so a workspace with no policy
         // is public.
         let rows = sqlx::query(
-            "SELECT path_prefix, auth_required FROM routing.auth_routes WHERE workspace_id = $1",
+            "SELECT path_prefix, auth_required, requires_role, requires_entitlement, min_aal \
+             FROM routing.auth_routes WHERE workspace_id = $1",
         )
         .bind(workspace_id)
         .fetch_all(&self.pool)
@@ -550,7 +562,14 @@ impl RoutingStore for PgRoutingStore {
             .into_iter()
             .map(|r| PathRule {
                 prefix: r.get::<String, _>("path_prefix"),
-                auth: RouteAuth { required: r.get::<bool, _>("auth_required") },
+                auth: RouteAuth {
+                    required: r.get::<bool, _>("auth_required"),
+                    requires_role: r.get::<Option<String>, _>("requires_role"),
+                    requires_entitlement: r.get::<Option<String>, _>("requires_entitlement"),
+                    min_aal: r
+                        .get::<Option<i16>, _>("min_aal")
+                        .and_then(|v| u8::try_from(v).ok()),
+                },
             })
             .collect();
         Ok(AuthPolicy::new(rules))
@@ -560,17 +579,25 @@ impl RoutingStore for PgRoutingStore {
         &self,
         workspace_id: &str,
         prefix: &str,
-        required: bool,
+        auth: &RouteAuth,
     ) -> Result<(), BoxError> {
         sqlx::query(
-            "INSERT INTO routing.auth_routes (workspace_id, path_prefix, auth_required, updated_at) \
-             VALUES ($1, $2, $3, now()) \
+            "INSERT INTO routing.auth_routes \
+                 (workspace_id, path_prefix, auth_required, requires_role, requires_entitlement, min_aal, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now()) \
              ON CONFLICT (workspace_id, path_prefix) DO UPDATE SET \
-                 auth_required = EXCLUDED.auth_required, updated_at = now()",
+                 auth_required = EXCLUDED.auth_required, \
+                 requires_role = EXCLUDED.requires_role, \
+                 requires_entitlement = EXCLUDED.requires_entitlement, \
+                 min_aal = EXCLUDED.min_aal, \
+                 updated_at = now()",
         )
         .bind(workspace_id)
         .bind(prefix)
-        .bind(required)
+        .bind(auth.required)
+        .bind(auth.requires_role.as_deref())
+        .bind(auth.requires_entitlement.as_deref())
+        .bind(auth.min_aal.map(i16::from))
         .execute(&self.pool)
         .await?;
         Ok(())

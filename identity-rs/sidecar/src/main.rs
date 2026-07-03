@@ -14,6 +14,7 @@
 //! Hardening: structured logging (tracing), Prometheus metrics (C12), and
 //! graceful shutdown on SIGTERM/SIGINT for both servers.
 
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -67,6 +68,31 @@ const PAYLOAD_KEY: &str = "verified";
 /// sides together.
 const IDENTITY_CONTRACT_VERSION: &str = "v1";
 
+/// Per-route requirement signals (N4 phase 2), emitted by the tenant-router from
+/// the tenant's resolved auth policy and C3-stripped from client input — trusted
+/// by the time they reach this filter. On the wire, absence IS the
+/// no-requirement state; this filter enforces them (403) and strips them before
+/// the backend (policy detail never leaves the edge).
+const HDR_REQUIRES_ROLE: &str = "x-auth-requires-role";
+const HDR_REQUIRES_ENTITLEMENT: &str = "x-auth-requires-entitlement";
+const HDR_MIN_AAL: &str = "x-auth-min-aal";
+
+/// Method→assurance-level ordering (N4 phase 2): the single owner of "how strong
+/// is this authentication method". Data-driven via `SIDECAR_AAL_LEVELS`
+/// (`method=level[,method=level…]`) so richer methods (MFA/passkey) slot in
+/// without a rebuild once `x-auth-method` distinguishes them; a method missing
+/// from the map fails any min-AAL requirement (closed), never defaults up.
+const DEFAULT_AAL_LEVELS: &str = "none=0,bearer=1";
+
+fn parse_aal_levels(spec: &str) -> HashMap<String, u8> {
+    spec.split(',')
+        .filter_map(|pair| {
+            let (method, level) = pair.split_once('=')?;
+            Some((method.trim().to_ascii_lowercase(), level.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,6 +115,9 @@ struct AppState {
     /// availability-first behavior (enrich without a profile). A genuinely absent
     /// profile (no row) is NOT this case and never fails closed.
     fail_open: bool,
+    /// The method→AAL ordering the min-AAL requirement compares against
+    /// (`SIDECAR_AAL_LEVELS`, default [`DEFAULT_AAL_LEVELS`]).
+    aal_levels: Arc<HashMap<String, u8>>,
 }
 
 /// The outcome of resolving a subject's profile — distinguishes "no row" (a
@@ -242,6 +271,93 @@ fn extract_acting_workspace(req: &ProcessingRequest) -> Option<String> {
     find_header(map, "x-workspace-id").or_else(|| find_header(map, "x-tenant-id"))
 }
 
+/// The per-route requirements resolved by the tenant-router for THIS request,
+/// read from its trusted signals. `min_aal` is kept raw: an unparseable value is
+/// a requirement we cannot evaluate, which must DENY (fail-closed), not vanish.
+#[derive(Default)]
+struct RouteRequirements {
+    role: Option<String>,
+    entitlement: Option<String>,
+    min_aal: Option<String>,
+}
+
+impl RouteRequirements {
+    fn any(&self) -> bool {
+        self.role.is_some() || self.entitlement.is_some() || self.min_aal.is_some()
+    }
+}
+
+fn extract_requirements(req: &ProcessingRequest) -> RouteRequirements {
+    let Some(processing_request::Request::RequestHeaders(HttpHeaders { headers: Some(map), .. })) =
+        &req.request
+    else {
+        return RouteRequirements::default();
+    };
+    RouteRequirements {
+        role: find_header(map, HDR_REQUIRES_ROLE),
+        entitlement: find_header(map, HDR_REQUIRES_ENTITLEMENT),
+        min_aal: find_header(map, HDR_MIN_AAL),
+    }
+}
+
+/// The N4 phase-2 authorization comparison, isolated for unit tests: EVERY
+/// resolved requirement must be satisfied by the enrichment this filter itself
+/// computed (never by request headers). A requirement that cannot be evaluated —
+/// no enrichment to compare, an unmapped method, an unparseable level — DENIES,
+/// so degraded state can never open a gated route.
+fn authorize_route(
+    reqs: &RouteRequirements,
+    roles: &[String],
+    entitlements: Option<&[String]>,
+    method_level: Option<u8>,
+) -> Result<(), &'static str> {
+    if let Some(role) = &reqs.role
+        && !roles.iter().any(|r| r == role)
+    {
+        return Err("role");
+    }
+    if let Some(needed) = &reqs.entitlement {
+        match entitlements {
+            Some(list) if list.iter().any(|e| e == needed) => {}
+            _ => return Err("entitlement"),
+        }
+    }
+    if let Some(min) = &reqs.min_aal {
+        let Ok(min) = min.parse::<u8>() else {
+            return Err("min_aal_unparseable");
+        };
+        match method_level {
+            Some(level) if level >= min => {}
+            _ => return Err("aal"),
+        }
+    }
+    Ok(())
+}
+
+/// Gather the comparison inputs from the in-process enrichment state and run
+/// [`authorize_route`]. Roles follow the same precedence as the emitted
+/// `x-user-roles` (token first, then Profile); entitlements exist only with a
+/// Profile; the method mirrors the emitted `x-auth-method`.
+fn enforce_route_requirements(
+    reqs: &RouteRequirements,
+    token_roles: &[String],
+    profile: Option<&Arc<Profile>>,
+    authenticated: bool,
+    aal_levels: &HashMap<String, u8>,
+) -> Result<(), &'static str> {
+    if !reqs.any() {
+        return Ok(());
+    }
+    let roles: &[String] = if token_roles.is_empty() {
+        profile.map_or(&[], |p| &p.roles)
+    } else {
+        token_roles
+    };
+    let entitlements = profile.map(|p| p.entitlements.as_slice());
+    let method = if authenticated { "bearer" } else { "none" };
+    authorize_route(reqs, roles, entitlements, aal_levels.get(method).copied())
+}
+
 fn enrich_response(
     sub: &str,
     token_roles: &[String],
@@ -286,8 +402,15 @@ fn enrich_response(
     // independent of Envoy's set-vs-remove apply order (a header in both lists
     // could otherwise be wiped after we set it).
     // `x-auth-required` is consumed by jwt_authn upstream and never authored
-    // here, so it is always stripped before forwarding to the backend.
-    let mut remove = vec!["x-auth-required".to_owned()];
+    // here, so it is always stripped before forwarding to the backend. The
+    // phase-2 requirement signals are consumed by THIS filter's gate and are
+    // policy detail no backend needs — stripped the same way (design D5).
+    let mut remove = vec![
+        "x-auth-required".to_owned(),
+        HDR_REQUIRES_ROLE.to_owned(),
+        HDR_REQUIRES_ENTITLEMENT.to_owned(),
+        HDR_MIN_AAL.to_owned(),
+    ];
     // The nexus-owned acting scope (workspace-tenancy 3.2). Authored ONLY from a
     // LIVE membership check of the resolved workspace against the Profile — never
     // from the token — so a revoked/changed membership takes effect within seconds
@@ -371,6 +494,22 @@ fn unavailable_503() -> ProcessingResponse {
     immediate_503("identity store unavailable")
 }
 
+/// N4 phase-2 rejection: the route's resolved requirements are not satisfied by
+/// this request's enrichment. The body deliberately names no requirement — the
+/// policy detail stays at the edge.
+fn forbidden_403() -> ProcessingResponse {
+    ProcessingResponse {
+        response: Some(processing_response::Response::ImmediateResponse(
+            ImmediateResponse {
+                status: Some(HttpStatus { code: 403 }),
+                body: b"forbidden".to_vec(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // ext_proc service.
 // --------------------------------------------------------------------------- //
@@ -389,47 +528,66 @@ impl Sidecar {
         }
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
-            let (sub, token_roles, authenticated) = extract_identity(&req);
-            // The workspace this request acts in, from the trusted routing header.
-            // Threaded into enrich so the membership check authorizes the SAME
-            // workspace the router resolved (not a client-chosen one).
-            let acting_workspace = extract_acting_workspace(&req);
-            let ws = acting_workspace.as_deref();
-            // `sub` is a user identifier (PII): keep it out of per-request info
-            // logs (enable debug for the subject when diagnosing a specific user).
-            debug!(sub = %sub, "enrich subject");
-            if authenticated {
-                match self.state.resolve(&sub).await {
-                    Resolved::Found(p) => {
-                        info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
-                        (enrich_response(&sub, &token_roles, Some(p), true, ws), "hit")
-                    }
-                    // Authenticated but no profile row yet — a legitimate state
-                    // (e.g. not-yet-synced user); enrich without profile fields.
-                    Resolved::Absent => {
-                        info!(anonymous = false, hit = false, token_roles = token_roles.len(), "enrich");
-                        (enrich_response(&sub, &token_roles, None, true, ws), "miss")
-                    }
-                    // Store unreadable → suspension state is UNKNOWN. Fail closed
-                    // by default so a suspended user can't slip through during a
-                    // store outage; SIDECAR_FAIL_OPEN trades back to availability.
-                    Resolved::Unavailable => {
-                        if must_fail_closed(true, true, self.state.fail_open) {
-                            warn!("store unavailable for authenticated request -> 503 (fail-closed)");
-                            (unavailable_503(), "unavailable_closed")
-                        } else {
+            'decide: {
+                let (sub, token_roles, authenticated) = extract_identity(&req);
+                // The workspace this request acts in, from the trusted routing header.
+                // Threaded into enrich so the membership check authorizes the SAME
+                // workspace the router resolved (not a client-chosen one).
+                let acting_workspace = extract_acting_workspace(&req);
+                let ws = acting_workspace.as_deref();
+                // The per-route requirements the tenant-router resolved (N4 phase 2).
+                let requirements = extract_requirements(&req);
+                // `sub` is a user identifier (PII): keep it out of per-request info
+                // logs (enable debug for the subject when diagnosing a specific user).
+                debug!(sub = %sub, "enrich subject");
+                let (profile, result) = if authenticated {
+                    match self.state.resolve(&sub).await {
+                        Resolved::Found(p) => {
+                            info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
+                            (Some(p), "hit")
+                        }
+                        // Authenticated but no profile row yet — a legitimate state
+                        // (e.g. not-yet-synced user); enrich without profile fields.
+                        Resolved::Absent => {
+                            info!(anonymous = false, hit = false, token_roles = token_roles.len(), "enrich");
+                            (None, "miss")
+                        }
+                        // Store unreadable → suspension state is UNKNOWN. Fail closed
+                        // by default so a suspended user can't slip through during a
+                        // store outage; SIDECAR_FAIL_OPEN trades back to availability.
+                        Resolved::Unavailable => {
+                            if must_fail_closed(true, true, self.state.fail_open) {
+                                warn!("store unavailable for authenticated request -> 503 (fail-closed)");
+                                break 'decide (unavailable_503(), "unavailable_closed");
+                            }
                             warn!("store unavailable for authenticated request -> enrich without profile (fail-open)");
-                            (enrich_response(&sub, &token_roles, None, true, ws), "unavailable_open")
+                            (None, "unavailable_open")
                         }
                     }
+                } else {
+                    // Don't touch the store for unauthenticated requests: the subject
+                    // is "anonymous" (no credential), which is never a stored profile —
+                    // so a lookup is a guaranteed miss that needlessly loads the pool on
+                    // high-volume anonymous traffic (and is not negatively cached).
+                    info!(anonymous = true, token_roles = token_roles.len(), "enrich");
+                    (None, "anonymous")
+                };
+                // N4 phase-2 gate: every resolved requirement must be satisfied by
+                // the enrichment computed above, else 403 before the backend.
+                // jwt_authn upstream owns the anonymous-on-protected-route 401; an
+                // anonymous request carrying requirement signals means something
+                // upstream is misconfigured, and it denies here (fail-closed).
+                if let Err(reason) = enforce_route_requirements(
+                    &requirements,
+                    &token_roles,
+                    profile.as_ref(),
+                    authenticated,
+                    &self.state.aal_levels,
+                ) {
+                    info!(reason, "route requirements unsatisfied -> 403");
+                    break 'decide (forbidden_403(), "forbidden");
                 }
-            } else {
-                // Don't touch the store for unauthenticated requests: the subject
-                // is "anonymous" (no credential), which is never a stored profile —
-                // so a lookup is a guaranteed miss that needlessly loads the pool on
-                // high-volume anonymous traffic (and is not negatively cached).
-                info!(anonymous = true, token_roles = token_roles.len(), "enrich");
-                (enrich_response(&sub, &token_roles, None, false, ws), "anonymous")
+                (enrich_response(&sub, &token_roles, profile, authenticated, ws), result)
             }
         } else {
             warn!("not ready -> 503");
@@ -693,6 +851,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // block rather than serve it without its suspension state (see AppState).
     let fail_open = env::var("SIDECAR_FAIL_OPEN")
         .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let aal_levels = parse_aal_levels(
+        &env::var("SIDECAR_AAL_LEVELS").unwrap_or_else(|_| DEFAULT_AAL_LEVELS.to_owned()),
+    );
 
     let store: Arc<dyn ProfileStore> = loop {
         match PgProfileStore::connect(&pg_url).await {
@@ -717,6 +878,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warm_ms: Arc::new(AtomicU64::new(0)),
         start: Instant::now(),
         fail_open,
+        aal_levels: Arc::new(aal_levels),
     };
 
     // Periodically publish the gauge-style snapshots (the exporter's own listener
@@ -1072,6 +1234,170 @@ mod tests {
         assert_eq!(extract_acting_workspace(&empty), None);
     }
 
+    // ---- N4 phase-2 route requirements (edge-role-entitlement-gate) ---------- //
+
+    /// A profile carrying coarse roles + entitlements for the gate matrix.
+    fn gated_profile(roles: &[&str], entitlements: &[&str]) -> Arc<Profile> {
+        Arc::new(Profile {
+            sub: "u1".into(),
+            roles: roles.iter().map(|s| (*s).to_owned()).collect(),
+            entitlements: entitlements.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn levels() -> HashMap<String, u8> {
+        parse_aal_levels(DEFAULT_AAL_LEVELS)
+    }
+
+    fn reqs(role: Option<&str>, ent: Option<&str>, aal: Option<&str>) -> RouteRequirements {
+        RouteRequirements {
+            role: role.map(str::to_owned),
+            entitlement: ent.map(str::to_owned),
+            min_aal: aal.map(str::to_owned),
+        }
+    }
+
+    /// Spec "Satisfied requirements pass to the backend" + "Phase-1 parity".
+    #[test]
+    fn satisfied_requirements_pass() {
+        let p = gated_profile(&["admin"], &["pro"]);
+        assert_eq!(
+            enforce_route_requirements(
+                &reqs(Some("admin"), Some("pro"), Some("1")),
+                &[],
+                Some(&p),
+                true,
+                &levels(),
+            ),
+            Ok(()),
+        );
+        // No signals -> no enforcement, regardless of enrichment state.
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, None), &[], None, false, &levels()),
+            Ok(()),
+        );
+    }
+
+    /// Spec "Missing role is rejected" — and token roles take the same precedence
+    /// as the emitted `x-user-roles` (token first, then Profile).
+    #[test]
+    fn missing_role_is_denied_and_token_roles_count() {
+        let p = gated_profile(&["viewer"], &[]);
+        assert_eq!(
+            enforce_route_requirements(&reqs(Some("admin"), None, None), &[], Some(&p), true, &levels()),
+            Err("role"),
+        );
+        // The same requirement satisfied by a token-carried role.
+        assert_eq!(
+            enforce_route_requirements(
+                &reqs(Some("admin"), None, None),
+                &["admin".to_owned()],
+                Some(&p),
+                true,
+                &levels(),
+            ),
+            Ok(()),
+        );
+    }
+
+    /// Spec "Missing entitlement is rejected (plan gate)".
+    #[test]
+    fn missing_entitlement_is_denied() {
+        let p = gated_profile(&[], &["free"]);
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, Some("pro"), None), &[], Some(&p), true, &levels()),
+            Err("entitlement"),
+        );
+    }
+
+    /// Spec "Insufficient assurance level is rejected": bearer maps to 1 in the
+    /// default ordering, so a min of 2 denies; an unparseable minimum also denies.
+    #[test]
+    fn insufficient_or_unparseable_aal_is_denied() {
+        let p = gated_profile(&[], &[]);
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, Some("2")), &[], Some(&p), true, &levels()),
+            Err("aal"),
+        );
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, Some("1")), &[], Some(&p), true, &levels()),
+            Ok(()),
+        );
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, Some("high")), &[], Some(&p), true, &levels()),
+            Err("min_aal_unparseable"),
+        );
+    }
+
+    /// Spec "Requirement with absent enrichment fails closed": no profile means
+    /// an entitlement requirement cannot be evaluated -> deny, never pass. The
+    /// anonymous case (upstream misconfiguration — jwt_authn should have 401'd)
+    /// also denies: no roles, and "none" maps below any positive minimum.
+    #[test]
+    fn requirement_with_absent_enrichment_fails_closed() {
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, Some("pro"), None), &[], None, true, &levels()),
+            Err("entitlement"),
+        );
+        assert_eq!(
+            enforce_route_requirements(&reqs(Some("admin"), None, None), &[], None, false, &levels()),
+            Err("role"),
+        );
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, Some("1")), &[], None, false, &levels()),
+            Err("aal"),
+        );
+        // A method absent from the ordering can satisfy nothing (fail-closed).
+        assert_eq!(
+            enforce_route_requirements(&reqs(None, None, Some("1")), &[], None, true, &HashMap::new()),
+            Err("aal"),
+        );
+    }
+
+    #[test]
+    fn requirement_signals_are_read_and_stripped() {
+        // The tenant-router's trusted signals parse out of the request…
+        let req = req_with_headers(&[
+            ("x-auth-requires-role", "admin"),
+            ("x-auth-min-aal", "2"),
+        ]);
+        let r = extract_requirements(&req);
+        assert_eq!(r.role.as_deref(), Some("admin"));
+        assert_eq!(r.entitlement, None);
+        assert_eq!(r.min_aal.as_deref(), Some("2"));
+        // …and every forwarded response strips them (policy detail never
+        // reaches the backend), alongside the phase-1 boolean.
+        let resp = enrich_response("u1", &[], None, true, None);
+        let removed = remove_headers(&resp);
+        for h in ["x-auth-required", "x-auth-requires-role", "x-auth-requires-entitlement", "x-auth-min-aal"] {
+            assert!(removed.contains(&h.to_owned()), "must strip {h}");
+        }
+    }
+
+    #[test]
+    fn aal_levels_parse_with_default_and_override() {
+        let d = levels();
+        assert_eq!(d.get("none").copied(), Some(0));
+        assert_eq!(d.get("bearer").copied(), Some(1));
+        // An override adds methods and skips malformed pairs instead of failing.
+        let custom = parse_aal_levels("none=0, Bearer=1, mfa=2, bogus, empty=");
+        assert_eq!(custom.get("bearer").copied(), Some(1));
+        assert_eq!(custom.get("mfa").copied(), Some(2));
+        assert_eq!(custom.len(), 3);
+    }
+
+    #[test]
+    fn forbidden_403_is_an_immediate_403() {
+        matches!(
+            &forbidden_403().response,
+            Some(processing_response::Response::ImmediateResponse(r))
+                if r.status.as_ref().map(|s| s.code) == Some(403)
+        )
+        .then_some(())
+        .expect("expected an immediate 403");
+    }
+
     // ---- http-request-resilience -------------------------------------------- //
 
     use axum::body::Body;
@@ -1171,6 +1497,7 @@ mod tests {
             warm_ms: Arc::new(AtomicU64::new(0)),
             start: Instant::now(),
             fail_open: false,
+            aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

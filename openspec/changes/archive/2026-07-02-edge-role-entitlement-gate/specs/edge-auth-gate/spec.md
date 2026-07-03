@@ -1,61 +1,6 @@
-# edge-auth-gate
+# edge-auth-gate — delta: role / entitlement / minimum-AAL gate (N4 Phase 2)
 
-## Purpose
-
-The per-route authentication contract enforced at the combined production edge:
-how the edge decides, per request, whether a verified credential is required,
-optional, or the request is rejected — driven by the tenant's per-route policy
-signal and fail-safe under signal loss. The mechanism is the Envoy `jwt_authn`
-filter branching on the `x-auth-required` header emitted by the tenant-routing
-stage; this spec is language-agnostic and states only the observable behavior.
-
-## Requirements
-
-### Requirement: Per-route authentication is driven by the tenant policy signal
-
-The edge SHALL determine each request's authentication requirement from the
-`x-auth-required` header emitted by the tenant-routing stage (derived from the
-tenant's per-route `auth_routes` policy), not from a blanket per-domain rule. A
-route MUST be able to be public (anonymous allowed) and another route on the same
-domain MUST be able to require a verified credential.
-
-#### Scenario: Route marked protected requires a credential
-- **WHEN** the tenant policy resolves the request path to `auth_required = true`
-  (signal `x-auth-required: "true"`) and the request carries no credential
-- **THEN** the edge SHALL reject the request as unauthenticated (401)
-
-#### Scenario: Route marked public allows anonymous
-- **WHEN** the tenant policy resolves the request path to `auth_required = false`
-  (signal `x-auth-required: "false"`) and the request carries no credential
-- **THEN** the edge SHALL allow the request to proceed as anonymous
-
-#### Scenario: Zero-config tenant is public by default
-- **WHEN** a tenant has configured no `auth_routes` rule matching the request path
-- **THEN** the tenant policy SHALL resolve to pass-through (`auth_required = false`)
-  and the edge SHALL allow the request to proceed as anonymous
-
-### Requirement: An invalid credential is always rejected, even on public routes
-
-The edge SHALL reject a request that presents a malformed, expired, or otherwise
-invalid credential, regardless of whether the route is public or protected. Only a
-genuinely absent credential is permitted on a public route.
-
-#### Scenario: Invalid token on a public route
-- **WHEN** a route resolves to public (`x-auth-required: "false"`) and the request
-  presents an invalid/expired bearer token
-- **THEN** the edge SHALL reject the request (401) rather than treat it as anonymous
-
-### Requirement: The gate is fail-safe under a missing signal
-
-The edge SHALL treat the **absence** of the `x-auth-required` signal as
-"credential required" (fail-closed), not as "public". An explicit
-`x-auth-required: "false"` is the only condition that opens a route to anonymous
-access.
-
-#### Scenario: Signal absent falls through to required
-- **WHEN** a request reaches the credential-verification stage with no
-  `x-auth-required` header present
-- **THEN** the edge SHALL require a verified credential (reject if absent/invalid)
+## ADDED Requirements
 
 ### Requirement: Per-route authorization requirements are resolved with the auth policy
 
@@ -65,8 +10,7 @@ all optional). The tenant-routing stage SHALL resolve these with the same
 longest-prefix match, cache, and invalidation as `auth_required`, and SHALL emit
 each one as a trusted policy signal (`x-auth-requires-role`,
 `x-auth-requires-entitlement`, `x-auth-min-aal`) only when the resolved rule sets
-it. A rule that sets none of them SHALL behave exactly as before this capability
-gained requirements.
+it. A rule that sets none of them SHALL behave exactly as before this change.
 
 #### Scenario: Requirements ride the resolved rule
 - **WHEN** the tenant policy resolves the request path to a rule carrying
@@ -150,6 +94,8 @@ policy to anonymous callers.
 - **THEN** the edge SHALL reject it as unauthenticated (401) exactly as on any
   protected route
 
+## MODIFIED Requirements
+
 ### Requirement: The trusted header family is unforgeable by clients
 
 The edge SHALL strip every client-supplied trusted header before its authoritative
@@ -185,26 +131,3 @@ policy signal.
 - **THEN** the edge SHALL remove it before the identity plane stamps the authoritative
   version, so a client can neither forge a contract version nor mask a bypass of the
   edge enrichment
-
-### Requirement: The request path is canonicalized before the gate decides
-
-The edge SHALL canonicalize the request path — remove RFC 3986 `.`/`..` dot
-segments, collapse duplicate slashes, and resolve percent-encoded slashes — BEFORE
-the tenant policy resolves the authentication requirement, so that the path the gate
-evaluates is the same path the backend acts on. A request MUST NOT be able to
-present a path that resolves to a public route for the gate but a different
-(protected) route at the backend.
-
-#### Scenario: Encoded traversal cannot downgrade a protected route
-- **WHEN** a request targets a path such as `/public%2f..%2fadmin` or
-  `/public/../admin`, whose literal prefix matches a public rule but which resolves
-  to a protected route
-- **THEN** the edge SHALL evaluate the gate against the canonical path (`/admin`)
-  and require a verified credential (401 without one), not treat the request as
-  public
-
-#### Scenario: Genuine public and protected paths are unaffected
-- **WHEN** a request targets an already-canonical public path (e.g. `/public`) or a
-  protected path (e.g. `/app`)
-- **THEN** the gate outcome SHALL be unchanged by canonicalization (public allows
-  anonymous; protected requires a credential)

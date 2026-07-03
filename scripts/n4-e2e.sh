@@ -76,6 +76,35 @@ expect "/blog/../app"       401 "dot-segment traversal (/blog/../app) stays priv
 expect "/blog/..%2fapp"     401 "mixed traversal (/blog/..%2fapp) stays private"
 expect "/blog/%2e%2e/app"   401 "encoded-dot traversal (/blog/%2e%2e/app) stays private"
 
+echo "== 5. phase 2 (edge-role-entitlement-gate): requirement fields =="
+# Spec "Inconsistent rule is rejected at write time": a requirement with
+# auth_required=false must 400 and store nothing.
+BADRULE=$(cpcurl $JSON -o /dev/null -w '%{http_code}' -X PUT "$CP/tenants/acme/auth-routes" \
+  -d '{"path_prefix":"/members","auth_required":false,"requires_entitlement":"pro"}')
+if [ "$BADRULE" = "400" ]; then echo "  PASS  requirement + auth_required=false is rejected (-> $BADRULE)"; pass=$((pass+1));
+else echo "  FAIL  inconsistent rule accepted (-> $BADRULE, want 400)"; fail=$((fail+1)); fi
+
+# Spec "Anonymous caller gets 401, not 403": a valid gated rule (role-required)
+# demands a credential first — anonymous sees the AUTHENTICATION outcome, and the
+# authorization policy is never disclosed. (The authenticated 403 leg needs a
+# real token; covered by sidecar unit tests.)
+cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" \
+  -d '{"path_prefix":"/members","auth_required":true,"requires_role":"admin","min_aal":1}' >/dev/null
+settle
+expect "/members"      401 "anon gated route -> 401 (never 403)"
+expect "/members/area" 401 "anon gated subtree -> 401"
+# The site-wide {/, required} rule from step 2 is still active here, so the
+# public /blog carve-out is the "unaffected" probe (/ itself is legitimately 401).
+expect "/blog"         200 "public carve-out unaffected by the gated rule"
+
+# The requirement fields round-trip through the CRUD list surface.
+SNAP=$(cpcurl "$CP/tenants/acme/auth-routes")
+case "$SNAP" in
+  *'"requires_role":"admin"'*) echo "  PASS  list surface returns the requirement fields"; pass=$((pass+1));;
+  *) echo "  FAIL  requirement fields missing from list surface: $SNAP"; fail=$((fail+1));;
+esac
+cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/members"}' >/dev/null
+
 echo "== policy snapshot =="
 cpcurl "$CP/tenants/acme/auth-routes"; echo
 

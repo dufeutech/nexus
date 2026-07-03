@@ -5,9 +5,9 @@
 //! data-driven (rules §1.3/§5: the rules come from the store, never a constant).
 //!
 //! Two-knob separation (N4): authentication *method* (password/passkey/MFA/SSO)
-//! stays in the `IdP`; this is route *protection* only — "must this path carry a
-//! verified credential, or may it pass through anonymously?". Phase 1 covers the
-//! single boolean `required`; role/entitlement/min-AAL gating is a later phase.
+//! stays in the `IdP`; this is route *protection* only. Phase 1 is the boolean
+//! `required` gate; phase 2 adds the optional per-rule role / entitlement /
+//! minimum-AAL requirements, resolved here and enforced at the edge (403).
 //!
 //! Default is **pass-through** (`required = false`): a tenant with no policy, or a
 //! path matching no rule, is public. That makes "any customer site works with zero
@@ -15,17 +15,50 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The protection decision for one route: phase 1 is the single authentication
-/// gate. `required = false` → anonymous pass-through (`jwt_authn` `allow_missing`);
-/// `required = true` → a verified credential is demanded (`jwt_authn` `provider`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The protection decision for one route. `required = false` → anonymous
+/// pass-through (`jwt_authn` `allow_missing`); `required = true` → a verified
+/// credential is demanded (`jwt_authn` `provider`). The phase-2 requirement
+/// fields are optional refinements enforced after authentication: `None` means
+/// no requirement (the phase-1 behavior, and the wire absence of the signal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAuth {
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_entitlement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_aal: Option<u8>,
 }
 
 impl RouteAuth {
     /// The zero-config decision: public (anonymous pass-through).
-    pub const PASS_THROUGH: Self = Self { required: false };
+    pub const PASS_THROUGH: Self = Self {
+        required: false,
+        requires_role: None,
+        requires_entitlement: None,
+        min_aal: None,
+    };
+
+    /// True when the rule carries any phase-2 requirement.
+    #[must_use]
+    pub const fn has_requirements(&self) -> bool {
+        self.requires_role.is_some()
+            || self.requires_entitlement.is_some()
+            || self.min_aal.is_some()
+    }
+
+    /// Fail-closed interpretation: a rule carrying any requirement demands a
+    /// verified credential, even if the stored row says otherwise (the CRUD
+    /// surface rejects that combination, but a hand-edited row must not open
+    /// an authorization-gated route to anonymous callers).
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        if self.has_requirements() {
+            self.required = true;
+        }
+        self
+    }
 }
 
 impl Default for RouteAuth {
@@ -87,7 +120,7 @@ impl AuthPolicy {
             .iter()
             .filter(|r| prefix_matches(&r.prefix, path))
             .max_by_key(|r| r.prefix.len())
-            .map_or(RouteAuth::PASS_THROUGH, |r| r.auth)
+            .map_or(RouteAuth::PASS_THROUGH, |r| r.auth.clone().normalized())
     }
 }
 
@@ -112,7 +145,10 @@ mod tests {
     use super::*;
 
     fn rule(prefix: &str, required: bool) -> PathRule {
-        PathRule { prefix: prefix.into(), auth: RouteAuth { required } }
+        PathRule {
+            prefix: prefix.into(),
+            auth: RouteAuth { required, ..RouteAuth::PASS_THROUGH },
+        }
     }
 
     #[test]
@@ -186,6 +222,54 @@ mod tests {
         assert!(p.resolve("/app/orders").required);
         assert!(!p.resolve("/app/public").required); // longest prefix wins
         assert!(!p.resolve("/app/public/logo.png").required);
+    }
+
+    #[test]
+    fn requirements_ride_the_matched_rule() {
+        let gated = PathRule {
+            prefix: "/admin".into(),
+            auth: RouteAuth {
+                required: true,
+                requires_role: Some("admin".into()),
+                requires_entitlement: Some("pro".into()),
+                min_aal: Some(2),
+            },
+        };
+        let p = AuthPolicy::new(vec![rule("/", true), gated]);
+        let hit = p.resolve("/admin/users");
+        assert_eq!(hit.requires_role.as_deref(), Some("admin"));
+        assert_eq!(hit.requires_entitlement.as_deref(), Some("pro"));
+        assert_eq!(hit.min_aal, Some(2));
+        // A path matching only the phase-1 rule carries no requirements.
+        let miss = p.resolve("/app");
+        assert!(miss.required && !miss.has_requirements());
+    }
+
+    #[test]
+    fn requirement_implies_required_fail_closed() {
+        // A hand-edited row combining a requirement with required=false must
+        // resolve as protected, never as anonymous pass-through.
+        let inconsistent = PathRule {
+            prefix: "/members".into(),
+            auth: RouteAuth {
+                required: false,
+                requires_entitlement: Some("member".into()),
+                ..RouteAuth::PASS_THROUGH
+            },
+        };
+        let p = AuthPolicy::new(vec![inconsistent]);
+        let hit = p.resolve("/members");
+        assert!(hit.required);
+        assert_eq!(hit.requires_entitlement.as_deref(), Some("member"));
+    }
+
+    #[test]
+    fn phase1_json_without_requirement_fields_deserializes() -> Result<(), serde_json::Error> {
+        // A cached phase-1 RouteAuth (only `required`) must keep deserializing;
+        // the new fields default to None (no requirement).
+        let auth: RouteAuth = serde_json::from_str(r#"{"required":true}"#)?;
+        assert!(auth.required && !auth.has_requirements());
+        Ok(())
     }
 
     #[test]

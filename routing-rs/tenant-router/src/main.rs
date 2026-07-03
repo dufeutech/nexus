@@ -53,6 +53,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
 };
 use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 
+use router_core::auth::RouteAuth;
 use router_core::cache::SharedCache;
 use router_core::context::ClientContext;
 use router_core::domain::RoutingDecision;
@@ -385,6 +386,36 @@ fn route_response(d: &RoutingDecision, extra: &[(&'static str, String)]) -> Proc
     }
 }
 
+/// Per-route auth policy signal names (RFC N4). Hop-internal: emitted here,
+/// consumed by the edge (`jwt_authn` branches on the boolean; the identity
+/// sidecar enforces the phase-2 requirements), all C3-stripped from client
+/// input so they are unforgeable.
+const HDR_AUTH_REQUIRED: &str = "x-auth-required";
+const HDR_AUTH_REQUIRES_ROLE: &str = "x-auth-requires-role";
+const HDR_AUTH_REQUIRES_ENTITLEMENT: &str = "x-auth-requires-entitlement";
+const HDR_AUTH_MIN_AAL: &str = "x-auth-min-aal";
+
+/// The auth-policy signals for one resolved route. The boolean gate is ALWAYS
+/// emitted (`true`|`false`) so the contract is explicit; the phase-2 requirement
+/// signals are emitted ONLY when the resolved rule sets them — on the wire,
+/// absence IS the no-requirement state (mirroring the zero-config default).
+fn auth_signals(auth: &RouteAuth) -> Vec<(&'static str, String)> {
+    let mut signals = vec![(
+        HDR_AUTH_REQUIRED,
+        if auth.required { "true" } else { "false" }.to_owned(),
+    )];
+    if let Some(role) = &auth.requires_role {
+        signals.push((HDR_AUTH_REQUIRES_ROLE, role.clone()));
+    }
+    if let Some(entitlement) = &auth.requires_entitlement {
+        signals.push((HDR_AUTH_REQUIRES_ENTITLEMENT, entitlement.clone()));
+    }
+    if let Some(aal) = auth.min_aal {
+        signals.push((HDR_AUTH_MIN_AAL, aal.to_string()));
+    }
+    signals
+}
+
 /// Reject at the edge before any backend is selected (RFC C18 / tenant isolation).
 fn reject_unknown_host() -> ProcessingResponse {
     ProcessingResponse {
@@ -439,12 +470,11 @@ impl Router {
                 let mut extra: Vec<(&'static str, String)> = Vec::new();
                 // Per-route auth policy (RFC N4): resolve the request path
                 // against the tenant's cached policy and emit the authoritative
-                // gate the edge branches on. ALWAYS emitted (true|false) so the
-                // contract is explicit and the C3 strip makes it unforgeable;
-                // jwt_authn keys `requires: provider` vs `allow_missing` on it.
+                // signals the edge acts on — the boolean gate jwt_authn branches
+                // on, plus the phase-2 requirement signals the identity sidecar
+                // enforces (emitted only when set; see `auth_signals`).
                 let path = extract_path(&req);
-                let required = d.auth.resolve(&path).required;
-                extra.push(("x-auth-required", if required { "true" } else { "false" }.to_owned()));
+                extra.extend(auth_signals(&d.auth.resolve(&path)));
                 let geo = extract_geo(&req).map(|g| g.to_headers()).unwrap_or_default();
                 let country = geo
                     .iter()
@@ -867,7 +897,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // --------------------------------------------------------------------------- //
 #[cfg(test)]
 mod tests {
-    use super::{api, sleep};
+    use super::{api, auth_signals, sleep, RouteAuth};
     use std::env::var;
     use std::time::Duration;
     use axum::body::Body;
@@ -875,6 +905,41 @@ mod tests {
     use axum::routing::get;
     use axum::Router as AxumRouter;
     use tower::util::ServiceExt;
+
+    /// Spec "Requirements ride the resolved rule": a gated rule emits exactly the
+    /// signals it sets, alongside the always-present boolean gate.
+    #[test]
+    fn gated_rule_emits_only_its_requirement_signals() {
+        let auth = RouteAuth {
+            required: true,
+            requires_role: Some("admin".into()),
+            requires_entitlement: None,
+            min_aal: Some(2),
+        };
+        let signals = auth_signals(&auth);
+        assert_eq!(
+            signals,
+            vec![
+                ("x-auth-required", "true".to_owned()),
+                ("x-auth-requires-role", "admin".to_owned()),
+                ("x-auth-min-aal", "2".to_owned()),
+            ],
+        );
+    }
+
+    /// Spec "Phase-1 rules are unchanged": no requirement fields -> only the
+    /// boolean gate goes on the wire (absence IS the no-requirement state).
+    /// Convergence after a rule change needs no new test: the policy rides the
+    /// cached RoutingDecision, which the existing `routing_invalidations`
+    /// machinery already drops and reloads.
+    #[test]
+    fn phase1_rule_emits_only_the_boolean_gate() {
+        let public = RouteAuth::PASS_THROUGH;
+        assert_eq!(auth_signals(&public), vec![("x-auth-required", "false".to_owned())]);
+
+        let protected = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };
+        assert_eq!(auth_signals(&protected), vec![("x-auth-required", "true".to_owned())]);
+    }
 
     /// A handler that outlives the timeout must be terminated with 408 rather
     /// than pinning the task.

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::Serialize;
 
-use crate::auth::AuthPolicy;
+use crate::auth::{AuthPolicy, RouteAuth};
 use crate::domain::WorkspaceConfig;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -130,12 +130,14 @@ pub trait RoutingStore: Send + Sync {
     async fn get_auth_policy(&self, workspace_id: &str) -> Result<AuthPolicy, BoxError>;
 
     /// Create or update one path-prefix rule for a workspace (control-plane write).
-    /// The per-workspace default is the rule with `prefix = "/"`.
+    /// The per-workspace default is the rule with `prefix = "/"`. The rule carries
+    /// the full protection decision, including the optional phase-2 requirement
+    /// fields (`None` = no requirement).
     async fn upsert_auth_route(
         &self,
         workspace_id: &str,
         prefix: &str,
-        required: bool,
+        auth: &RouteAuth,
     ) -> Result<(), BoxError>;
 
     /// Remove one path-prefix rule (idempotent — missing is not an error).

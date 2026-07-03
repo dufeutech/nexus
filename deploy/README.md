@@ -236,6 +236,11 @@ supply the *truth*):**
 - [ ] **Control-plane reachability matches C16.** Broker-only NetworkPolicy on
       :9400 (`controlPlane.networkPolicy.*`), scrapers/kubelet on the ops port
       :9401 only; `CONTROL_AUTH_TOKEN` from a Secret, never `CONTROL_AUTH_DISABLED`.
+- [ ] **N4 phase-2 rollout order: enforcer before emitter.** Roll the identity
+      sidecar (which 403-enforces the `x-auth-requires-*` signals) before or
+      with the tenant-router that emits them. A newer router beside an older
+      sidecar leaves requirement rules silently unenforced; the reverse order is
+      safe (a sidecar that sees no signals enforces nothing).
 
 **Config hygiene:**
 
