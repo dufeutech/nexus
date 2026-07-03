@@ -92,8 +92,8 @@ tracks current CertMagic before bumping Caddy.)
   mechanism behind "any balancer serves any domain."
 - **`ask` = the router's own predicate** — `/authorize` resolves with the SAME
   code path as routing, so the cert gate and the router converge by construction.
-  When N1 fully lands, the interim `services/entry/templates/authz.py` shim and its
-  `pg_*` reads are deleted; until then it stays as the gate.
+  (N1 shipped; the interim `services/entry/templates/authz.py` shim and its
+  `pg_*` reads were deleted from the infra side 2026-06-30.)
 - **The quota gate is the issuance-rate governor** — on-demand issues one cert per
   domain on first handshake; renewals recur (~60d) for every live cert. The
   per-tenant plan quota (control-plane `declare`, already shipped) caps how fast

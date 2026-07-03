@@ -1,205 +1,179 @@
 # Nexus upstream integration requirements
 
-Features/patches the **nexus** stack (`dufeutech/nexus` — first-party, we own it) should
-absorb so the infra side (`toolify` entry + stores) stays thin and the _authoritative_
-domain logic lives in the platform. Hand this to the nexus agents.
+Requirements that downstream consumers — **toolify** (infra/entry), **jsbox/runlet** (the
+first backend box), and every future box on the internal network — place on **nexus**, plus
+the header contract nexus publishes back to them. nexus is the authoritative core: routing,
+domain lifecycle, identity enrichment, and edge policy live here; boxes stay thin and trust
+the headers the edge injects.
 
-> Why upstream, not in toolify: the entry layer currently ships a sidecar
-> (`services/entry/templates/authz.py`) that re-implements "is this a known, verified
-> tenant domain?" by reading `routing.domains` directly — only because nexus exposes no
-> per-host read of that predicate (the control-plane admin API is a loopback singleton on
-> ctrl-1). That duplication already caused a divergence in testing (2026-06-21): a
-> wildcard row authorized a cert the tenant-router then `404`'d. Moving the decision into
-> nexus removes the duplicate and makes the cert gate and the router the **same decision**.
-
-Background the infra side already provides (do not rebuild): on-demand, authorization-gated
-TLS at the edge (Caddy), a **shared Postgres certificate store** (any balancer serves any
-domain), a stable ingress name `edge.<base_domain>` (a DNS-only A-pool of the balancer IPs)
-that tenants `CNAME` to, and the product model below. See `docs/on-demand-tls.md`
-(edge TLS + shared cert store + the `ask` → `/authorize` wiring) and `docs/backend-pools.md`.
-
-Product model (decided): tenants **declare each (sub)domain explicitly**; the per-tenant
-domain **count is plan-gated** (the upsell lever). Once a domain is `verified`, the infra
-mechanics are already **fully automatic** (verify → authorize → on-demand issue → share to
-all balancers → route), zero operator touch. So self-service only has to automate the one
-human-trust step (`verified`) and the quota.
+**This file is canonical in the nexus repo.** Consumers (jsbox today) keep a mirror of the
+sections that concern them; any change here must be reflected there ("pin any rename in
+both repos").
 
 ---
 
-## Status (2026-06-29)
+## Status (2026-07-02 — verified against source)
 
-| Req    | State                | Where                                                                                 |
-| ------ | -------------------- | ------------------------------------------------------------------------------------- |
-| **N1** | ✅ SHIPPED            | `routing-rs/tenant-router/src/main.rs` — `GET /authorize` on `:9300` (`api::authorize`) |
-| **N2** | ✅ SHIPPED            | `routing-rs/control-plane/src/main.rs` — `/domains/declare`, `/domains/{d}/verify`, poll |
-| **N3** | finding only         | no work — captured below in case wildcard tiers are ever wanted                        |
-| **N4** | ~ Phase 1 in repo    | auth gate shipped (`x-auth-required` → jwt_authn `allow_missing`); role/entitlement/AAL gate (phase 2) still open |
-
-Infra follow-up now unblocked by N1: point Caddy `on_demand_tls { ask … }` at the local
-tenant-router and **delete** `services/entry/templates/authz.py` + `Dockerfile.authz` + the
-`pg_*` read refs (the doc's "interim shim" no longer applies — see `docs/on-demand-tls.md`).
+| Req    | State                        | Where                                                                                                      |
+| ------ | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **N1** | ✅ SHIPPED                   | `routing-rs/tenant-router/src/main.rs` — `GET /authorize` on `:9300` (`api::authorize`)                    |
+| **N2** | ✅ SHIPPED                   | `routing-rs/control-plane/src/main.rs` — `/domains/declare`, `/domains/{d}/verify`, leader-elected TXT poll |
+| **N3** | finding only                 | no work — kept below in case wildcard tiers are ever wanted                                                |
+| **N4** | ✅ SHIPPED (both phases)     | phase 1 auth gate + phase 2 role/entitlement/AAL gate (change `edge-role-entitlement-gate`, 2026-07-02)    |
+| **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **open action is jsbox-side** |
+| **N6** | ⏳ open — enhancement        | no trace propagation anywhere yet (edge has no tracing config; monitoring is metrics-only)                 |
 
 ---
 
-## N1 — tenant-router: per-host domain-authorization endpoint (retire the infra gate)
+## Shipped — contract lives in code and docs, not restated here
 
-> **✅ SHIPPED.** Live as `GET /authorize?domain=<sni>` on the tenant-router's `:9300` HTTP
-> API (`routing-rs/tenant-router/src/main.rs`, `api::authorize`). It resolves with the SAME
-> `resolve()` path as routing and fails closed (`403`) on empty/unknown/pending/not-ready.
+### N1 — tenant-router `/authorize` (the on-demand TLS gate)
 
-**Problem.** Caddy on-demand TLS needs a per-host HTTP `ask`. nexus exposes none, so the
-infra ships `authz.py`, duplicating the router's routing predicate.
+`GET /authorize?domain=<sni>` on the tenant-router's `:9300` API. Resolves with the SAME
+`resolve()` path as routing and fails closed (`403`) on empty/unknown/pending/not-ready —
+a domain that authorizes a cert is, by construction, a domain the router will route.
+Consumer-side contract (Caddy `ask` wiring, fail-closed semantics): `docs/on-demand-tls.md`.
+Emits `router_authorize_total{result=allow|deny}`.
 
-**Ask.** The **tenant-router** (already replicated on every edge host) exposes a tiny HTTP
-endpoint, **Caddy-`ask`-compatible**:
+### N2 — control-plane domain lifecycle (declare + TXT-verify + quota)
 
-```
-GET /authorize?domain=<sni>      ->  2xx  if <sni> is a known, VERIFIED, routable domain
-                                     403  otherwise   (fail-closed)
-```
+`POST /domains/declare` — plan-quota gate via data-driven `ROUTING_PLAN_LIMITS`, structured
+`402 quota_exceeded {plan, limit, used}`, idempotent challenge
+(`_nexus-challenge.<domain>` TXT), pending-TTL sweep (`ROUTING_PENDING_TTL`).
+`POST /domains/{domain}/verify` + a leader-elected background TXT poll: on token match set
+`verified` and `pg_notify('routing_invalidations', domain)` — the single invalidation path;
+routers and the cert gate converge in seconds. Once `verified`, everything downstream
+(authorize → issue → share to all balancers → route) is automatic, zero operator touch.
 
-- Same predicate the router uses to resolve `host → tenant → pool` — so a domain that
-  authorizes a certificate is, by construction, a domain the router will route (no more
-  "cert issued, then 404").
-- Read-only, fast (it's already in the router's cache), bound to the host, no new store.
+Product model (decided, unchanged): tenants declare each (sub)domain explicitly; the
+per-tenant domain count is plan-gated (the upsell lever).
 
-**Effect on infra.** Point Caddy `on_demand_tls { ask … }` at the local tenant-router and
-**delete** `services/entry/templates/authz.py` + `Dockerfile.authz` + the `pg_*` read refs.
-(N1 has shipped, so this deletion is unblocked — the `authz.py` shim is no longer required.)
+**toolify follow-up: ✅ done 2026-06-30** — `authz.py` + `Dockerfile.authz` + `pg_read_db`
+deleted; Caddy `on_demand_tls { ask }` → `http://tenant-router:9300/authorize`;
+tenant-router joined the `edge` network. Deploy order: `nexus-edge` then `entry`.
 
----
+### N4 — per-route auth gate, both phases
 
-## N2 — control-plane: self-service domain lifecycle (declare + TXT-verify + quota)
+**Phase 1** (anonymous pass-through): `router-core::auth` (policy types +
+longest-prefix `resolve`), `routing.auth_routes` (per-tenant path-prefix rules),
+control-plane CRUD at `PUT/GET/DELETE /workspaces/{id}/auth-routes` (legacy
+`/tenants/{id}/auth-routes` alias), tenant-router emits `x-auth-required`, and
+`edge/envoy.yaml` branches jwt_authn on it — `allow_missing` (NOT
+`allow_missing_or_failed`: missing token → anonymous pass-through,
+present-but-invalid still 401s) — with `x-auth-required` in the C3 strip list.
 
-> **✅ SHIPPED.** `routing-rs/control-plane/src/main.rs`: `POST /domains/declare` (quota gate
-> via data-driven `ROUTING_PLAN_LIMITS`, structured `402 quota_exceeded`, idempotent
-> challenge, pending-TTL sweep), `POST /domains/{domain}/verify` + a leader-elected
-> background poll (TXT proof → `verified` + `pg_notify('routing_invalidations', …)` → retire
-> challenge). N2a/N2b/N2c are all covered. The spec below is retained as the contract.
+**Phase 2** (role / entitlement / min-AAL — shipped 2026-07-02, change
+`edge-role-entitlement-gate`): a rule may additionally carry `requires_role`,
+`requires_entitlement`, `min_aal` (same table, same NOTIFY invalidation, same
+CRUD; a requirement combined with `auth_required=false` is rejected 400 at write
+time). The tenant-router emits `x-auth-requires-role` /
+`x-auth-requires-entitlement` / `x-auth-min-aal` only when the resolved rule sets
+them; the identity sidecar enforces them **403** fail-closed against its
+in-process enrichment (roles token-then-profile, entitlements from the live
+Profile, method→AAL ordering via `SIDECAR_AAL_LEVELS`, default `none=0,bearer=1`)
+and strips the signals before the backend — policy detail never leaves the edge.
+All three names are in the C3 strip list. An anonymous caller on a gated route
+still gets the Phase-1 **401** (requirements imply authentication), so
+authorization policy is never disclosed to anonymous callers. Rollout order:
+sidecar (enforcer) before tenant-router (emitter) — pinned in `deploy/README.md`'s
+production checklist. Backends like jsbox keep only resource-ownership checks;
+role/plan route gates are the edge's job now, both phases.
 
-The control-plane owns the `routing` schema, the domain API, and the invalidation NOTIFY —
-so the declare/verify/quota lifecycle belongs here. Keep using the existing
-`routing_invalidations` NOTIFY; do not add a second invalidation path.
-
-### N2a — Declare (with quota)
-
-An endpoint the self-service/dashboard layer calls:
-
-```
-declare(tenant_id, domain):
-  - QUOTA: reject if the tenant's (verified + pending) domain count >= plan limit;
-           return a structured `quota_exceeded` error carrying {plan, limit, used}
-           (the dashboard turns this into an upgrade prompt).
-  - create an UNVERIFIED routing.domains row for `domain` under `tenant_id`.
-  - mint a verification token; return the expected DNS record the tenant must add:
-        name  = _nexus-challenge.<domain>
-        type  = TXT
-        value = <token>
-  - idempotent: re-declaring a pending domain returns the SAME challenge.
-```
-
-### N2b — Verify (TXT — the strongest proof)
-
-```
-verify(domain) [periodic poll of pending domains, and/or a tenant-triggered "check now"]:
-  - resolve TXT _nexus-challenge.<domain>; on token match:
-       set verified = true  AND  pg_notify('routing_invalidations', domain)
-       (routers + the cert gate converge in seconds; mechanics take over automatically).
-  - token has a TTL + can be re-issued; clear/retire the challenge on success.
-```
-
-TXT proves the tenant controls the domain's DNS — required before `verified`, or tenant A
-could claim `victim.com`. The challenge name is a _subdomain_ label, so it coexists with an
-apex `CNAME`-flattened record.
-
-### N2c — Plan → limit
-
-Data-driven config (`plan name → max domains`), not hardcoded, so billing tiers map to it
-(e.g. free=1, pro=N, enterprise=∞). The declare quota check reads this.
+Default = pass-through: **no rows for a workspace means `auth: none`** (the `/` row is an
+operator-set default, not auto-seeded), so any customer site works with zero URL
+constraints; gating is opt-in.
 
 ---
 
-## N3 — (optional / future) wildcard apex coexistence + canonical matching
+## Open work in nexus
 
-Not needed for the explicit model above (each domain is its own exact row). Capture the
-**finding** so it's known if wildcard tiers are ever wanted (verified live 2026-06-21):
+### N5 — acting-org assurance — ✅ shipped in nexus (superseded form); **open action is jsbox-side**
 
-- One row per `domain` string. `is_wildcard=true` routes **subdomains** (`blog.x.com` → ok)
-  but **not the apex** (`x.com` → 404). `is_wildcard=false` routes **only the apex**. A
-  literal `*.x.com` row does not match (the router strips the left label and looks up the
-  bare parent). So **apex + wildcard-subdomains cannot coexist** for one domain.
-- If wildcard tiers are wanted: key domains by `(domain, is_wildcard)` **or** let a wildcard
-  also cover its own apex; and publish **one** canonical matching spec that BOTH the
-  tenant-router **and** any remaining infra gate implement identically.
+Both halves of N5 are live in nexus, but the tripwire shipped in a different (better)
+form than the original ask, and jsbox must adapt to it (decided 2026-07-02):
 
----
+- **Semantics (shipped):** the identity sidecar authors the acting workspace from a
+  **live membership check** of the resolved workspace (`identity-rs/sidecar/src/main.rs`,
+  header-authoring block), never from the token's `resourceowner` — the home org is
+  retired as an authz input (`x-user-org` is never authored and always stripped;
+  `resourceowner` only populates `Profile.home_org` in the projection). The injected
+  `x-workspace-id` IS the authorized acting org.
+- **Tripwire (shipped, superseded form):** the spec `identity-workspace-authz` (synced
+  2026-07-01) folds the acting-scope guarantee into the **versioned contract stamp**:
+  the sidecar emits `x-identity-contract: v1` on every enriched request, a valid `vN`
+  request by definition carries the acting `x-workspace-id` + `x-user-type`, and there
+  is **NO standalone acting-scope marker header** (`x-tenant-scope` was deliberately
+  retired — one coordination gate, not two sentinels to keep in sync). The edge strips
+  client-supplied `x-identity-contract` (C3), and header-shape drift is a version bump
+  that fails closed on partial rollout.
 
-## N4 — per-route auth policy (anonymous pass-through + declarative "private" modes)
+**jsbox action (the remaining N5 work, box-side):** replace runlet's
+`x-tenant-scope == acting` check with the contract check — reject a tenant-scoped
+request unless `x-identity-contract` is an accepted version (`v1` today) AND the acting
+`x-workspace-id` + `x-user-type` are present; else `403`. Equivalent strength (both are
+trusted-boundary tripwires, not cryptographic proof). Bring-up ordering concern
+disappears: nexus already emits the stamp, so jsbox can switch enforcement any time.
+Bump `v1` → `v2` in BOTH repos together on any future header-shape change.
 
-> **~ Phase 1 in repo.** The authentication gate is implemented: `router-core::auth`
-> (policy types + longest-prefix `resolve`), `routing.auth_routes` (per-tenant path-prefix
-> rules; default = the `/` row, absence = pass-through), control-plane CRUD at
-> `PUT/GET/DELETE /tenants/{id}/auth-routes`, tenant-router emits `x-auth-required` from the
-> resolved `(domain, path)` policy, and `edge/envoy.yaml` branches jwt_authn on it
-> (`provider` vs `allow_missing`) with the header in the C3 strip list. **Phase 2 (open):**
-> the `x-auth-requires-role` / `-entitlement` / `x-auth-min-aal` emission + the 403
-> enforcement step (identity sidecar or Envoy RBAC) — deferred (it crosses into identity-rs).
+**Naming pin (part of the same jsbox action):** nexus injects `x-workspace-id`;
+`x-tenant-id` survives only as a legacy read-fallback inside the sidecar. Boxes read
+`x-workspace-id` (their trusted-header names are configurable box-side).
 
-**Problem.** `jwt_authn` ships a single static rule (`match: "/" requires: provider zitadel`),
-so **every** route demands a valid token — a customer's site is all-or-nothing (no public
-marketing page + private app on the same domain). The only per-route lever today is a `/public`
-path prefix, which is **unacceptable** (forces tenants to restructure their URLs). Meanwhile the
-identity sidecar **already** supports anonymous (no credential → `x-auth-anonymous: true`,
-emitted on every request); the _only_ thing blocking pass-through is jwt_authn's unconditional
-`requires`. (Found while rehearsing the k3s migration, 2026-06-29.)
+### N6 — W3C `traceparent` propagation (open, enhancement — not a gate)
 
-**Two-knob separation (the model).**
+The edge does not start or propagate a trace today: `edge/envoy.yaml` has no tracing
+stanza, no OTLP/OpenTelemetry config exists anywhere in the repo, and monitoring is
+metrics-only (Prometheus + Grafana, no collector). Boxes fail open — runlet starts its own
+root span when no `traceparent` arrives — so this is an observability enhancement, not a
+release gate.
 
-- **Authentication METHOD** (password / passkey / MFA / social / SSO) stays in **ZITADEL**
-  (per-org login policy). The edge is method-agnostic — out of scope here.
-- **Route PROTECTION** is this requirement: a **declarative per-route policy** the tenant-router
-  resolves (exactly as it resolves host→tenant→pool) and the edge enacts.
-- **Resource ownership** ("does this user own THIS order") stays in the **backend**.
-
-**Ask.** tenant-router resolves a policy per `(domain, path-pattern)` and emits authoritative,
-**C3-stripped** headers the edge branches on:
-
-- `x-auth-required: true|false` → jwt_authn uses `requires: provider` vs `requires: { allow_missing: {} }`.
-  Use **`allow_missing`, NOT `allow_missing_or_failed`**: a _missing_ token → anonymous pass-through;
-  a _present-but-invalid/expired_ token still **401s**.
-- optional `x-auth-requires-role` / `x-auth-requires-entitlement` / `x-auth-min-aal` → a thin authz
-  step (Envoy RBAC filter or the identity sidecar) returns **403** when the already-injected
-  `x-user-roles` / `x-user-entitlements` / `x-auth-method` don't satisfy; else pass to the backend.
-
-**Default = `auth: none` (pass-through)** so any customer site works with zero URL constraints;
-authenticated / role / entitlement gating is opt-in (the membership/plan upsell). The dynamic
-branch is safe because tenant-router runs BEFORE jwt_authn (C17) and every `x-auth-*` policy header
-is in the C3 strip list (clients cannot self-assert) — **add `x-auth-required` + any new policy
-headers to that strip list.**
-
-**Data model.** Auth policy in routing config: a per-tenant default + optional per-path-pattern
-overrides (`{path_glob, auth_required, requires_role?, requires_entitlement?, min_aal?}`). Lives in
-the `routing` schema, resolved + cached by tenant-router, invalidated via the existing
-`routing_invalidations` NOTIFY; CRUD on the control-plane API (alongside N2).
-
-**Effect on infra.** Removes the all-or-nothing edge: public + private coexist on one domain;
-membership/plan gates run at the edge on existing enrichment; no `/public` hack.
+Work when picked up: Envoy tracing config (edge starts the trace, makes the head sampling
+decision, injects W3C `traceparent`/`tracestate` toward the box) + a collector in the
+monitoring stack. Boxes continue the trace and do no tail sampling. Bring-up order is
+flexible (boxes tolerate either order).
 
 ---
 
-## Ownership after these land
+## N3 — finding: wildcard apex coexistence (no work planned)
 
-| Concern                                                                                                       | Owner                                                                       |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| declare, quota, TXT verify, invalidation NOTIFY                                                               | **nexus control-plane**                                                     |
-| routing match + per-host `/authorize` endpoint (N1)                                                           | **nexus tenant-router**                                                     |
-| per-route auth policy resolution + `x-auth-*` emit + role/entitlement gate (N4)                               | **nexus tenant-router** (resolve/enforce) + **control-plane** (policy CRUD) |
-| authentication method (password/passkey/MFA/social/SSO)                                                       | **ZITADEL** (per-org login policy)                                          |
-| ingress name `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, deploy/HA, seeding `plan→limit` | **toolify / infra**                                                         |
-| `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                                            | **tenant**                                                                  |
+Verified live 2026-06-21, kept in case wildcard tiers are ever wanted: one row per
+`domain` string; `is_wildcard=true` routes subdomains but NOT the apex, `false` routes
+only the apex, and a literal `*.x.com` row never matches (the router strips the left
+label). So apex + wildcard-subdomains cannot coexist for one domain. If wildcard tiers are
+wanted: key by `(domain, is_wildcard)` or let a wildcard cover its own apex — and publish
+ONE canonical matching spec that the router and any other gate implement identically.
 
-N1 has shipped: the tenant-router `/authorize` endpoint is the on-demand gate.
-`services/entry/templates/authz.py` is now removable (infra follow-up).
-✅ Done in toolify 2026-06-30: `authz.py` + `Dockerfile.authz` deleted, authz sidecar + `pg_read_db`
-removed, Caddy `on_demand_tls { ask }` → `http://tenant-router:9300/authorize`, tenant-router joined the
-`edge` network. Deploy order: `nexus-edge` then `entry` (not yet deployed).
+---
+
+## Downstream header contract (what boxes like jsbox may rely on)
+
+The edge strips all client-supplied `x-*` before the identity sidecar injects trusted
+headers. Boxes treat these as authoritative and pre-authorized; they add only
+resource-ownership checks.
+
+| Header                                             | Meaning                                                            | Status                        |
+| -------------------------------------------------- | ------------------------------------------------------------------ | ----------------------------- |
+| `x-workspace-id`                                   | the **authorized acting workspace** (live membership check)        | shipped (`x-tenant-id` = legacy fallback only — pin the rename) |
+| `x-user-id`                                        | the user, for audit                                                | shipped                       |
+| `x-user-roles`, `x-user-entitlements`, `x-auth-method` | enrichment inputs (also enforced at the edge per-route, N4 Phase 2) | shipped (injected + enforced) |
+| `x-auth-required`, `x-auth-requires-*`, `x-auth-min-aal` | edge-internal policy signals (jwt_authn branch + sidecar 403 gate); stripped, never reach boxes | shipped                       |
+| `x-identity-contract: v1`                          | versioned contract stamp = the acting-org tripwire (a valid `vN` carries acting `x-workspace-id` + `x-user-type`); boxes reject unknown/absent versions on enriched routes | shipped (jsbox must switch its check to this — N5) |
+| `traceparent`                                      | W3C trace context, edge-rooted                                     | open — N6, boxes fail open    |
+
+---
+
+## Ownership
+
+| Concern                                                                               | Owner                                                                        |
+| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| declare, quota, TXT verify, invalidation NOTIFY                                       | **nexus control-plane**                                                      |
+| routing match + per-host `/authorize` (N1)                                            | **nexus tenant-router**                                                      |
+| per-route auth policy resolve + `x-auth-*` emit (N4)                                  | **nexus tenant-router** (resolve/emit) + **control-plane** (policy CRUD)     |
+| per-route 403 gate: role / entitlement / min-AAL enforcement (N4 Phase 2)             | **nexus identity sidecar**                                                   |
+| acting-org authorization + trusted header injection + contract stamp (N5)             | **nexus identity sidecar**                                                   |
+| contract-stamp enforcement (`x-identity-contract` version check)                      | **backend boxes** (jsbox/runlet, …)                                          |
+| trace rooting + `traceparent` injection (N6)                                          | **nexus edge (Envoy)** + monitoring collector                                |
+| authentication method (password/passkey/MFA/social/SSO)                               | **ZITADEL** (per-org login policy)                                           |
+| ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **toolify / infra**                                                          |
+| `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                    | **tenant**                                                                   |
+| resource ownership ("does this user own THIS order"), scope-header enforcement       | **backend boxes** (jsbox/runlet, …)                                          |
