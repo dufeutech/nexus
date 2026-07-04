@@ -165,6 +165,57 @@ resource-ownership checks.
 
 ---
 
+## Box telemetry contract (the observability twin of the header contract)
+
+**Published 2026-07-03** (change `box-telemetry-contract`). What any box on the internal
+network — jsbox/runlet today, a Python or Node service tomorrow — can rely on nexus for,
+and what it must emit to be observable. Anchored on OTLP + the OTel semantic conventions
+so a box in ANY language complies with off-the-shelf instrumentation and zero nexus-side
+integration work.
+
+**What nexus provides:**
+
+- **ONE collection endpoint** (the OTel Collector) accepting **traces, metrics, and
+  logs** over OTLP (gRPC `:4317` / HTTP `:4318`). A box knows this endpoint and nothing
+  else; only the collector's config knows the stores (traces → Tempo, pushed metrics →
+  Prometheus, logs → Loki — one Grafana, logs↔traces pivot in both directions). Store
+  changes never touch a box.
+- **Edge-rooted W3C trace context** on every request (N6 above; sampled flag = the
+  edge's head decision).
+- **Fail-open, both ways:** a collector/store outage never affects request handling
+  (verified: requests keep serving, telemetry resumes on its own), and one box's
+  telemetry volume cannot block another producer's request path.
+
+**What a compliant box emits (all through that one endpoint):**
+
+- **Resource identity on every signal:** `service.name`, `service.version`,
+  `deployment.environment.name` — identical values across traces, metrics, and logs, so
+  one identity selects the service in every signal and two versions are distinguishable
+  during a rollout.
+- **Traces:** continue the edge-rooted `traceparent` when present (root only when
+  absent); no tail sampling box-side.
+- **Logs:** structured and severity-tagged, stamped with the active `trace_id`/`span_id`
+  while handling a traced request — that's what makes the two-way pivot work.
+- **RED metrics (request-driven boxes):** request rate, error count/ratio, and duration
+  as an aggregatable **histogram** — fleet-wide p50/p95/p99 must be computable across
+  replicas (pre-computed per-replica percentiles are NOT the canonical latency signal).
+  RED metrics are first-class: deriving them from sampled traces is a defect — turning
+  the edge sampling knob down must not move any metric (verified).
+- **PII hygiene — the edge access-log rule applies to every signal:** no credential
+  material, no request/response bodies, no user identifiers beyond the permitted
+  trusted-header set, in any span attribute, metric label, or log field. The structured
+  form keeps this mechanically checkable (e.g. a LogQL sweep like
+  `` {service_name=~".+"} |~ `(?i)(bearer\s+[a-z0-9._-]+|authorization:|password|set-cookie)` ``);
+  the collector is the future enforcement/redaction point.
+
+**Onboarding a new box in any language = one env var:** run the standard OTel SDK /
+auto-instrumentation and set `OTEL_EXPORTER_OTLP_ENDPOINT=<collector>`. Verified
+2026-07-03 with a throwaway auto-instrumented Python box: identity, trace continuation +
+log correlation, hygiene detectability, sampling independence, and fail-open all pass
+with no custom telemetry code.
+
+---
+
 ## Ownership
 
 | Concern                                                                               | Owner                                                                        |
@@ -176,6 +227,8 @@ resource-ownership checks.
 | acting-org authorization + trusted header injection + contract stamp (N5)             | **nexus identity sidecar**                                                   |
 | contract-stamp enforcement (`x-identity-contract` version check)                      | **backend boxes** (jsbox/runlet, …)                                          |
 | trace rooting + `traceparent` injection (N6)                                          | **nexus edge (Envoy)** + monitoring collector                                |
+| telemetry collection endpoint + stores + Grafana pivot (box telemetry contract)       | **nexus monitoring stack** (collector/Tempo/Prometheus/Loki)                 |
+| contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (jsbox/runlet, any future service)                         |
 | authentication method (password/passkey/MFA/social/SSO)                               | **ZITADEL** (per-org login policy)                                           |
 | ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **toolify / infra**                                                          |
 | `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                    | **tenant**                                                                   |

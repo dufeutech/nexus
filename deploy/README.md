@@ -184,8 +184,47 @@ only the collector's config knows the trace store (Tempo → Grafana). Export is
   access-log-allowed set only (method/path/status/durations, route pool,
   workspace id). Adding a `custom_tags` entry for a credential or `x-user-*`
   header is a spec violation (`edge-request-tracing`).
-- Roadmap (log↔trace correlation, service spans, retention/SLO policy — phases
-  2–4) is recorded in the `edge-rooted-tracing` change's `design.md`.
+- Log↔trace correlation shipped with the box telemetry contract (below);
+  service spans and retention/SLO policy remain on the roadmap in the
+  `box-telemetry-contract` change's `design.md`.
+
+## Telemetry — all signals (the box telemetry contract)
+
+Tracing above is one signal of three. The OTel Collector accepts **traces,
+metrics, and logs** on the same OTLP endpoint — the single telemetry egress for
+every producer on the internal network. Only the collector's config knows the
+stores (traces → Tempo, pushed metrics → Prometheus's native OTLP receiver,
+logs → Loki), and all three are explored in the same Grafana with a two-way
+logs↔traces pivot by trace ID. The consumer-facing half — what a compliant box
+must emit — is the "Box telemetry contract" section of
+`nexus-upstream-requirements.md`.
+
+- **Cluster (helm) pattern — identical to how tracing shipped:** the collector
+  and ALL stores are EXTERNAL to the charts, exactly like Prometheus. A box's
+  workload spec carries exactly one telemetry address — the collector's OTLP
+  endpoint (for SDK-instrumented boxes, the standard
+  `OTEL_EXPORTER_OTLP_ENDPOINT` env var). No chart code changes exist or are
+  needed: there is no per-box scrape config to coordinate (box metrics are
+  pushed), no log-shipper sidecar (logs are pushed), and no store address in
+  any workload manifest. Swapping or fanning out a store is a collector-config
+  edit, invisible to every box.
+- **Compose/lab knobs:** the lab (`../docker-compose.yaml` + `../monitoring/`)
+  bundles the full stack to copy from — collector pipelines in
+  `monitoring/otel-collector/otel-collector.yaml` (store endpoints via
+  `TEMPO_OTLP_ENDPOINT` / `LOKI_OTLP_ENDPOINT` / `PROMETHEUS_OTLP_ENDPOINT`
+  env), the log store in `monitoring/loki/loki.yaml` (retention default 7d —
+  `limits_config.retention_period`; traces stay at 48h), and pinned store
+  images (`LOKI_VERSION`, `PROMETHEUS_VERSION` in `.env`) because native OTLP
+  ingestion is version-gated in both stores. Bump pins deliberately and re-run
+  the telemetry smoke checks.
+- **First-party services still scrape** (Prometheus jobs in
+  `monitoring/prometheus/prometheus.yml`) — deliberately untouched. Both
+  metrics paths coexist until the first-party services join the contract
+  (Change B in the `box-telemetry-contract` roadmap).
+- **Bring-up order is flexible and everything is fail-open:** a down collector
+  or store never affects request handling; boxes buffer/drop telemetry and
+  resume on their own when the collector returns. Producers deliberately do
+  not `depends_on` the collector.
 
 ## BREAKING — upgrading to the fail-closed edge guards
 

@@ -406,12 +406,19 @@ services:
 
   # --- observability: Prometheus scrapes all /metrics; Grafana dashboards ------
   prometheus:
-    image: prom/prometheus:latest
+    # PINNED (box-telemetry-contract): the native OTLP receiver
+    # (--web.enable-otlp-receiver, /api/v1/otlp) is version-gated — stable in
+    # the Prometheus 3 line, verified on this LTS version. Bump deliberately,
+    # re-running the telemetry smoke checks.
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.5.0}
     container_name: zitadel-lab-prometheus
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --enable-feature=native-histograms
+      # Push-path metrics ingestion (box-telemetry-contract): the collector
+      # forwards boxes' OTLP metrics here; scrape jobs are unaffected.
+      - --web.enable-otlp-receiver
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -434,30 +441,56 @@ services:
     depends_on:
       - prometheus
       - tempo
+      - loki
 
-  # --- tracing (N6): edge --OTLP--> otel-collector --> tempo <-- grafana ------
-  # The collector is the SINGLE telemetry egress point: producers (the edge)
-  # know only the collector; only the collector's config knows Tempo. The edge
-  # deliberately does NOT depends_on the collector — trace export is fail-open
-  # (a telemetry outage must never affect request handling), and the boxes'
-  # bring-up-order contract stays flexible.
+  # --- telemetry: boxes/edge --OTLP--> otel-collector --> stores <-- grafana --
+  # The collector is the SINGLE telemetry egress point for ALL signals (N6
+  # shipped traces; box-telemetry-contract added metrics + logs): producers
+  # know only the collector; only the collector's config knows Tempo/
+  # Prometheus/Loki. Producers deliberately do NOT depends_on the collector —
+  # telemetry is fail-open (an outage must never affect request handling), and
+  # the boxes' bring-up-order contract stays flexible.
   otel-collector:
     image: otel/opentelemetry-collector:latest
     container_name: zitadel-lab-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otelcol/otel-collector.yaml"]
     environment:
-      # The ONLY place the trace store's address enters the system (single-
-      # egress rule); the collector config reads it via ${env:...}.
+      # The ONLY place any store's address enters the system (single-egress
+      # rule); the collector config reads these via ${env:...}. Fanning out or
+      # swapping a store is an edit here — producers never change.
       TEMPO_OTLP_ENDPOINT: ${TEMPO_OTLP_ENDPOINT:-tempo:4317}
+      LOKI_OTLP_ENDPOINT: ${LOKI_OTLP_ENDPOINT:-http://loki:3100/otlp}
+      PROMETHEUS_OTLP_ENDPOINT: ${PROMETHEUS_OTLP_ENDPOINT:-http://prometheus:9090/api/v1/otlp}
     volumes:
       - ./monitoring/otel-collector/otel-collector.yaml:/etc/otelcol/otel-collector.yaml:ro
     ports:
-      # OTLP/HTTP on loopback for host-side test spans; the edge exports
-      # OTLP/gRPC in-network (otel-collector:4317, not published).
+      # OTLP on loopback for host-side test payloads and the synthetic-box
+      # compliance checks; in-network producers use otel-collector:4317/4318
+      # (not published).
       - "127.0.0.1:${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
+      - "127.0.0.1:${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317"
     depends_on:
       - tempo
+      - loki
+      - prometheus
+
+  # Log store (box-telemetry-contract): Loki, written ONLY by the collector
+  # (native OTLP), read ONLY by Grafana. PINNED: native OTLP ingestion +
+  # structured metadata are version-gated (Loki 3.x) — bump deliberately,
+  # re-running the telemetry smoke checks.
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-3.5.3}
+    container_name: zitadel-lab-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./monitoring/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki:rw
+    ports:
+      # Query API on loopback for operator/debug queries; Grafana reaches it
+      # in-network (loki:3100).
+      - "127.0.0.1:${LOKI_HTTP_PORT:-3100}:3100"
 
   tempo:
     image: grafana/tempo:latest
@@ -483,3 +516,4 @@ networks:
 volumes:
   postgres-data:
   tempo-data:
+  loki-data:

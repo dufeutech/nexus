@@ -1,3 +1,11 @@
+# Grafana datasources — the ONE investigation surface (metrics + traces +
+# logs; box-telemetry-contract). Grafana is the sole reader of every store;
+# producers export via the OTel Collector, never here.
+#
+# NOTE the $$ doubling on ${__...} template variables below: Grafana expands
+# environment variables in provisioning files, and $$ is its escape so the
+# literal ${__value.raw}/${__span.traceId} reach the datasource config intact.
+
 apiVersion: 1
 
 datasources:
@@ -9,11 +17,45 @@ datasources:
     isDefault: true
     editable: true
 
-  # Trace store (N6 edge-rooted tracing): query traces by trace ID. Grafana is
-  # Tempo's only reader; producers export via the OTel Collector, never here.
+  # Trace store (N6 edge-rooted tracing): query traces by trace ID.
   - name: Tempo
     type: tempo
     uid: tempo
     access: proxy
     url: http://tempo:3200
     editable: true
+    jsonData:
+      # trace -> logs pivot (box-telemetry-contract): from any span, jump to
+      # the producing service's log records for that trace. Custom query
+      # because OTLP-ingested trace IDs live in Loki STRUCTURED METADATA (a
+      # `| trace_id = ...` filter), not in the log line (a `|=` line filter
+      # would miss them).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        tags:
+          - key: service.name
+            value: service_name
+        customQuery: true
+        query: '{$${__tags}} | trace_id = `$${__span.traceId}`'
+
+  # Log store (box-telemetry-contract): aggregated box logs, queryable by
+  # service identity / severity / time / trace_id beside the traces they
+  # correlate with.
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      # log -> trace pivot: the trace_id structured-metadata field on every
+      # contract-compliant log record becomes a link into Tempo.
+      derivedFields:
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"

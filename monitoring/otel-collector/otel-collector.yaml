@@ -1,27 +1,37 @@
-# OpenTelemetry Collector — the SINGLE telemetry egress point (N6).
+# OpenTelemetry Collector — the SINGLE telemetry egress point (N6 traces;
+# box-telemetry-contract extends it to ALL signals).
 #
-# Every trace producer (the Envoy edge today; Rust services in a later phase)
-# exports OTLP to THIS collector and knows nothing else. Only this file knows
-# the trace store's address, so adding/changing/fanning-out destinations
-# (customer SIEM, vendor APM, a second store) is an edit HERE — never a
-# producer config change. Do not point any producer directly at Tempo.
+# Every telemetry producer (the Envoy edge, any box, Rust services in a later
+# phase) exports OTLP — traces, metrics, AND logs — to THIS collector and knows
+# nothing else. Only this file knows any store's address, so adding/changing/
+# fanning-out destinations (customer SIEM, vendor APM, a second store) is an
+# edit HERE — never a producer config change. Do not point any producer
+# directly at Tempo, Loki, or Prometheus.
+#
+# Distribution note: this config runs on the CORE distribution on purpose —
+# both store paths are native OTLP (Loki 3.x /otlp, Prometheus 3.x
+# /api/v1/otlp), so no contrib-only component is needed. The contrib switch is
+# deferred until a change actually needs it (tail sampling; see the
+# box-telemetry-contract design).
 
 receivers:
   otlp:
+    # ONE receiver for all three signals — the single collection endpoint the
+    # box telemetry contract promises producers.
     protocols:
       grpc:
-        # Envoy's OTel tracer exports OTLP/gRPC here (in-network :4317).
+        # Envoy's OTel tracer and SDK gRPC exporters land here (in-network :4317).
         endpoint: 0.0.0.0:4317
       http:
-        # OTLP/HTTP kept open for host-side test spans and future producers.
+        # OTLP/HTTP for host-side test payloads and http-exporting producers.
         endpoint: 0.0.0.0:4318
 
 processors:
-  # Batch before export — standard back-pressure hygiene for the OTLP exporter.
+  # Batch before export — standard back-pressure hygiene for the OTLP exporters.
   batch: {}
 
 exporters:
-  otlp:
+  otlp/tempo:
     # The ONE place the trace store's address is known (single-egress rule).
     # Set via the compose service env (TEMPO_OTLP_ENDPOINT), not a literal.
     endpoint: ${env:TEMPO_OTLP_ENDPOINT}
@@ -29,9 +39,35 @@ exporters:
       # Lab/compose-internal hop; the deliberately-insecure lab posture.
       insecure: true
 
+  otlphttp/loki:
+    # Log store: Loki 3.x native OTLP ingestion (Grafana's recommended path —
+    # keeps this collector on the core distribution). The exporter appends
+    # /v1/logs, so the env value is the base, e.g. http://loki:3100/otlp.
+    endpoint: ${env:LOKI_OTLP_ENDPOINT}
+    tls:
+      insecure: true
+
+  otlphttp/prometheus:
+    # Metrics store: Prometheus 3.x native OTLP receiver (push path — a new
+    # box needs zero scrape coordination). The exporter appends /v1/metrics,
+    # so the env value is the base, e.g. http://prometheus:9090/api/v1/otlp.
+    endpoint: ${env:PROMETHEUS_OTLP_ENDPOINT}
+    tls:
+      insecure: true
+
 service:
   pipelines:
+    # Pipelines are independent on purpose: a slow/failed store for one signal
+    # never blocks another, and each signal stays fail-open end to end.
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlp]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]

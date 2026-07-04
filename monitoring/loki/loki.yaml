@@ -1,0 +1,58 @@
+# Grafana Loki — the log store (box-telemetry-contract). Reachable ONLY by the
+# OTel Collector (its sole writer, via the native OTLP endpoint /otlp) and
+# Grafana (its sole reader, via the query API :3100). No producer may know this
+# address — log egress goes through the collector (see
+# monitoring/otel-collector/otel-collector.yaml).
+#
+# Ingestion is Loki 3.x native OTLP (Grafana's recommended path): standard
+# resource-identity attributes (service.name/version, deployment environment)
+# become stream labels; everything else — including the trace_id/span_id the
+# contract requires on request logs — lands in STRUCTURED METADATA, not labels,
+# so Loki's high-cardinality label weakness never applies to trace IDs.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  # Single-binary, local-disk lab shape — the same minimal-ops default as
+  # Tempo. Object storage is the production-scale option; swapping is a config
+  # change here only (single-egress: producers never notice).
+  replication_factor: 1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    # v13 + TSDB: the schema line that supports structured metadata (which the
+    # native OTLP endpoint requires).
+    - from: "2024-04-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Required for native OTLP ingestion (trace_id et al. live here).
+  allow_structured_metadata: true
+  # Logs outlive traces on purpose: traces settled on 48h as a debugging
+  # signal; logs are the investigation trail — 7 days is the lab default. A config
+  # value, not a contract term; retention economics is Change C.
+  retention_period: 168h
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

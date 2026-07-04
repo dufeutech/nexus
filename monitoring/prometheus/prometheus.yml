@@ -2,6 +2,26 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Native OTLP ingestion (box-telemetry-contract): boxes PUSH metrics via the
+# OTel Collector to /api/v1/otlp — no per-box scrape coordination. Enabled by
+# the --web.enable-otlp-receiver flag in the compose service. The scrape jobs
+# below (first-party services) are untouched; both paths coexist until the
+# first-party services join the contract (Change B).
+otlp:
+  # OTLP resource attributes to promote to first-class labels so one identity
+  # (service name/version/environment) selects a service across signals; the
+  # full resource lands in target_info regardless.
+  promote_resource_attributes:
+    - service.version
+    - deployment.environment.name
+    - deployment.environment
+
+storage:
+  tsdb:
+    # Pushed OTLP samples arrive unordered across producers/replicas; a small
+    # out-of-order window is the documented companion to the OTLP receiver.
+    out_of_order_time_window: 30m
+
 scrape_configs:
   - job_name: identity-sidecar-rs
     # Prefer protobuf so native histograms are scraped (they don't exist in text).
