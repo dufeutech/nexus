@@ -360,7 +360,7 @@ services:
     # tracing.spawn_upstream_span are all stable in this line. Bump minor
     # versions deliberately — re-verify span export (the OTel tracer is still
     # flagged work-in-progress upstream; see edge-rooted-tracing design.md).
-    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.34-latest}
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.34.14@sha256:cfc0678bc03cca19cbb031688acb31d510bff501ff97e163026a375fe0515d69}
     container_name: zitadel-lab-envoy
     restart: unless-stopped
     command:

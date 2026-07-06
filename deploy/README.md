@@ -358,6 +358,22 @@ identity enrichment now require one of:
   absence of any origin control is a misconfiguration, never a default-safe
   state.
 
+**Probe that your CNI actually enforces the policy** (many clusters render a
+NetworkPolicy that the CNI silently ignores — Calico/Cilium enforce, some
+managed defaults do not). From a throwaway pod *in the backend namespace*,
+hit the backend directly, bypassing the edge, with a forged stamp — it MUST
+be refused (timeout/connection-refused), not answered:
+
+```sh
+# NS = backend namespace, BACKEND_SVC:PORT = the pod the policy protects
+kubectl -n "$NS" run np-probe --rm -it --restart=Never --image=curlimages/curl -- \
+  curl -sS --max-time 5 \
+    -H 'x-workspace-id: forged' -H 'x-identity-contract: v1' \
+    http://BACKEND_SVC:PORT/ ; echo "exit=$?"
+# PASS = curl fails (exit 28 timeout / 7 refused). FAIL = HTTP response => the
+# CNI is NOT enforcing NetworkPolicy; the trusted-header family is forgeable.
+```
+
 ## Production deployment checklist
 
 The platform itself is gated: every spec-asserted security boundary is enforced
@@ -386,7 +402,9 @@ supply the *truth*):**
       emits `x-identity-contract` and the spec scopes the rule, but rejecting an
       absent/unknown stamp on identity-enriched routes is the BACKEND's code
       (deliberately out of this repo's test surface). If you own the backend,
-      that check is its backlog item, not an assumption.
+      that check is its backlog item, not an assumption. The full consumer
+      contract — every injected header and the exact reject rules — is in
+      [`../docs/box-consumer-contract.md`](../docs/box-consumer-contract.md).
 - [ ] **Control-plane reachability matches C16.** Broker-only NetworkPolicy on
       :9400 (`controlPlane.networkPolicy.*`), scrapers/kubelet on the ops port
       :9401 only; `CONTROL_AUTH_TOKEN` from a Secret, never `CONTROL_AUTH_DISABLED`.
@@ -400,10 +418,12 @@ supply the *truth*):**
 
 - [ ] **Secrets via `existingSecret` everywhere** (postgres, routingPg, ZITADEL
       PAT, control token) — inline `*.url`/`value` land in the release manifest.
-- [ ] **Pin every image.** First-party images to a concrete tag you built; the
-      Envoy image to a concrete patch version (`images.envoy.tag` floats on
-      `v1.34-latest` by default — the values file says pin it; do). The lab
-      pins ZITADEL for the same reason (a floating tag broke the CI gate).
+- [ ] **Pin every image.** First-party images to a concrete tag you built. The
+      Envoy image now ships pinned to a concrete patch version + digest
+      (`images.envoy.tag: v1.34.14@sha256:…`); on a bump, re-resolve the digest
+      (`docker buildx imagetools inspect envoyproxy/envoy:<tag> | grep Digest`)
+      and re-verify span export. The lab pins ZITADEL for the same reason (a
+      floating tag broke the CI gate).
 - [ ] **Issuer single-sourced (D7).** `zitadel.issuer` must equal the `iss`
       ZITADEL mints AND the value the workers derive — drift is silent-but-fatal
       (sync works, every authenticated request 401s). The lab guards this in

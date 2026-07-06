@@ -154,6 +154,11 @@ The edge strips all client-supplied `x-*` before the identity sidecar injects tr
 headers. Boxes treat these as authoritative and pre-authorized; they add only
 resource-ownership checks.
 
+> The table below is the identity subset. For the **complete** injected-header reference
+> (every header with its exact format — including the `x-geo-*`, request-context, and
+> provenance families — plus the origin-trust prerequisite and box responsibilities), see
+> [`docs/box-consumer-contract.md`](docs/box-consumer-contract.md).
+
 | Header                                             | Meaning                                                            | Status                        |
 | -------------------------------------------------- | ------------------------------------------------------------------ | ----------------------------- |
 | `x-workspace-id`                                   | the **authorized acting workspace** (live membership check)        | shipped (`x-tenant-id` = legacy fallback only — pin the rename) |
