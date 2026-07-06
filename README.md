@@ -15,17 +15,30 @@ the only network path that can reach them.
 
 Three planes plus one edge. Everything is Rust; the edge is stock Envoy driven by config.
 
-```
-             ┌─────────────────────────── the edge (Envoy) ───────────────────────────┐
-  client ───▶│  strip client x-* (anti-forgery)                                        │
-             │    → tenant-router  ext_proc   (workspace/plan/pool/geo/context)        │──▶ box
-             │    → jwt_authn      (verify bearer vs ZITADEL JWKS, per-route gate)      │   (jsbox,
-             │    → identity       ext_proc   (verified x-user-*, x-identity-contract)  │    runlet,
-             │    → route to the selected backend pool                                  │    your svc)
-             └─────────────────────────────────────────────────────────────────────────┘
-                        │                         │                         │
-                 routing plane            identity plane            OTel Collector
-                 (routing-rs)             (identity-rs)             (traces/metrics/logs)
+```mermaid
+flowchart LR
+    client([Client])
+    box([Box<br/>jsbox · runlet · your service])
+
+    subgraph edge["The edge — Envoy"]
+        direction TB
+        strip["Strip client x-*<br/>anti-forgery"]
+        tr["tenant-router ext_proc<br/>workspace · plan · pool · geo · context"]
+        jwt["jwt_authn<br/>verify bearer vs ZITADEL JWKS<br/>per-route gate"]
+        id["identity ext_proc<br/>verified x-user-* · x-identity-contract"]
+        route["Route to the selected backend pool"]
+        strip --> tr --> jwt --> id --> route
+    end
+
+    routing[("Routing plane<br/>routing-rs")]
+    identity[("Identity plane<br/>identity-rs")]
+    otel[["OTel Collector<br/>traces · metrics · logs"]]
+
+    client -->|request| strip
+    route -->|trusted headers| box
+    tr <-->|resolve tenant| routing
+    id <-->|resolve membership| identity
+    edge -.->|telemetry, fail-open| otel
 ```
 
 | Plane | Repo dir | Does | Details |
