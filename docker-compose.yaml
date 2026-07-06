@@ -82,55 +82,42 @@ services:
   # in its own database, not inside ZITADEL's `zitadel` DB). Freshness is the RFC C4
   # change feed implemented as a `seq`-cursor over Postgres LISTEN/NOTIFY (channel
   # `identity_changes`); no replica set, no second database technology. The
-  # writers (sync-worker, reconciler) create the schema idempotently on startup.
+  # writers (authz-admin, membership-sync) create the schema idempotently on startup.
 
-  sync-worker:
+  # Nexus-native authorization authoring surface (nexus-native-authorization).
+  # The SINGLE source of record for roles/entitlements/suspension: it authors them
+  # into the identity Profile store via the AuthzAuthoring port, and the sidecar
+  # picks the change up over the identity change feed within seconds. The OIDC
+  # provider (ZITADEL) is NEVER an authorization source — it only answers "who am I".
+  # Auth-gated by IDENTITY_ADMIN_TOKEN (lab dev credential; production parity with
+  # the control-plane's CONTROL_AUTH_TOKEN). Bootstrap: set AUTHZ_BOOTSTRAP_ADMIN_SUB
+  # to a subject `sub` to seed the first admin when the store has none.
+  authz-admin:
     build:
       context: ./identity-rs
-      target: sync-worker
-    container_name: zitadel-lab-sync
+      target: authz-admin
+    container_name: zitadel-lab-authz-admin
     restart: unless-stopped
     environment:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
-      ZITADEL_INTERNAL_URL: http://zitadel:8080
-      # D7 single source: derives from ZITADEL_EXTERNALPORT with the SAME default
-      # (8080) the zitadel service uses — and the edge's issuer literal in
-      # edge/envoy.yaml must equal it. A mismatch is silent-but-fatal: sync works
-      # while every authenticated request 401s at the edge (the old 8088 default
-      # was exactly that drift). scripts/helm-guards-test.sh asserts consistency.
-      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
-      WEBHOOK_SELF_URL: http://sync-worker:8080/webhook
-      PAT_FILE: /machinekey/zitadel-admin-sa.pat
+      # Lab dev credential (this file is the deliberately-insecure loopback lab —
+      # same posture as the control-plane token). Override beyond loopback.
+      IDENTITY_ADMIN_TOKEN: ${IDENTITY_ADMIN_TOKEN:-zitadel-lab-dev-token}
+      # Seed the first administrator from an empty store (idempotent break-glass).
+      # Empty => no bootstrap seed; author the first grants via the admin API.
+      AUTHZ_ADMIN_ROLE: ${AUTHZ_ADMIN_ROLE:-admin}
+      AUTHZ_BOOTSTRAP_ADMIN_SUB: ${AUTHZ_BOOTSTRAP_ADMIN_SUB:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
-    volumes:
-      - ./machinekey:/machinekey:ro
+    ports:
+      - "9300:9300"   # admin authoring API + /healthz
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9300/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     depends_on:
-      zitadel:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-
-  reconciler:
-    build:
-      context: ./identity-rs
-      target: reconciler
-    container_name: zitadel-lab-reconciler
-    restart: unless-stopped
-    environment:
-      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
-      ZITADEL_INTERNAL_URL: http://zitadel:8080
-      # D7: same default as the zitadel service + edge issuer (see sync-worker).
-      ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
-      PAT_FILE: /machinekey/zitadel-admin-sa.pat
-      RECONCILE_INTERVAL: "30"   # ~600 in prod (RFC §6.2); short here to observe
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
-    volumes:
-      - ./machinekey:/machinekey:ro
-    depends_on:
-      zitadel:
-        condition: service_healthy
       postgres:
         condition: service_healthy
 
@@ -328,7 +315,7 @@ services:
 
   # Identity sidecar (Rust: tonic + envoy-types + sqlx/Postgres + moka). The one
   # Envoy calls. Built from the identity-rs workspace (shares the core crate with
-  # sync-worker + reconciler — one canonical Profile + version guard). Cache is
+  # authz-admin + membership-sync — one canonical Profile + authz ports). Cache is
   # kept fresh by the seq-cursor LISTEN/NOTIFY change feed (RFC C4). Read + listen
   # only — never creates schema.
   identity-sidecar-rs:

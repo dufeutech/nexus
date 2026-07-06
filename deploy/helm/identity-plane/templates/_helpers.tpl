@@ -38,7 +38,7 @@ Image ref: ("repo" "tag" ctx) -> repo:tag, defaulting tag to AppVersion.
 
 {{/*
 Postgres is EXTERNAL by design — this chart does not run a database. The sidecar,
-sync-worker and reconciler read PROFILE_PG_URL from a Secret. Either you supply
+authz-admin and membership-sync read PROFILE_PG_URL from a Secret. Either you supply
 your own (postgres.existingSecret — preferred, works with ExternalSecrets/
 SealedSecrets), or the chart wraps an inline postgres.url in a managed Secret.
 */}}
@@ -115,12 +115,27 @@ Issuer authority (host[:port]) — used as the JWKS Host header default.
 {{- end -}}
 
 {{/*
-Name of the Secret holding the ZITADEL admin PAT (created or pre-existing).
+authz-admin bearer token (nexus-native-authorization) — the fail-closed admin gate
+on the authoring surface. Same existingSecret-vs-inline pattern as the pg Secret;
+the chart manages the Secret only when neither an existingSecret nor authDisabled is
+set (so a token is always required unless auth is explicitly turned off).
 */}}
-{{- define "identity-plane.patSecretName" -}}
-{{- if .Values.oidc.patSecret.existingSecret -}}
-{{- .Values.oidc.patSecret.existingSecret -}}
+{{- define "identity-plane.authzAdminSecretName" -}}
+{{- if .Values.authzAdmin.existingSecret -}}
+{{- .Values.authzAdmin.existingSecret -}}
 {{- else -}}
-{{- printf "%s-zitadel-pat" (include "identity-plane.fullname" .) -}}
+{{- printf "%s-authz-admin" (include "identity-plane.fullname" .) -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.authzAdminSecretKey" -}}
+{{- if .Values.authzAdmin.existingSecret -}}
+{{- .Values.authzAdmin.existingSecretKey -}}
+{{- else -}}
+token
+{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.ownsAuthzAdminSecret" -}}
+{{- if or .Values.authzAdmin.existingSecret .Values.authzAdmin.authDisabled -}}false{{- else -}}true{{- end -}}
 {{- end -}}

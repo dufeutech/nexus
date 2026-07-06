@@ -44,6 +44,7 @@ use identity_core::store::{
 };
 use identity_core::Profile;
 
+mod authz;
 mod source_memberships;
 pub use source_memberships::PgSourceMembershipReader;
 
@@ -101,7 +102,7 @@ impl PgProfileStore {
         self
     }
 
-    /// Idempotent schema bootstrap. Writers (sync-worker, reconciler) own this on
+    /// Idempotent schema bootstrap. Writers (authz-admin, membership-sync) own this on
     /// startup; the sidecar only reads + listens, so it never creates schema.
     pub async fn init_schema(&self) -> Result<(), BoxError> {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS identity")

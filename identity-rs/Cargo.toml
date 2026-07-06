@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "store-postgres", "sidecar", "sync-worker", "reconciler", "membership-sync"]
+members = ["core", "store-postgres", "sidecar", "authz-admin", "membership-sync"]
 
 [workspace.package]
 edition = "2024"

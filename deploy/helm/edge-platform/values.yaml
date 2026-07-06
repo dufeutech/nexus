@@ -23,9 +23,9 @@ routing-plane:
   #   enabled: false                 # optional external L2
 
 # -------------------------------------------------------------------------- #
-# Identity plane (subchart) — deploys sync-worker + reconciler (its edge is
+# Identity plane (subchart) — deploys authz-admin + membership-sync (its edge is
 # disabled; this umbrella runs the combined one). The durable store (PostgreSQL)
-# is EXTERNAL. Set images.*, oidc.*, postgres.* (external), backend here.
+# is EXTERNAL. Set images.*, oidc.*, postgres.* (external), authzAdmin.*, backend here.
 # -------------------------------------------------------------------------- #
 identity-plane:
   edge:

@@ -102,46 +102,35 @@ services:
       retries: 6
       start_period: 10s
 
-  # Real-time webhook -> store (C7). Single owner (registers its own signing key).
-  # ZITADEL must be able to reach WEBHOOK_SELF_URL.
-  sync-worker:
-    image: ${IDENTITY_REPO:-identity}/identity-sync-worker:${IMAGE_TAG:-0.1.0}
-    build: { context: ../../identity-rs, target: sync-worker }
+  # Nexus-native authorization authoring surface (nexus-native-authorization). The
+  # SINGLE source of record for roles/entitlements/suspension: it authors them into
+  # the identity Profile store via the AuthzAuthoring port, and the sidecar picks the
+  # change up over the identity change feed within seconds. The OIDC provider is NEVER
+  # an authorization source. Keep it on an administrative boundary — do NOT publish
+  # 9300 publicly. Auth-gated by IDENTITY_ADMIN_TOKEN (fail-closed, like the
+  # control-plane's CONTROL_AUTH_TOKEN).
+  authz-admin:
+    image: ${IDENTITY_REPO:-identity}/identity-authz-admin:${IMAGE_TAG:-0.1.0}
+    build: { context: ../../identity-rs, target: authz-admin }
     restart: unless-stopped
     environment:
       PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
-      ZITADEL_INTERNAL_URL: ${ZITADEL_INTERNAL_URL:?set ZITADEL_INTERNAL_URL}
-      ZITADEL_HOST: ${ZITADEL_HOST:?set ZITADEL_HOST (issuer authority)}
-      WEBHOOK_SELF_URL: ${WEBHOOK_SELF_URL:?set WEBHOOK_SELF_URL ZITADEL can reach}
-      PAT_FILE: /secrets/zitadel-admin-sa.pat
+      # Admin-token gate: the authoring endpoints mutate authorization state, so they
+      # require this bearer token. Fail-closed — the container refuses to start unless
+      # IDENTITY_ADMIN_TOKEN is set OR IDENTITY_ADMIN_AUTH_DISABLED=true (dev only).
+      IDENTITY_ADMIN_TOKEN: ${IDENTITY_ADMIN_TOKEN:-}
+      IDENTITY_ADMIN_AUTH_DISABLED: ${IDENTITY_ADMIN_AUTH_DISABLED:-}
+      # Bootstrap the first administrator from an empty store (idempotent break-glass).
+      # Empty => no seed; author the first grants via the admin API.
+      AUTHZ_ADMIN_ROLE: ${AUTHZ_ADMIN_ROLE:-admin}
+      AUTHZ_BOOTSTRAP_ADMIN_SUB: ${AUTHZ_BOOTSTRAP_ADMIN_SUB:-}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-    volumes:
-      - ./secrets:/secrets:ro
-
-  # Periodic authoritative diff -> store (C8). The safety net for lost webhooks.
-  reconciler:
-    image: ${IDENTITY_REPO:-identity}/identity-reconciler:${IMAGE_TAG:-0.1.0}
-    build: { context: ../../identity-rs, target: reconciler }
-    restart: unless-stopped
-    environment:
-      PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
-      ZITADEL_INTERNAL_URL: ${ZITADEL_INTERNAL_URL:?set ZITADEL_INTERNAL_URL}
-      ZITADEL_HOST: ${ZITADEL_HOST:?set ZITADEL_HOST (issuer authority)}
-      PAT_FILE: /secrets/zitadel-admin-sa.pat
-      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-600}
-      RECONCILE_PAGE_LIMIT: ${RECONCILE_PAGE_LIMIT:-1000}
-      METRICS_PORT: "9000"
-      LOG_FORMAT: ${LOG_FORMAT:-json}
-      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
-      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-    volumes:
-      - ./secrets:/secrets:ro
+    ports:
+      - "127.0.0.1:9300:9300"   # bound to loopback: admin boundary only
 
   # --- Edge (data plane) ---------------------------------------------------- #
   # Envoy runs the tenant-first chain and forwards. The combined config lives in

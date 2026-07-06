@@ -50,10 +50,9 @@ must **never infer state from a header's absence** — read the explicit flag in
 | `x-user-id` | Verified subject (`sub`). | id string | Audit / ownership checks. |
 | `x-user-type` | Acting relationship in this workspace. | `staff` \| `customer` | Acting-scope decisions. |
 | `x-user-role` | Workspace-scoped role (not global). | role string | Acting-scope decisions. |
-| `x-user-roles` | Coarse roles (token first, else Profile). | comma-joined | Enrichment. |
-| `x-user-roles-source` | Provenance of `x-user-roles`. | `token` \| `profile` \| `none` | Diagnostics. |
-| `x-user-entitlements` | Entitlements from the live Profile. | comma-joined | Feature checks. |
-| `x-user-suspended` | Suspension flag (always from live Profile — revocation-sensitive). | `true` \| `false` | Hard block. |
+| `x-user-roles` | Coarse global roles, **nexus-authored** (from the live Profile via the resolver — never the token or the OIDC provider; `nexus-native-authorization`). | comma-joined | Enrichment. |
+| `x-user-entitlements` | Entitlements, nexus-authored (live Profile). | comma-joined | Feature checks. |
+| `x-user-suspended` | Suspension flag, nexus-authored (always from live Profile — revocation-sensitive, effective within seconds). | `true` \| `false` | Hard block. |
 | `x-user-enriched-by` | Provenance marker. | `identity-sidecar-rs` \| `identity-sidecar-rs:miss` | Diagnostics. |
 | `x-auth-anonymous` | Is the caller anonymous. | `true` \| `false` | Branch on identity. |
 | `x-auth-method` | Auth method used. | `bearer` \| `none` | Diagnostics / step-up. |

@@ -1,4 +1,6 @@
-# One workspace build, three runtime images (selected via compose `target:`).
+# One workspace build, three runtime images (selected via compose `target:`):
+# the identity sidecar (hot path), the authz-admin authoring surface, and the
+# membership-sync projection worker.
 # protoc is needed for the sidecar's native-histogram (protobuf) metrics export.
 FROM rust:1-bookworm AS build
 WORKDIR /app
@@ -22,27 +24,18 @@ USER 10001
 EXPOSE 50051 9200 9202
 CMD ["identity-sidecar"]
 
-# --- sync-worker (webhook + metrics + healthz on 8080) ---
-FROM debian:bookworm-slim AS sync-worker
+# --- authz-admin (nexus-native authorization authoring surface + healthz on 9300) ---
+# The identity-plane admin API that authors roles/entitlements/suspension
+# (nexus-native-authorization). wget is installed for the HEALTHCHECK (GET /healthz).
+FROM debian:bookworm-slim AS authz-admin
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 app
-COPY --from=build /app/target/release/sync-worker /usr/local/bin/sync-worker
+COPY --from=build /app/target/release/authz-admin /usr/local/bin/authz-admin
 USER 10001
-EXPOSE 8080
-CMD ["sync-worker"]
-
-# --- reconciler (metrics on 9000) ---
-FROM debian:bookworm-slim AS reconciler
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 10001 app
-COPY --from=build /app/target/release/reconciler /usr/local/bin/reconciler
-USER 10001
-EXPOSE 9000
-CMD ["reconciler"]
+EXPOSE 9300
+CMD ["authz-admin"]
 
 # --- membership-sync (routing membership NOTIFY -> Profile projection; metrics 9000) ---
 FROM debian:bookworm-slim AS membership-sync

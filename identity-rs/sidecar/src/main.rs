@@ -224,12 +224,14 @@ const fn must_fail_closed(authenticated: bool, unavailable: bool, fail_open: boo
 }
 
 // --------------------------------------------------------------------------- //
-// Metadata extraction (C11): the verified `sub` plus any COARSE roles carried in
-// the token. Coarse roles ride in the JWT (zero-latency, portable); revocation-
-// sensitive state (suspended/entitlements) is sourced from the live Profile
-// instead, so it can change within seconds without a token refresh.
+// Metadata extraction (C11): the verified `sub` and whether the request is
+// authenticated. The token answers ONLY "who am I" — the `roles` claim is
+// deliberately NOT read (nexus-native-authorization spec R1): roles, entitlements,
+// and suspension are nexus-authored and sourced from the live Profile via the
+// AuthzResolver, so a provider-asserted role confers nothing and a grant/revoke
+// takes effect within seconds without a token refresh.
 // --------------------------------------------------------------------------- //
-fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
+fn extract_identity(req: &ProcessingRequest) -> (String, bool) {
     use envoy_types::pb::google::protobuf::value::Kind;
     let fields = match req
         .metadata_context
@@ -241,35 +243,15 @@ fn extract_identity(req: &ProcessingRequest) -> (String, Vec<String>, bool) {
             Some(Kind::StructValue(s)) => &s.fields,
             _ => &ns.fields,
         },
-        None => return ("anonymous".to_owned(), Vec::new(), true),
+        None => return ("anonymous".to_owned(), true),
     };
     // A verified `sub` is the authority for "authenticated": its presence flips
-    // is-anonymous to false. Absence (no sub claim) stays anonymous.
-    let (sub, authenticated) = match fields.get("sub").and_then(|v| v.kind.as_ref()) {
+    // is-anonymous to false. Absence (no sub claim) stays anonymous. No authorization
+    // claim (`roles`/`:roles`) is read here — authorization is nexus-sourced (R1).
+    match fields.get("sub").and_then(|v| v.kind.as_ref()) {
         Some(Kind::StringValue(s)) if !s.is_empty() => (s.clone(), true),
         _ => ("anonymous".to_owned(), false),
-    };
-    let mut roles = Vec::new();
-    // A plain `roles` array claim, if present...
-    if let Some(Kind::ListValue(l)) = fields.get("roles").and_then(|v| v.kind.as_ref()) {
-        for it in &l.values {
-            if let Some(Kind::StringValue(s)) = it.kind.as_ref() {
-                roles.push(s.clone());
-            }
-        }
     }
-    // ...or the provider's nested project-roles claim (key ends ":roles", a
-    // struct whose field names are the role keys).
-    if roles.is_empty() {
-        for (k, v) in fields {
-            if k.ends_with(":roles")
-                && let Some(Kind::StructValue(s)) = v.kind.as_ref()
-            {
-                roles.extend(s.fields.keys().cloned());
-            }
-        }
-    }
-    (sub, roles, authenticated)
 }
 
 // --------------------------------------------------------------------------- //
@@ -400,12 +382,12 @@ fn authorize_route(
 }
 
 /// Gather the comparison inputs from the in-process enrichment state and run
-/// [`authorize_route`]. Roles follow the same precedence as the emitted
-/// `x-user-roles` (token first, then Profile); entitlements exist only with a
-/// Profile; the method mirrors the emitted `x-auth-method`.
+/// [`authorize_route`]. Roles and entitlements are **nexus-authored** (spec R1):
+/// sourced ONLY from the live Profile (the AuthzResolver's backing), never the
+/// token — so an absent Profile means no roles/entitlements (deny-by-default). The
+/// method mirrors the emitted `x-auth-method`.
 fn enforce_route_requirements(
     reqs: &RouteRequirements,
-    token_roles: &[String],
     profile: Option<&Arc<Profile>>,
     authenticated: bool,
     aal_levels: &HashMap<String, u8>,
@@ -413,11 +395,7 @@ fn enforce_route_requirements(
     if !reqs.any() {
         return Ok(());
     }
-    let roles: &[String] = if token_roles.is_empty() {
-        profile.map_or(&[], |p| &p.roles)
-    } else {
-        token_roles
-    };
+    let roles: &[String] = profile.map_or(&[], |p| &p.roles);
     let entitlements = profile.map(|p| p.entitlements.as_slice());
     let method = if authenticated { "bearer" } else { "none" };
     authorize_route(reqs, roles, entitlements, aal_levels.get(method).copied())
@@ -425,7 +403,6 @@ fn enforce_route_requirements(
 
 fn enrich_response(
     sub: &str,
-    token_roles: &[String],
     profile: Option<Arc<Profile>>,
     authenticated: bool,
     acting_workspace: Option<&str>,
@@ -448,16 +425,14 @@ fn enrich_response(
         header("x-auth-method", if authenticated { "bearer" } else { "none" }),
         header("x-user-id", sub),
     ];
-    // Roles are coarse → prefer the token (zero-latency), fall back to the Profile.
-    let (roles, roles_source) = if !token_roles.is_empty() {
-        (token_roles.join(","), "token")
-    } else if let Some(p) = &profile {
-        (p.roles.join(","), "profile")
-    } else {
-        (String::new(), "none")
-    };
+    // Roles are NEXUS-AUTHORED (spec R1): sourced ONLY from the live Profile (the
+    // AuthzResolver's backing), NEVER the token — so a grant/revoke takes effect
+    // within seconds without a token refresh, and a provider-asserted role confers
+    // nothing. Absent Profile → empty roles (deny-by-default). Always authored
+    // (OverwriteIfExistsOrAdd), so a client copy is overwritten. `x-user-roles-source`
+    // is retired — the source is always nexus now.
+    let roles = profile.as_ref().map_or_else(String::new, |p| p.roles.join(","));
     set.push(header("x-user-roles", &roles));
-    set.push(header("x-user-roles-source", roles_source));
     // Defense-in-depth strip (RFC C3, belt-and-suspenders vs. the edge strip):
     // the sidecar removes any client-supplied identity header it does NOT itself
     // author on THIS path, so a forged value can't reach the backend even if the
@@ -608,7 +583,7 @@ impl Sidecar {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             'decide: {
-                let (sub, token_roles, authenticated) = extract_identity(&req);
+                let (sub, authenticated) = extract_identity(&req);
                 // The workspace this request acts in, from the trusted routing header.
                 // Threaded into enrich so the membership check authorizes the SAME
                 // workspace the router resolved (not a client-chosen one).
@@ -622,13 +597,13 @@ impl Sidecar {
                 let (profile, result) = if authenticated {
                     match self.state.resolve(&sub).await {
                         Resolved::Found(p) => {
-                            info!(anonymous = false, hit = true, token_roles = token_roles.len(), "enrich");
+                            info!(anonymous = false, hit = true, "enrich");
                             (Some(p), "hit")
                         }
                         // Authenticated but no profile row yet — a legitimate state
-                        // (e.g. not-yet-synced user); enrich without profile fields.
+                        // (deny-by-default, spec R2); enrich without authz fields.
                         Resolved::Absent => {
-                            info!(anonymous = false, hit = false, token_roles = token_roles.len(), "enrich");
+                            info!(anonymous = false, hit = false, "enrich");
                             (None, "miss")
                         }
                         // Store unreadable → suspension state is UNKNOWN. Fail closed
@@ -648,7 +623,7 @@ impl Sidecar {
                     // is "anonymous" (no credential), which is never a stored profile —
                     // so a lookup is a guaranteed miss that needlessly loads the pool on
                     // high-volume anonymous traffic (and is not negatively cached).
-                    info!(anonymous = true, token_roles = token_roles.len(), "enrich");
+                    info!(anonymous = true, "enrich");
                     (None, "anonymous")
                 };
                 // N4 phase-2 gate: every resolved requirement must be satisfied by
@@ -658,7 +633,6 @@ impl Sidecar {
                 // upstream is misconfigured, and it denies here (fail-closed).
                 if let Err(reason) = enforce_route_requirements(
                     &requirements,
-                    &token_roles,
                     profile.as_ref(),
                     authenticated,
                     &self.state.aal_levels,
@@ -666,7 +640,7 @@ impl Sidecar {
                     info!(reason, "route requirements unsatisfied -> 403");
                     break 'decide (forbidden_403(), "forbidden");
                 }
-                (enrich_response(&sub, &token_roles, profile, authenticated, ws), result)
+                (enrich_response(&sub, profile, authenticated, ws), result)
             }
         } else {
             warn!("not ready -> 503");
@@ -1075,7 +1049,6 @@ mod tests {
         // by the sidecar -> always stripped before the backend, on every path.
         let some = enrich_response(
             "u1",
-            &[],
             Some(Arc::new(Profile { sub: "u1".into(), ..Default::default() })),
             true,
             None,
@@ -1097,7 +1070,7 @@ mod tests {
 
         // On a profile MISS the sidecar authors none of those, so any client copy
         // must be stripped — suspension especially (absent == unknown).
-        let miss = enrich_response("u1", &[], None, true, None);
+        let miss = enrich_response("u1", None, true, None);
         let r_miss = remove_headers(&miss);
         for h in ["x-auth-required", "x-user-org", "x-user-entitlements", "x-user-suspended"] {
             assert!(r_miss.contains(&h.to_owned()), "miss path must strip {h}");
@@ -1134,14 +1107,14 @@ mod tests {
             is_suspended: true,
             ..Default::default()
         });
-        let h = set_headers(&enrich_response("u1", &[], Some(suspended), true, None));
+        let h = set_headers(&enrich_response("u1", Some(suspended), true, None));
         assert_eq!(h.get("x-user-suspended").map(String::as_str), Some("true"));
         assert_eq!(h.get("x-auth-anonymous").map(String::as_str), Some("false"));
 
         // A profile MISS (no row) must NOT assert a suspension either way — the
         // header is simply absent, which is exactly why a store outage that
         // collapses to "miss" is dangerous and must instead fail closed.
-        let h_miss = set_headers(&enrich_response("u1", &[], None, true, None));
+        let h_miss = set_headers(&enrich_response("u1", None, true, None));
         assert!(!h_miss.contains_key("x-user-suspended"));
     }
 
@@ -1177,7 +1150,6 @@ mod tests {
         // NOT in the strip list (it was authored).
         let resp = enrich_response(
             "u1",
-            &[],
             Some(member_profile("ws_1", MemberType::Staff, "admin")),
             true,
             Some("ws_1"),
@@ -1197,7 +1169,6 @@ mod tests {
         // Customer of ws_2 resolves to the customer type + the ws-scoped role.
         let resp = enrich_response(
             "u1",
-            &[],
             Some(member_profile("ws_2", MemberType::Customer, "buyer")),
             true,
             Some("ws_2"),
@@ -1213,7 +1184,6 @@ mod tests {
         // authoritative scope, and any forged copy is stripped (fail-closed).
         let resp = enrich_response(
             "u1",
-            &[],
             Some(member_profile("ws_1", MemberType::Staff, "admin")),
             true,
             Some("ws_other"),
@@ -1236,7 +1206,6 @@ mod tests {
                 "member",
                 enrich_response(
                     "u1",
-                    &[],
                     Some(member_profile("ws_1", MemberType::Staff, "admin")),
                     true,
                     Some("ws_1"),
@@ -1246,14 +1215,13 @@ mod tests {
                 "non_member",
                 enrich_response(
                     "u1",
-                    &[],
                     Some(member_profile("ws_1", MemberType::Staff, "admin")),
                     true,
                     Some("ws_other"),
                 ),
             ),
-            ("miss", enrich_response("u1", &[], None, true, None)),
-            ("anonymous", enrich_response("anonymous", &[], None, false, None)),
+            ("miss", enrich_response("u1", None, true, None)),
+            ("anonymous", enrich_response("anonymous", None, false, None)),
         ];
         for (label, resp) in &cases {
             let h = set_headers(resp);
@@ -1315,7 +1283,6 @@ mod tests {
         assert_eq!(
             enforce_route_requirements(
                 &reqs(Some("admin"), Some("pro"), Some("1")),
-                &[],
                 Some(&p),
                 true,
                 &levels(),
@@ -1324,29 +1291,25 @@ mod tests {
         );
         // No signals -> no enforcement, regardless of enrichment state.
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, None), &[], None, false, &levels()),
+            enforce_route_requirements(&reqs(None, None, None), None, false, &levels()),
             Ok(()),
         );
     }
 
-    /// Spec "Missing role is rejected" — and token roles take the same precedence
-    /// as the emitted `x-user-roles` (token first, then Profile).
+    /// Spec "Missing role is rejected" — roles are nexus-authored only (spec R1), so
+    /// only a role on the Profile satisfies a role requirement; there is no token
+    /// path (see `role_claiming_token_confers_nothing`).
     #[test]
-    fn missing_role_is_denied_and_token_roles_count() {
-        let p = gated_profile(&["viewer"], &[]);
+    fn missing_role_is_denied_nexus_roles_only() {
+        let viewer = gated_profile(&["viewer"], &[]);
         assert_eq!(
-            enforce_route_requirements(&reqs(Some("admin"), None, None), &[], Some(&p), true, &levels()),
+            enforce_route_requirements(&reqs(Some("admin"), None, None), Some(&viewer), true, &levels()),
             Err("role"),
         );
-        // The same requirement satisfied by a token-carried role.
+        // The same requirement satisfied by a NEXUS-AUTHORED role on the Profile.
+        let admin = gated_profile(&["admin"], &[]);
         assert_eq!(
-            enforce_route_requirements(
-                &reqs(Some("admin"), None, None),
-                &["admin".to_owned()],
-                Some(&p),
-                true,
-                &levels(),
-            ),
+            enforce_route_requirements(&reqs(Some("admin"), None, None), Some(&admin), true, &levels()),
             Ok(()),
         );
     }
@@ -1356,7 +1319,7 @@ mod tests {
     fn missing_entitlement_is_denied() {
         let p = gated_profile(&[], &["free"]);
         assert_eq!(
-            enforce_route_requirements(&reqs(None, Some("pro"), None), &[], Some(&p), true, &levels()),
+            enforce_route_requirements(&reqs(None, Some("pro"), None), Some(&p), true, &levels()),
             Err("entitlement"),
         );
     }
@@ -1367,15 +1330,15 @@ mod tests {
     fn insufficient_or_unparseable_aal_is_denied() {
         let p = gated_profile(&[], &[]);
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, Some("2")), &[], Some(&p), true, &levels()),
+            enforce_route_requirements(&reqs(None, None, Some("2")), Some(&p), true, &levels()),
             Err("aal"),
         );
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, Some("1")), &[], Some(&p), true, &levels()),
+            enforce_route_requirements(&reqs(None, None, Some("1")), Some(&p), true, &levels()),
             Ok(()),
         );
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, Some("high")), &[], Some(&p), true, &levels()),
+            enforce_route_requirements(&reqs(None, None, Some("high")), Some(&p), true, &levels()),
             Err("min_aal_unparseable"),
         );
     }
@@ -1387,20 +1350,20 @@ mod tests {
     #[test]
     fn requirement_with_absent_enrichment_fails_closed() {
         assert_eq!(
-            enforce_route_requirements(&reqs(None, Some("pro"), None), &[], None, true, &levels()),
+            enforce_route_requirements(&reqs(None, Some("pro"), None), None, true, &levels()),
             Err("entitlement"),
         );
         assert_eq!(
-            enforce_route_requirements(&reqs(Some("admin"), None, None), &[], None, false, &levels()),
+            enforce_route_requirements(&reqs(Some("admin"), None, None), None, false, &levels()),
             Err("role"),
         );
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, Some("1")), &[], None, false, &levels()),
+            enforce_route_requirements(&reqs(None, None, Some("1")), None, false, &levels()),
             Err("aal"),
         );
         // A method absent from the ordering can satisfy nothing (fail-closed).
         assert_eq!(
-            enforce_route_requirements(&reqs(None, None, Some("1")), &[], None, true, &HashMap::new()),
+            enforce_route_requirements(&reqs(None, None, Some("1")), None, true, &HashMap::new()),
             Err("aal"),
         );
     }
@@ -1418,11 +1381,37 @@ mod tests {
         assert_eq!(r.min_aal.as_deref(), Some("2"));
         // …and every forwarded response strips them (policy detail never
         // reaches the backend), alongside the phase-1 boolean.
-        let resp = enrich_response("u1", &[], None, true, None);
+        let resp = enrich_response("u1", None, true, None);
         let removed = remove_headers(&resp);
         for h in ["x-auth-required", "x-auth-requires-role", "x-auth-requires-entitlement", "x-auth-min-aal"] {
             assert!(removed.contains(&h.to_owned()), "must strip {h}");
         }
+    }
+
+    /// Spec R1 / task 8.1: a role-claiming token confers nothing. Roles are
+    /// nexus-authored only — sourced from the Profile, never the token. A subject
+    /// nexus holds no roles for gets an empty `x-user-roles` and is refused a
+    /// role-gated route; even a Profile role that isn't the required one denies.
+    /// (Structurally there is NO token→roles path: `extract_identity` reads no roles
+    /// claim and `enrich_response`/`enforce_route_requirements` take no token roles.)
+    #[test]
+    fn role_claiming_token_confers_nothing() {
+        // No nexus Profile → deny-by-default: empty roles header, role route refused.
+        let miss = enrich_response("u1", None, true, None);
+        assert_eq!(set_headers(&miss).get("x-user-roles").map(String::as_str), Some(""));
+        assert_eq!(
+            enforce_route_requirements(&reqs(Some("admin"), None, None), None, true, &levels()),
+            Err("role"),
+        );
+        // A Profile with only a different nexus role still denies the admin route.
+        let viewer = gated_profile(&["viewer"], &[]);
+        assert_eq!(
+            enforce_route_requirements(&reqs(Some("admin"), None, None), Some(&viewer), true, &levels()),
+            Err("role"),
+        );
+        // The emitted roles are exactly the nexus-authored set, nothing else.
+        let h = set_headers(&enrich_response("u1", Some(viewer), true, None));
+        assert_eq!(h.get("x-user-roles").map(String::as_str), Some("viewer"));
     }
 
     #[test]
