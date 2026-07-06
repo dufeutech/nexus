@@ -22,6 +22,7 @@
 
 use std::env;
 
+use router_core::auth::RouteAuth;
 use router_core::domain::{Pool, WorkspaceConfig};
 use router_core::store::{
     Membership, MembershipStore, OwnershipStore, RoutingStore,
@@ -257,8 +258,8 @@ async fn auth_route_requirement_fields_round_trip() {
     store.upsert_workspace(&workspace("ws_auth")).await.unwrap();
 
     // A phase-1 rule (no requirements) and a phase-2 gated rule.
-    let plain = router_core::auth::RouteAuth { required: true, ..router_core::auth::RouteAuth::PASS_THROUGH };
-    let gated = router_core::auth::RouteAuth {
+    let plain = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };
+    let gated = RouteAuth {
         required: true,
         requires_role: Some("admin".to_owned()),
         requires_entitlement: Some("pro".to_owned()),
@@ -277,6 +278,6 @@ async fn auth_route_requirement_fields_round_trip() {
 
     // Upserting the gated rule back to plain clears the requirement columns.
     store.upsert_auth_route("ws_auth", "/admin", &plain).await.unwrap();
-    let policy = store.get_auth_policy("ws_auth").await.unwrap();
-    assert!(!policy.resolve("/admin").has_requirements());
+    let cleared = store.get_auth_policy("ws_auth").await.unwrap();
+    assert!(!cleared.resolve("/admin").has_requirements());
 }
