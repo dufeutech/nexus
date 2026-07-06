@@ -174,3 +174,142 @@ ports are clean.
      through `/opsx:decide`.
 3. Note the cross-repo mirror: `nexus-upstream-requirements.md` is mirrored by the consumer
    repo; any header/identity-contract change from this work must be pinned in both.
+
+---
+
+## 7. Explore session 2026-07-06 — AuthN/AuthZ boundary + authorization port
+
+**Status update.** Change 1 (`nexus-owned-identity-db`) is DONE, archived, merged to `main`
+(DB residency + vendor-neutral OIDC). Fork §5.1 is settled: **option A, nexus-native.** This
+section pressure-tests change 2 (`oidc-agnostic-identity-source`) and records the design spine.
+
+### 7.1 The settled boundary (user stance)
+
+> **ZITADEL / any OIDC = "who am I". nexus = "what am I allowed to do here".**
+
+- **AuthN, borrowed:** the OIDC provider authenticates (`sub`) and supplies the *basic* profile
+  (name, email) as claims. Nothing more.
+- **AuthZ, owned:** roles, entitlements, permissions, suspension, and workspace membership are
+  **nexus-authored and authoritative.** The IdP is never a source of authorization.
+
+### 7.2 What this settles (verified against the current code, 2026-07-06)
+
+Per-signal producer, today → after change 2 (map from the explore session):
+
+| Enrichment signal | producer TODAY | after change 2 |
+| --- | --- | --- |
+| `x-user-id` (sub) | verified token | unchanged (Envoy) |
+| `x-user-roles` | **TOKEN claim primary**, Profile fallback (`sidecar extract_identity`) | **nexus Profile ONLY** — the token-roles path is REMOVED (the IdP must not be the role authority) |
+| `x-workspace-id`/`-type`/`-role` | `Profile.memberships` (routing → `membership-sync`) | unchanged — already nexus-native |
+| `x-user-entitlements` | `Profile.entitlements` — **no producer exists** (`reconcile.rs:41 = Vec::new()`, never set in `sync.rs`) | nexus-native — change 2 is its **first** producer |
+| `x-user-suspended` | `Profile.is_suspended` (ZITADEL Actions → sync-worker) | nexus-native — **the one signal that genuinely breaks** when the binaries are deleted |
+| `x-user-org` | retired — always stripped | dead already |
+
+So "make roles/entitlements/suspension nexus-native" decomposes precisely: **roles** flip from
+token-authority to nexus (a deletion of the token path); **entitlements** get their first-ever
+producer; **suspension** needs a nexus-native home (the real revocation work). `name`/`email`
+come from OIDC claims and are unused on the hot path (the sidecar never reads them).
+
+### 7.3 The consequence to accept — deny-by-default authorization
+
+Cutting the token-roles path makes authorization **explicit and deny-by-default**: a freshly
+authenticated user has a valid token, a `sub`, maybe a name — and **zero permissions** until
+nexus grants them. Two things this forces, both invisible in code:
+
+- a **provisioning surface** (the thing that replaces "manage grants in ZITADEL") to
+  assign/revoke roles + entitlements and suspend/reactivate;
+- a **bootstrap answer** — how the *first* nexus admin gets a role when no one can grant it yet
+  (seed row / break-glass config-authored admin). Decide explicitly.
+
+The Profile becomes **"the set of subjects nexus has an authz opinion about."** Absent row =
+the safe default (authenticated, no roles, not suspended, no entitlements, no scope) — which the
+sidecar already produces by stripping the headers on a cache miss. No enumerate-pass, no
+backfill, no lazy name/email needed for enforcement.
+
+### 7.4 Design spine — authorization behind a port (future: OpenFGA / Cedar)
+
+The user intends to possibly adopt **OpenFGA (ReBAC)** or **Cedar (policy)** *in the future* —
+not now. The instruction is to get the **port/adapter boundary** right so that becomes an
+adapter swap, not a rewrite. Two ports, expressed in **domain language (grants/decisions), never
+storage terms**:
+
+```
+   Enforcement (edge gate · sidecar enrichment · future backend checks)
+        │  depends ONLY on ↓  (traits in core)
+   ┌──────────────────────────┬───────────────────────────────┐
+   │  AuthzAuthoring (write)   │  AuthzResolver (read, hot path)│
+   │  assign/revoke role,      │  "what may this subject do?"   │
+   │  grant/revoke entitlement,│  → effective grants / decision │
+   │  suspend / reactivate     │                                │
+   └──────────────────────────┴───────────────────────────────┘
+        │ implemented by ↓  (swap the adapter, not the callers)
+   nexus-native (Postgres) ← change 2   │  OpenFGA(tuples) · Cedar(policies) ← future
+```
+
+Disciplines that make the seam real (not nominal):
+
+1. **Enforcement depends on the port, never on `Profile.roles` directly.** Header-injection is
+   merely *how today's coarse decisions reach the edge*; a future engine swaps the adapter, not
+   the callers.
+2. **Keep the coarse edge gate attribute-based.** Route-level "can you hit `/admin` at all" stays
+   flat role/entitlement matching forever (cheap, correct). A decision engine earns its keep at
+   **resource-level** ("can U edit *this* doc") — a **new** enforcement layer added later behind
+   the same port family, not a swap of the edge gate. Change 2 must not preclude it, and must not
+   build it.
+3. **Attribute vs decision is a shape change, not just a store change.** Today: attribute-based
+   (`inject roles → gate matches`). OpenFGA/Cedar: decision-based (`(subject, action, resource)
+   → allow`). Shaping the port as an authorization *question* (not a column read) is what keeps
+   the future engine a drop-in for the questions it can answer.
+4. **Do not over-abstract now (YAGNI).** Build the two ports + one nexus-native Postgres adapter.
+   No OpenFGA/Cedar scaffolding until it's real — at which point it is a `/opsx:decide` adapter
+   pick, not a rewrite.
+
+**Unification note:** memberships are *already* authorization facts (workspace-scoped grants)
+behind their own resolver port; roles/entitlements/suspension are *global* grants. A future
+OpenFGA models all of them uniformly as relationships. Shape the new global-grant port so it
+could eventually **subsume** memberships too — don't design it to fight that merge later.
+
+### 7.4a Settled build-vs-adopt — authorization engine (decide 2026-07-06)
+
+**Decision: Build nexus-native flat RBAC now, behind ports; defer OpenFGA/Cedar.**
+Status: approved (to be recorded verbatim in `design.md`'s `## Decisions` at `/opsx:propose`).
+
+- **Why:** today's need is coarse flat roles/entitlements/suspension matched at the edge —
+  textbook RBAC. Mature engines solve a heavier, different problem (fine-grained ReBAC / policy)
+  not yet present; current guidance is explicitly "start with RBAC, adopt ReBAC/ABAC on role
+  explosion or complex sharing." The ports (§7.4) make future adoption an adapter swap, not a
+  rewrite — Adopt-when-real, not Build-and-be-stuck.
+- **Considered:** *Adopt OpenFGA now* — CNCF Incubation, production-grade ReBAC, but a separate
+  Go service + graph store to operate with no first-class Rust SDK; overkill for flat roles.
+  *Adopt Cedar now* — Rust-native (`cedar-policy` crate), in-process, formal analysis, but
+  ABAC/policy-shaped and you still build the grant store; overkill until attribute rules exist.
+- **Isolation:** `AuthzAuthoring` (write) + `AuthzResolver` (read) ports in `core`; today's adapter
+  is nexus-native Postgres. A future OpenFGA/Cedar adapter is a `/opsx:decide` pick behind the same
+  ports. Rust-nativeness note for that future call: Cedar embeds as a crate; OpenFGA is an external
+  service + HTTP client.
+- **Tier:** Build (behind a port) now → planned future Adopt.
+
+### 7.5 Still-open for change 2 (settle at `/opsx:propose` / `/opsx:decide`)
+
+- **Model 1 vs Model 2 for today's adapter.** M1 = admin API writes grants straight into the
+  Profile store (Profile is the SoR; simplest while authz is flat). M2 = a normalized nexus authz
+  SoR table projected into the Profile read-model (mirrors the membership pattern; survives growth).
+  Since a future engine backs the *port*, the adapter can start M1-simple **as long as enforcement
+  depends on the port, not the Profile** — but if the flat model is expected to grow before OpenFGA
+  lands, M2 avoids a mid-life migration. Recommend deciding against the expected authz-richness
+  runway.
+- **Provisioning surface + bootstrap** (§7.3) — where the admin authoring API lives (identity plane
+  for global user grants, parallel to control-plane's workspace/membership authoring) and how the
+  first admin is seeded.
+- **Roles: still read the token claim at all?** Recommended NO (stance §7.1); confirm no provider
+  integration depends on it.
+- **Migration** — currently ZITADEL-sourced roles must be re-authored as nexus grants. Pre-prod +
+  rebuildable, so likely re-provision rather than ETL; confirm.
+
+### 7.6 Deletion scope (change 2)
+
+Delete `reconciler` + `sync-worker` binaries, `core/reconcile.rs`, `core/sync.rs`, the ZITADEL
+wire-shape parsing, PAT handling + webhook registration, the `oidc.internalUrl`/`patSecret` Helm
+wiring and `ZITADEL_HOST`/`ZITADEL_INTERNAL_URL`/`PAT_FILE` env (the directory-API surface change 1
+deliberately left in place). Keep: OIDC verification (Envoy), `sub`, membership plane, the
+`ProfileStore` port + `PgProfileStore`, `membership-sync`.
