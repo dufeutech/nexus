@@ -75,9 +75,11 @@ services:
       start_period: 20s
 
   # --- identity store + sync pipeline ----------------------------------------
-  # The identity store is the SAME Postgres ZITADEL uses (the `postgres` service
-  # below), under a dedicated `identity` schema — the identity-plane twin of the
-  # routing plane's `routing` schema (RFC decision 14). Freshness is the RFC C4
+  # The identity store is a nexus-OWNED database (`identitydb`) on the SAME
+  # Postgres server ZITADEL uses (the `postgres` service below), under a dedicated
+  # `identity` schema — the identity-plane twin of the routing plane's `routing`
+  # database/schema (RFC decision 14; identity-data-residency: nexus owns its data
+  # in its own database, not inside ZITADEL's `zitadel` DB). Freshness is the RFC C4
   # change feed implemented as a `seq`-cursor over Postgres LISTEN/NOTIFY (channel
   # `identity_changes`); no replica set, no second database technology. The
   # writers (sync-worker, reconciler) create the schema idempotently on startup.
@@ -89,7 +91,7 @@ services:
     container_name: zitadel-lab-sync
     restart: unless-stopped
     environment:
-      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
       ZITADEL_INTERNAL_URL: http://zitadel:8080
       # D7 single source: derives from ZITADEL_EXTERNALPORT with the SAME default
       # (8080) the zitadel service uses — and the edge's issuer literal in
@@ -116,7 +118,7 @@ services:
     container_name: zitadel-lab-reconciler
     restart: unless-stopped
     environment:
-      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
       ZITADEL_INTERNAL_URL: http://zitadel:8080
       # D7: same default as the zitadel service + edge issuer (see sync-worker).
       ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
@@ -145,8 +147,8 @@ services:
     container_name: zitadel-lab-membership-sync
     restart: unless-stopped
     environment:
-      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
-      ROUTING_PG_RO_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
+      ROUTING_PG_RO_URL: postgres://postgres:postgres@postgres:5432/routing
       MEMBERSHIP_BACKSTOP_INTERVAL: "30"   # ~600 in prod; short here to observe
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
@@ -209,7 +211,7 @@ services:
     container_name: zitadel-lab-control-plane
     restart: unless-stopped
     environment:
-      ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/routing
       # C16 fail-closed guard, satisfied WITH AUTH ENABLED — production parity,
       # NOT CONTROL_AUTH_DISABLED: the e2e release gate runs against this stack,
       # and validating against an auth-disabled control plane would give false
@@ -239,7 +241,7 @@ services:
     container_name: zitadel-lab-tenant-router
     restart: unless-stopped
     environment:
-      ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/routing
       REDIS_URL: redis://redis:6379
       ROUTING_CACHE_TTL: ${ROUTER_CACHE_TTL:-600}
       # first-party-telemetry: the ONE telemetry address (OTLP/gRPC to the collector).
@@ -316,7 +318,7 @@ services:
       - sh
       - -c
       - >-
-        psql -h postgres -U postgres -d zitadel -v ON_ERROR_STOP=1 -c
+        psql -h postgres -U postgres -d routing -v ON_ERROR_STOP=1 -c
         "UPDATE routing.domains SET verified = true
            WHERE domain IN ('localhost','app.acme.test','acme.test','api.globex.test');
          SELECT pg_notify('routing_invalidations', domain)
@@ -336,7 +338,7 @@ services:
     container_name: zitadel-lab-sidecar-rs
     restart: unless-stopped
     environment:
-      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
+      PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
       CACHE_TTL_SECONDS: ${SIDECAR_CACHE_TTL:-43200}
       READINESS_DELAY_SECONDS: ${SIDECAR_READINESS_DELAY:-0}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
@@ -417,6 +419,9 @@ services:
       start_period: 10s
     volumes:
       - postgres-data:/var/lib/postgresql/data:rw
+      # identity-data-residency: create the nexus-owned databases (identitydb,
+      # routing) at first init, separate from ZITADEL's `zitadel` database.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
 
   # --- observability: Prometheus scrapes all /metrics; Grafana dashboards ------
   prometheus:

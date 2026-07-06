@@ -12,7 +12,7 @@ Filter order is load-bearing:
 */ -}}
 {{- $iv := index .Values "identity-plane" -}}
 {{- $rv := index .Values "routing-plane" -}}
-{{- $u := $iv.zitadel.internalUrl | trimPrefix "http://" | trimPrefix "https://" | trimSuffix "/" -}}
+{{- $u := $iv.oidc.internalUrl | trimPrefix "http://" | trimPrefix "https://" | trimSuffix "/" -}}
 {{- $zHost := $u -}}
 {{- $zPort := "8080" -}}
 {{- if contains ":" $u -}}
@@ -25,11 +25,11 @@ Filter order is load-bearing:
 {{- /* edge-trust-anchor-integrity: the JWKS fetch is the root of ALL token
 verification — refuse to render an edge whose trust anchor would travel an
 unprotected channel nobody has vouched for (fail closed, not silently open). */ -}}
-{{- if and (not $iv.zitadel.jwksTls.enabled) (not $iv.zitadel.jwksPlaintextTrustedPath) -}}
-{{- fail "the edge fetches its JWT trust anchor (JWKS) but no transport-integrity choice is set — an on-path attacker substituting signing keys is a FULL auth bypass (edge-trust-anchor-integrity). Set identity-plane.zitadel.jwksTls.enabled=true to fetch over TLS with server-cert verification (preferred), or identity-plane.zitadel.jwksPlaintextTrustedPath=true to explicitly assert the edge→ZITADEL path is trusted (loopback / assessed in-cluster hop). Rendering without either would silently trust unauthenticated keys." -}}
+{{- if and (not $iv.oidc.jwksTls.enabled) (not $iv.oidc.jwksPlaintextTrustedPath) -}}
+{{- fail "the edge fetches its JWT trust anchor (JWKS) but no transport-integrity choice is set — an on-path attacker substituting signing keys is a FULL auth bypass (edge-trust-anchor-integrity). Set identity-plane.oidc.jwksTls.enabled=true to fetch over TLS with server-cert verification (preferred), or identity-plane.oidc.jwksPlaintextTrustedPath=true to explicitly assert the edge→provider path is trusted (loopback / assessed in-cluster hop). Rendering without either would silently trust unauthenticated keys." -}}
 {{- end -}}
-{{- $jwksScheme := ternary "https" "http" $iv.zitadel.jwksTls.enabled -}}
-{{- $jwksSni := $iv.zitadel.jwksTls.sni | default $zHost -}}
+{{- $jwksScheme := ternary "https" "http" $iv.oidc.jwksTls.enabled -}}
+{{- $jwksSni := $iv.oidc.jwksTls.sni | default $zHost -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -246,22 +246,22 @@ data:
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
                           providers:
-                            zitadel:
-                              issuer: {{ $iv.zitadel.issuer | quote }}
+                            oidc:
+                              issuer: {{ $iv.oidc.issuer | quote }}
                               remote_jwks:
                                 # SECURITY: the JWKS gates ALL token verification —
                                 # a network MITM that substitutes keys is a full
                                 # auth bypass (edge-trust-anchor-integrity). The
-                                # scheme follows identity-plane.zitadel.jwksTls; the
+                                # scheme follows identity-plane.oidc.jwksTls; the
                                 # actual protection is the `transport_socket` on the
-                                # `zitadel_jwks` cluster below (trusted CA + SNI +
+                                # `oidc_jwks` cluster below (trusted CA + SNI +
                                 # SAN match). A render guard refuses plaintext
                                 # without an explicit trusted-path assertion.
                                 http_uri:
-                                  uri: "{{ $jwksScheme }}://{{ include "edge-platform.jwksHost" . }}{{ $iv.zitadel.jwksPath }}"
-                                  cluster: zitadel_jwks
+                                  uri: "{{ $jwksScheme }}://{{ include "edge-platform.jwksHost" . }}{{ $iv.oidc.jwksPath }}"
+                                  cluster: oidc_jwks
                                   timeout: 5s
-                                cache_duration: { seconds: {{ $iv.zitadel.jwksCacheSeconds }} }
+                                cache_duration: { seconds: {{ $iv.oidc.jwksCacheSeconds }} }
                               payload_in_metadata: verified
                               forward: true
                           # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
@@ -279,7 +279,7 @@ data:
                                 headers: [{ name: x-auth-required, string_match: { exact: "false" } }]
                               requires: { allow_missing: {} }
                             - match: { prefix: "/" }
-                              requires: { provider_name: zitadel }
+                              requires: { provider_name: oidc }
                       # Enrich from the verified subject (C2).
                       - name: envoy.filters.http.ext_proc
                         typed_config:
@@ -333,17 +333,17 @@ data:
                   - endpoint:
                       address:
                         socket_address: { address: 127.0.0.1, port_value: 50051 }
-        - name: zitadel_jwks
+        - name: oidc_jwks
           type: STRICT_DNS
           lb_policy: ROUND_ROBIN
           load_assignment:
-            cluster_name: zitadel_jwks
+            cluster_name: oidc_jwks
             endpoints:
               - lb_endpoints:
                   - endpoint:
                       address:
                         socket_address: { address: {{ $zHost | quote }}, port_value: {{ $zPort }} }
-          {{- if $iv.zitadel.jwksTls.enabled }}
+          {{- if $iv.oidc.jwksTls.enabled }}
           # edge-trust-anchor-integrity: authenticate the key source and protect
           # the JWKS response against on-path substitution — verify the server
           # chain against the trusted CA AND pin the presented SAN, so a valid
@@ -356,7 +356,7 @@ data:
               common_tls_context:
                 validation_context:
                   trusted_ca:
-                    filename: {{ $iv.zitadel.jwksTls.caFile | quote }}
+                    filename: {{ $iv.oidc.jwksTls.caFile | quote }}
                   match_typed_subject_alt_names:
                     - san_type: DNS
                       matcher: { exact: {{ $jwksSni | quote }} }

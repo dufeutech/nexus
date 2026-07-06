@@ -16,10 +16,10 @@ dependency is **external** and operated outside this project:
 
 | External dependency | Used by            | Why it's external                                  |
 | ------------------- | ------------------ | -------------------------------------------------- |
-| **PostgreSQL**      | identity sidecar / sync-worker / reconciler | identity store + LISTEN/NOTIFY change feed (RFC C4); session connection required; app creates the `identity` schema |
-| **PostgreSQL**      | tenant-router / control-plane | authoritative routing store (RFC decision 14)      |
+| **PostgreSQL** (`identitydb`) | identity sidecar / sync-worker / reconciler | nexus-owned identity store + LISTEN/NOTIFY change feed (RFC C4); session connection required; app creates the `identity` schema. Separate database from the IdP (identity-data-residency) |
+| **PostgreSQL** (`routing`) | tenant-router / control-plane | nexus-owned authoritative routing store (RFC decision 14); separate database from the IdP |
 | **Redis** (optional) | tenant-router     | OPTIONAL L2 cache (RFC decision 9) — never a correctness dependency |
-| **ZITADEL** (IdP) + its DB | edge jwt_authn / sync-worker / reconciler | credential issuer; run its own chart / a managed instance |
+| **OIDC provider** (IdP) | edge jwt_authn / sync-worker / reconciler | credential issuer; ANY conformant OIDC provider by config (oidc-provider-independence). Owns ONLY authentication — not nexus's data. Run its own chart / a managed instance |
 | **Backend pools**   | edge router        | your applications — the finite set routing selects among (RFC C15) |
 
 Two equivalent topologies, **same images, same env-var contract** (topology
@@ -101,7 +101,7 @@ Runs the full first-party stack against your external infrastructure.
 cd compose
 cp .env.example .env                      # fill in Postgres / Redis / ZITADEL
 printf '%s' '<zitadel-admin-PAT>' > secrets/zitadel-admin-sa.pat
-$EDITOR envoy/envoy.yaml                   # set zitadel_jwks + pool_* upstreams
+$EDITOR envoy/envoy.yaml                   # set oidc_jwks + pool_* upstreams
 docker compose up -d --build               # builds from ../../identity-rs and ../../routing-rs
 ```
 
@@ -121,10 +121,10 @@ helm install identity ./helm/identity-plane -n identity --create-namespace \
   --set images.syncWorker.repository=REGISTRY/identity-sync-worker \
   --set images.reconciler.repository=REGISTRY/identity-reconciler \
   --set postgres.existingSecret=identity-pg \
-  --set zitadel.issuer=https://auth.example.com \
-  --set zitadel.internalUrl=https://zitadel.zitadel.svc.cluster.local:8443 \
-  --set zitadel.patSecret.existingSecret=zitadel-pat \
-  --set zitadel.jwksTls.enabled=true \
+  --set oidc.issuer=https://auth.example.com \
+  --set oidc.internalUrl=https://zitadel.zitadel.svc.cluster.local:8443 \
+  --set oidc.patSecret.existingSecret=zitadel-pat \
+  --set oidc.jwksTls.enabled=true \
   --set originEnforcement.networkPolicy.enabled=true \
   --set originEnforcement.networkPolicy.backendSelector.app=myapp \
   --set backend.host=myapp.default.svc.cluster.local \
@@ -324,19 +324,19 @@ rests on — over plaintext HTTP, silently. An on-path attacker who substitutes
 that response owns every "verified" identity. Now the stamping edges
 (identity-plane, edge-platform umbrella) require one of:
 
-- **`zitadel.jwksTls.enabled=true`** (preferred): the JWKS is fetched over TLS
+- **`oidc.jwksTls.enabled=true`** (preferred): the JWKS is fetched over TLS
   with server-cert verification (trusted CA + SNI + SAN pin). Point
-  `zitadel.internalUrl` at a TLS port; for a private CA, mount your bundle
-  into the Envoy pod and set `zitadel.jwksTls.caFile`; set
-  `zitadel.jwksTls.sni` when the cert is issued for a name other than the
+  `oidc.internalUrl` at a TLS port; for a private CA, mount your bundle
+  into the Envoy pod and set `oidc.jwksTls.caFile`; set
+  `oidc.jwksTls.sni` when the cert is issued for a name other than the
   dialed host.
-- **`zitadel.jwksPlaintextTrustedPath=true`**: an explicit assertion that the
-  edge→ZITADEL hop is a trusted path (e.g. genuinely in-cluster and assessed).
+- **`oidc.jwksPlaintextTrustedPath=true`**: an explicit assertion that the
+  edge→provider hop is a trusted path (e.g. genuinely in-cluster and assessed).
   This is an acknowledgment, not a control — prefer TLS.
 
 Migration for a deployment currently on plaintext JWKS over an untrusted hop:
-enable TLS on ZITADEL's serving endpoint (or front it with a TLS hop you
-trust), then set `zitadel.jwksTls.enabled=true`. Until then, upgrading the
+enable TLS on the OIDC provider's serving endpoint (or front it with a TLS hop you
+trust), then set `oidc.jwksTls.enabled=true`. Until then, upgrading the
 chart without either value is a hard render error by design.
 
 (On the umbrella, both values live under the `identity-plane:` block.)
@@ -394,7 +394,7 @@ supply the *truth*):**
       `originEnforcement.external=true`, that is an assertion — you own the
       network control (policy/mesh/firewall) that makes it true, and you should
       run the same probe against it.
-- [ ] **JWKS over verified TLS.** `zitadel.jwksTls.enabled=true` with a CA the
+- [ ] **JWKS over verified TLS.** `oidc.jwksTls.enabled=true` with a CA the
       Envoy pod can read (`jwksTls.caFile`) and the right `jwksTls.sni`. Use
       `jwksPlaintextTrustedPath=true` ONLY for a genuinely in-cluster hop you
       have assessed — it is an acknowledgment, not a control.
@@ -424,8 +424,8 @@ supply the *truth*):**
       (`docker buildx imagetools inspect envoyproxy/envoy:<tag> | grep Digest`)
       and re-verify span export. The lab pins ZITADEL for the same reason (a
       floating tag broke the CI gate).
-- [ ] **Issuer single-sourced (D7).** `zitadel.issuer` must equal the `iss`
-      ZITADEL mints AND the value the workers derive — drift is silent-but-fatal
+- [ ] **Issuer single-sourced (D7).** `oidc.issuer` must equal the `iss`
+      the provider mints AND the value the workers derive — drift is silent-but-fatal
       (sync works, every authenticated request 401s). The lab guards this in
       `../scripts/helm-guards-test.sh`; re-check it for your values file.
 - [ ] **TLS/ingress values are real**: `edge.ingress.host(s)`, cert-manager

@@ -890,7 +890,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // schema creation. It MUST reach the primary on a session connection — a
     // transaction-mode pooler silently swallows LISTEN (see deploy/README.md).
     let pg_url = env::var("PROFILE_PG_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@postgres:5432/zitadel".into());
+        .unwrap_or_else(|_| "postgres://postgres:postgres@postgres:5432/identitydb".into());
     let ttl: u64 = env::var("CACHE_TTL_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())

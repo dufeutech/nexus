@@ -141,10 +141,10 @@ ZITADEL JWKS Host header (issuer authority) for the combined edge's jwt_authn.
 */}}
 {{- define "edge-platform.jwksHost" -}}
 {{- $iv := index .Values "identity-plane" -}}
-{{- if $iv.zitadel.jwksHost -}}
-{{- $iv.zitadel.jwksHost -}}
+{{- if $iv.oidc.jwksHost -}}
+{{- $iv.oidc.jwksHost -}}
 {{- else -}}
-{{- $iv.zitadel.issuer | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/" -}}
+{{- $iv.oidc.issuer | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/" -}}
 {{- end -}}
 {{- end -}}
 

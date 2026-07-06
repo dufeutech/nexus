@@ -131,10 +131,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Prometheus exporter listener is retired — the collector's metrics pipeline
     // forwards to the store, no per-box scrape job.
 
-    let profile_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
+    let profile_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/identitydb");
     // Read-only routing connection (least privilege: SELECT on routing.memberships +
     // LISTEN). A SEPARATE database from the identity store in production.
-    let routing_url = env("ROUTING_PG_RO_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
+    let routing_url = env("ROUTING_PG_RO_URL", "postgres://postgres:postgres@postgres:5432/routing");
     let backstop_interval = Duration::from_secs(env_num("MEMBERSHIP_BACKSTOP_INTERVAL", 600_u64));
 
     // Connect (with retry) to both planes. This worker is a profile writer, so it

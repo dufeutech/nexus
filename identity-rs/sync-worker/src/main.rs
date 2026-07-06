@@ -271,7 +271,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Metrics now push via the OTel meter (first-party-telemetry); the old
     // Prometheus /metrics scrape endpoint is retired in favor of the OTLP push path.
 
-    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
+    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/identitydb");
     let internal_url = env("ZITADEL_INTERNAL_URL", "http://zitadel:8080");
     let host = env("ZITADEL_HOST", "localhost:8088");
     let self_url = env("WEBHOOK_SELF_URL", "http://sync-worker:8080/webhook");

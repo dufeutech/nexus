@@ -107,10 +107,10 @@ url
 Issuer authority (host[:port]) — used as the JWKS Host header default.
 */}}
 {{- define "identity-plane.jwksHost" -}}
-{{- if .Values.zitadel.jwksHost -}}
-{{- .Values.zitadel.jwksHost -}}
+{{- if .Values.oidc.jwksHost -}}
+{{- .Values.oidc.jwksHost -}}
 {{- else -}}
-{{- .Values.zitadel.issuer | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/" -}}
+{{- .Values.oidc.issuer | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/" -}}
 {{- end -}}
 {{- end -}}
 
@@ -118,8 +118,8 @@ Issuer authority (host[:port]) — used as the JWKS Host header default.
 Name of the Secret holding the ZITADEL admin PAT (created or pre-existing).
 */}}
 {{- define "identity-plane.patSecretName" -}}
-{{- if .Values.zitadel.patSecret.existingSecret -}}
-{{- .Values.zitadel.patSecret.existingSecret -}}
+{{- if .Values.oidc.patSecret.existingSecret -}}
+{{- .Values.oidc.patSecret.existingSecret -}}
 {{- else -}}
 {{- printf "%s-zitadel-pat" (include "identity-plane.fullname" .) -}}
 {{- end -}}

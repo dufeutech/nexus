@@ -143,8 +143,9 @@ Today's `get`-then-`apply`-then-`put` in the sync-worker has a benign TOCTOU rac
 - [x] **`store-mongo` deleted**; `mongodb` + `bson` dropped from the workspace.
 - [x] **Root `docker-compose.yaml`** — `mongo`/`mongo-init` services and
       `mongo-data` volume removed; the three identity services take
-      `PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel` and
-      depend on `postgres: { condition: service_healthy }`.
+      `PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb` (the
+      nexus-owned database — see change `nexus-owned-identity-db`) and depend on
+      `postgres: { condition: service_healthy }`.
 - [x] **`deploy/`** — `helm/identity-plane` gained a `postgres:` values block, a
       `secret-pg.yaml`, pg helpers, and `PROFILE_PG_URL` via `secretKeyRef`,
       mirroring `routing-plane`. `edge-platform`, `deploy/compose`, `.env.example`,

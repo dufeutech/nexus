@@ -11,7 +11,7 @@ The combined edge dials:
   - routing store secret : {{ include "edge-platform.routingPgSecret" . }} (key {{ include "edge-platform.routingPgSecretKey" . }})
   - identity store secret: {{ include "edge-platform.identityPgSecret" . }} (key {{ include "edge-platform.identityPgSecretKey" . }})
   - redis (L2)           : {{ include "edge-platform.redisUrl" . | default "(disabled — L1-only)" }}
-  - ZITADEL issuer       : {{ (index .Values "identity-plane").zitadel.issuer }}
+  - OIDC issuer          : {{ (index .Values "identity-plane").oidc.issuer }}
 
 Edge entry point:
 {{- if .Values.edge.ingress.enabled }}
@@ -36,7 +36,7 @@ Before trusting in production:
   1. Register routing config via the routing control plane (administrative boundary):
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "edge-platform.routingFullname" . }}-control-plane 9400:9400
      # then POST /tenants and verified /domains (see routing-plane NOTES)
-  2. Confirm the ZITADEL issuer above matches what your ZITADEL mints (RFC §6.6).
-  3. Provide the admin PAT secret for sync-worker/reconciler (identity-plane.zitadel.patSecret).
+  2. Confirm the OIDC issuer above matches what your provider mints (RFC §6.6).
+  3. Provide the admin PAT secret for sync-worker/reconciler (identity-plane.oidc.patSecret).
 
 Open production items: see deploy/README.md and run deploy/load/ (load/soak/failover).

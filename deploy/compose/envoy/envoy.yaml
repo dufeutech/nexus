@@ -12,7 +12,7 @@
 #     router                   forward to the pool the routing decision chose
 #
 # EXTERNAL upstreams you MUST point at your own infrastructure (this project does
-# not run them): the `zitadel_jwks` cluster and every `pool_*` cluster at the
+# not run them): the `oidc_jwks` cluster and every `pool_*` cluster at the
 # bottom. The in-stack clusters (tenant_router, identity_sidecar) need no edits.
 admin:
   # Bound to the container for health/inspection. NOT published in compose.
@@ -227,29 +227,33 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
                       providers:
-                        zitadel:
-                          # Must equal the `iss` your ZITADEL mints (RFC §6.6).
+                        # oidc-provider-independence: vendor-neutral provider name.
+                        # Any conformant OIDC provider works by setting issuer +
+                        # remote_jwks; ZITADEL is the currently deployed provider.
+                        oidc:
+                          # Must equal the `iss` your OIDC provider mints (RFC §6.6).
                           issuer: "https://auth.example.com"
                           remote_jwks:
                             http_uri:
                               # The Host header sent on the JWKS fetch must equal
                               # the issuer authority; the `cluster` is the in-
-                              # cluster ZITADEL upstream (zitadel_jwks below).
+                              # cluster in-cluster OIDC provider upstream (oidc_jwks
+                              # below).
                               # edge-trust-anchor-integrity: fetch the JWKS over HTTPS
                               # with cert validation on any untrusted path. Plaintext
                               # JWKS lets a network MITM substitute signing keys →
                               # full auth bypass. Changing the scheme here is NOT
-                              # enough — Envoy uses TLS only if the `zitadel_jwks`
+                              # enough — Envoy uses TLS only if the `oidc_jwks`
                               # CLUSTER has a `transport_socket` (UpstreamTlsContext
                               # with validation_context + SNI + SAN match; see the
-                              # Helm charts' zitadel.jwksTls for the reference
+                              # Helm charts' oidc.jwksTls for the reference
                               # wiring). This dev/compose config keeps plaintext ONLY
                               # under the explicitly asserted trusted path (the
-                              # compose-internal hop to its bundled ZITADEL — the
-                              # charts call it zitadel.jwksPlaintextTrustedPath); on
+                              # compose-internal hop to its bundled provider — the
+                              # charts call it oidc.jwksPlaintextTrustedPath); on
                               # any other topology this configuration fails the spec.
                               uri: "http://auth.example.com/oauth/v2/keys"
-                              cluster: zitadel_jwks
+                              cluster: oidc_jwks
                               timeout: 5s
                             cache_duration: { seconds: 600 }
                           payload_in_metadata: verified
@@ -273,7 +277,7 @@ static_resources:
                             headers: [{ name: x-auth-required, string_match: { exact: "false" } }]
                           requires: { allow_missing: {} }
                         - match: { prefix: "/" }
-                          requires: { provider_name: zitadel }
+                          requires: { provider_name: oidc }
                   # Enrich from the verified subject (C2).
                   - name: envoy.filters.http.ext_proc
                     typed_config:
@@ -352,13 +356,13 @@ static_resources:
                   address:
                     socket_address: { address: otel-collector, port_value: 4317 }
 
-    # ZITADEL (the IdP) — for the JWKS fetch. Address = the in-cluster/host
+    # OIDC provider (the IdP) — for the JWKS fetch. Address = the in-cluster/host
     # endpoint Envoy can reach; the Host header above stays the issuer authority.
-    - name: zitadel_jwks
+    - name: oidc_jwks
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
-        cluster_name: zitadel_jwks
+        cluster_name: oidc_jwks
         endpoints:
           - lb_endpoints:
               - endpoint:
