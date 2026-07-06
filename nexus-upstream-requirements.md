@@ -1,7 +1,7 @@
 # Nexus upstream integration requirements
 
-Requirements that downstream consumers — **toolify** (infra/entry) and the **backend
-services** ("boxes") on the internal network — place on **nexus**, plus the header contract
+Requirements that downstream consumers — the **ingress/infra layer** (TLS/entry) and the
+**backend services** ("boxes") on the internal network — place on **nexus**, plus the header contract
 nexus publishes back to them. nexus is the authoritative core: routing, domain lifecycle,
 identity enrichment, and edge policy live here; boxes stay thin and trust the headers the
 edge injects. The contract is service-agnostic — any backend in any language is a box.
@@ -47,7 +47,7 @@ routers and the cert gate converge in seconds. Once `verified`, everything downs
 Product model (decided, unchanged): tenants declare each (sub)domain explicitly; the
 per-tenant domain count is plan-gated (the upsell lever).
 
-**toolify follow-up: ✅ done 2026-06-30** — `authz.py` + `Dockerfile.authz` + `pg_read_db`
+**Ingress-layer follow-up: ✅ done 2026-06-30** — `authz.py` + `Dockerfile.authz` + `pg_read_db`
 deleted; Caddy `on_demand_tls { ask }` → `http://tenant-router:9300/authorize`;
 tenant-router joined the `edge` network. Deploy order: `nexus-edge` then `entry`.
 
@@ -263,6 +263,6 @@ cost ceiling).
 | telemetry collection endpoint + stores + Grafana pivot (box telemetry contract)       | **nexus monitoring stack** (collector/Tempo/Prometheus/Loki)                 |
 | contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (any downstream service) **+ the nexus first-party planes** (Change B) |
 | authentication method (password/passkey/MFA/social/SSO)                               | **ZITADEL** (per-org login policy)                                           |
-| ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **toolify / infra**                                                          |
+| ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **ingress / infra layer**                                                    |
 | `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                    | **tenant**                                                                   |
 | resource ownership ("does this user own THIS order"), scope-header enforcement       | **backend boxes** (any downstream service)                                   |

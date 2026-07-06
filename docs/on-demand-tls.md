@@ -1,6 +1,6 @@
 # On-demand TLS for tenant custom domains — edge spec (#3)
 
-How the TLS-terminating edge (Caddy today, in the `toolify` infra layer) must be
+How the TLS-terminating edge (Caddy today, in the ingress/infra layer) must be
 configured to issue certificates for **unbounded, self-service tenant custom
 domains** — gated by nexus's authorization predicate and backed by a **shared**
 certificate store so every balancer can serve every domain.
