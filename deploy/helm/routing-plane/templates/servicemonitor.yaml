@@ -2,25 +2,11 @@
 {{- $fullName := include "routing-plane.fullname" . -}}
 {{- $labels := .Values.metrics.serviceMonitor.labels -}}
 {{- $interval := .Values.metrics.serviceMonitor.interval -}}
-# Control-plane metrics are on the dedicated ops port (:9401 /metrics), kept OFF
-# the broker-only admin port (:9400) so a scrape peer can't reach the admin API.
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: {{ $fullName }}-control-plane
-  labels:
-    {{- include "routing-plane.labels" . | nindent 4 }}
-    {{- with $labels }}{{- toYaml . | nindent 4 }}{{- end }}
-spec:
-  selector:
-    matchLabels:
-      {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
-  endpoints:
-    - { port: ops, path: /metrics, interval: {{ $interval | quote }} }
----
-# The tenant-router latency histogram + cache/ready gauges are on a pod port
-# (:9302) deliberately kept off the edge Service, so they are scraped as pod
-# targets. Envoy admin (:9901) carries the proxy-level stats.
+# first-party-telemetry (Change B): the routing-plane Rust services (tenant-router,
+# control-plane) NO LONGER expose scrape endpoints — they PUSH OTLP metrics to the
+# collector (one endpoint env; see deploy/README.md "Telemetry"). Their ServiceMonitor
+# / PodMonitor scrape targets were retired. Only Envoy's own admin stats (:9901),
+# which are not part of the box telemetry contract, remain scrape-based.
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -33,6 +19,5 @@ spec:
     matchLabels:
       {{- include "routing-plane.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
   podMetricsEndpoints:
-    - { port: metrics, path: /metrics, interval: {{ $interval | quote }} }
     - { port: admin, path: /stats/prometheus, interval: {{ $interval | quote }} }
 {{- end }}

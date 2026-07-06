@@ -19,6 +19,7 @@ pub mod geo;
 pub mod normalize;
 pub mod plan;
 pub mod store;
+pub mod telemetry;
 pub mod verify;
 
 pub use auth::{AuthPolicy, PathRule, RouteAuth};

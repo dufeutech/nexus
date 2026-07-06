@@ -9,6 +9,7 @@ pub mod projection;
 pub mod reconcile;
 pub mod store;
 pub mod sync;
+pub mod telemetry;
 
 pub use membership::{
     Membership, MemberType, MembershipResolver, ResolvedMembership, SourceMembershipReader,

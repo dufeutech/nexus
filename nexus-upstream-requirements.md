@@ -214,6 +214,17 @@ auto-instrumentation and set `OTEL_EXPORTER_OTLP_ENDPOINT=<collector>`. Verified
 log correlation, hygiene detectability, sampling independence, and fail-open all pass
 with no custom telemetry code.
 
+**First-party services are compliant boxes too (Change B — `first-party-telemetry`,
+2026-07-05).** The nexus Rust planes — tenant-router, control-plane, identity sidecar,
+sync-worker, reconciler, membership-sync — now emit all three signals through the same
+one endpoint: they continue the edge-rooted trace on the ext_proc hot path (the routing
+and enrichment spans sit inside the edge trace, no first-party hole), stamp `trace_id`
+on their logs, and push RED + operational metrics to the collector (their Prometheus
+scrape endpoints retired; metric names unchanged). The single knob is the same
+`OTEL_EXPORTER_OTLP_ENDPOINT` (unset ⇒ telemetry off, fail-open). This makes the
+first-party RED baseline contract-shaped, which is the prerequisite for the policy layer
+(Change C: SLO targets, burn-rate alerts, keep policy) to build on.
+
 ---
 
 ## Ownership
@@ -228,7 +239,7 @@ with no custom telemetry code.
 | contract-stamp enforcement (`x-identity-contract` version check)                      | **backend boxes** (jsbox/runlet, …)                                          |
 | trace rooting + `traceparent` injection (N6)                                          | **nexus edge (Envoy)** + monitoring collector                                |
 | telemetry collection endpoint + stores + Grafana pivot (box telemetry contract)       | **nexus monitoring stack** (collector/Tempo/Prometheus/Loki)                 |
-| contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (jsbox/runlet, any future service)                         |
+| contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (jsbox/runlet, any future service) **+ the nexus first-party planes** (Change B) |
 | authentication method (password/passkey/MFA/social/SSO)                               | **ZITADEL** (per-org login policy)                                           |
 | ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **toolify / infra**                                                          |
 | `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                    | **tenant**                                                                   |

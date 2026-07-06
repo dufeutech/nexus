@@ -217,10 +217,15 @@ must emit — is the "Box telemetry contract" section of
   images (`LOKI_VERSION`, `PROMETHEUS_VERSION` in `.env`) because native OTLP
   ingestion is version-gated in both stores. Bump pins deliberately and re-run
   the telemetry smoke checks.
-- **First-party services still scrape** (Prometheus jobs in
-  `monitoring/prometheus/prometheus.yml`) — deliberately untouched. Both
-  metrics paths coexist until the first-party services join the contract
-  (Change B in the `box-telemetry-contract` roadmap).
+- **First-party services now push, not scrape (Change B — `first-party-telemetry`,
+  shipped):** the six Rust services (tenant-router, control-plane, identity sidecar,
+  sync-worker, reconciler, membership-sync) emit RED + operational metrics through
+  the OTel meter to the collector — the same push path as any box. Their Prometheus
+  scrape jobs and ServiceMonitors were retired; only Envoy's own admin stats
+  (`:9901`) remain scrape-based (Envoy is outside the box telemetry contract). Metric
+  **names are unchanged** (OTel counters drop the `_total` suffix that Prometheus's
+  OTLP receiver re-appends), so existing dashboard queries keep working. First-party
+  spans also join the edge-rooted trace and their logs carry the trace id.
 - **Bring-up order is flexible and everything is fail-open:** a down collector
   or store never affects request handling; boxes buffer/drop telemetry and
   resume on their own when the collector returns. Producers deliberately do

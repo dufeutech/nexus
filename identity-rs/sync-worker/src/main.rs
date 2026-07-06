@@ -13,6 +13,7 @@ use std::env::var;
 use std::error::Error;
 use std::fs;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(not(unix))]
 use std::future::pending;
@@ -25,8 +26,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::timeout::TimeoutLayer;
 use hmac::{Hmac, Mac};
-use metrics::{counter, gauge};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use reqwest::header::HOST;
 use reqwest::redirect::Policy;
 use serde_json::{json, Value};
@@ -35,10 +34,35 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use opentelemetry::metrics::{Counter, Gauge};
+use opentelemetry::{global, KeyValue};
 
+use identity_core::telemetry;
 use identity_core::store::ProfileStore;
 use identity_core::sync::{apply, classify, Apply, Classify};
 use store_postgres::PgProfileStore;
+
+// --------------------------------------------------------------------------- //
+// Metrics (first-party-telemetry): the webhook counters + last-event gauge,
+// emitted through the OTel meter (push path via identity_core::telemetry). The
+// counter names DROP the Prometheus `_total` suffix — Prometheus's OTLP receiver
+// re-appends it, so the stored series keep their names (sync_events_total,
+// sync_signature_failures_total). The gauge keeps its full name unchanged.
+// --------------------------------------------------------------------------- //
+struct Metrics {
+    signature_failures: Counter<u64>,
+    events: Counter<u64>,
+    last_event: Gauge<f64>,
+}
+
+static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
+    let meter = global::meter("sync-worker");
+    Metrics {
+        signature_failures: meter.u64_counter("sync_signature_failures").build(),
+        events: meter.u64_counter("sync_events").build(),
+        last_event: meter.f64_gauge("sync_last_event_timestamp_seconds").build(),
+    }
+});
 
 /// Total per-request timeout for the HTTP surface (http-request-resilience):
 /// operator-tunable via `HTTP_REQUEST_TIMEOUT_SECS` with a finite 30s default —
@@ -75,7 +99,6 @@ const MAX_SIG_AGE_SECS: f64 = 300.0;
 struct App {
     store: Arc<dyn ProfileStore>,
     signing_key: Arc<String>,
-    metrics: PrometheusHandle,
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -125,9 +148,12 @@ fn verify_signature(headers: &HeaderMap, body: &[u8], signing_key: &str) -> bool
 }
 
 // --------------------------------------------------------------------------- //
+// first-party-telemetry: root a trace per webhook delivery so its processing logs
+// correlate. skip_all keeps the raw body/headers out of telemetry (hygiene).
+#[tracing::instrument(skip_all, name = "sync.webhook", fields(otel.kind = "server"))]
 async fn webhook(State(s): State<App>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     if !verify_signature(&headers, &body, &s.signing_key) {
-        counter!("sync_signature_failures_total").increment(1);
+        METRICS.signature_failures.add(1, &[]);
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
     }
     let event: Value = match serde_json::from_slice(&body) {
@@ -168,14 +194,10 @@ async fn webhook(State(s): State<App>, headers: HeaderMap, body: Bytes) -> impl 
         },
     };
 
-    counter!("sync_events_total", "result" => result).increment(1);
-    gauge!("sync_last_event_timestamp_seconds").set(now_secs());
+    METRICS.events.add(1, &[KeyValue::new("result", result.to_owned())]);
+    METRICS.last_event.record(now_secs(), &[]);
     info!(event_type = ?event.get("event_type").and_then(|v| v.as_str()).unwrap_or(""), result, "handled");
     (status, axum::Json(json!({ "result": result }))).into_response()
-}
-
-async fn metrics_handler(State(s): State<App>) -> impl IntoResponse {
-    s.metrics.render()
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -240,21 +262,14 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let level = env("LOG_LEVEL", "info");
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    if env("LOG_FORMAT", "") == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    init_tracing();
-    let handle = PrometheusBuilder::new().install_recorder()?;
+    // Shared telemetry (first-party-telemetry): honors RUST_LOG/LOG_LEVEL/LOG_FORMAT
+    // as before, plus OTLP export when the endpoint env is set. Background work
+    // (webhook processing) roots its own traces; held for the process lifetime.
+    let _telemetry = telemetry::init("sync-worker");
+    // Metrics now push via the OTel meter (first-party-telemetry); the old
+    // Prometheus /metrics scrape endpoint is retired in favor of the OTLP push path.
 
     let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
     let internal_url = env("ZITADEL_INTERNAL_URL", "http://zitadel:8080");
@@ -288,18 +303,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     info!("webhook registered; signing key acquired; store ready");
 
-    let app = App { store, signing_key: Arc::new(signing_key), metrics: handle };
+    let app = App { store, signing_key: Arc::new(signing_key) };
     let router = resilient(
         Router::new()
             .route("/webhook", post(webhook))
-            .route("/metrics", get(metrics_handler))
             .route("/healthz", get(healthz)),
         request_timeout(),
     )
     .with_state(app);
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    info!("listening on :8080 (/webhook, /metrics, /healthz)");
+    info!("listening on :8080 (/webhook, /healthz)");
     if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await

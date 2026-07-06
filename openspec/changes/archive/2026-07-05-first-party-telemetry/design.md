@@ -71,60 +71,84 @@ Dependency direction stays inward-only: binaries → core telemetry module → O
 SDK/exporter (the adapter boundary). No service knows a store; hot-path code gains
 one `traceparent` read + span around the existing `handle()` stage, nothing else.
 
-ext_proc continuation detail: both hot paths receive the same edge-injected
-`traceparent`, so their spans become **siblings under the edge span**, ordered by
-time — acceptable and honest (Envoy doesn't re-inject between ext_proc filters);
-verified at apply.
+ext_proc continuation detail (**corrected at apply, verified in the lab**): the edge
+injects `traceparent` into the request headers toward the **backend**, which is
+*after* the ext_proc filters run — so the tenant-router / sidecar do NOT see it in
+the ext_proc `RequestHeaders` payload. Envoy does, however, trace the ext_proc gRPC
+call itself (the `async ExternalProcessor.Process egress` span) and propagates that
+context as **gRPC call metadata**. So the correct continuation source is the tonic
+`Request` metadata (one ext_proc stream per HTTP request ⇒ per-request context), not
+the HTTP header payload. The router/sidecar spans then parent under the edge's
+ext_proc egress span — closing the hole. (First implementation read the payload and
+produced separate root traces; the metadata read fixes it.)
 
 ## Decisions
 
-<!-- Critical concerns from the proposal; final call is /opsx:decide. Each carries
-     a research-grounded recommendation so the gate is fast. -->
+<!-- Resolved via /opsx:decide 2026-07-05; options researched against current
+     (July 2026) crate state. opentelemetry-rust is pre-1.0 (SDK 0.30, appender
+     0.31) but the traces/logs specs are stable and the metrics-SDK graduated to
+     stable at 0.30 — the churn is contained by the adapter boundary below. -->
 
-### Decision: Rust trace-context propagation + span SDK — PENDING /opsx:decide
+### Decision: Rust trace-context propagation + span SDK — Adopt opentelemetry-rust + tracing-opentelemetry
 
-- **Recommendation (Adopt):** the OpenTelemetry Rust stack (`opentelemetry`,
-  `opentelemetry_sdk`, OTLP exporter) with the `tracing-opentelemetry` bridge, so
-  spans are authored with the `tracing` macros the codebase already uses and W3C
-  context extraction/propagation is library code, never hand-rolled.
-- **Considered:** raw OTel API without the bridge (loses the existing `tracing`
-  idiom and the free log correlation); hand-parsing `traceparent` (correctness
-  defect by policy).
+- **Status**: approved
+- **Why**: W3C context extraction/propagation and span lifecycle are library code,
+  never hand-rolled (hand-parsing `traceparent` is a correctness defect by policy);
+  the `tracing-opentelemetry` bridge lets spans be authored with the `tracing`
+  macros the codebase already uses everywhere.
+- **Considered**: raw OTel tracing API without the bridge (loses the existing
+  `tracing` idiom and the free log correlation for no gain); hand-parsed W3C
+  context (rejected — correctness-critical build).
+- **Isolation**: `opentelemetry` + `opentelemetry_sdk` + `opentelemetry-otlp` and
+  all OTel types live only inside `router-core::telemetry` / `identity_core::telemetry`;
+  a pre-1.0 version bump is a two-file change.
 
-### Decision: log↔trace correlation bridge — PENDING /opsx:decide
+### Decision: log↔trace correlation bridge — Adopt opentelemetry-appender-tracing
 
-- **Recommendation (Adopt):** the OTel log appender for `tracing`
-  (`opentelemetry-appender-tracing`): events flow to the contract's OTLP logs
-  pipeline with active trace/span ids attached from context; the existing stdout
-  fmt layer stays for container-local debugging. No custom JSON schema invented.
-- **Considered:** stamping trace_id into the stdout JSON and scraping it (bypasses
-  the contract's push path — rejected by the shipped design); custom fmt layer
-  (build where adopt exists).
+- **Status**: approved
+- **Why**: the appender routes `tracing` events into the contract's OTLP logs
+  pipeline with the active trace/span ids attached from context (v0.31 attaches
+  TraceId/SpanId/TraceFlags automatically) — no custom JSON schema invented; the
+  existing stdout fmt layer stays for `docker logs` debugging.
+- **Considered**: stamping trace_id into stdout JSON and scraping it (bypasses the
+  contract's push path — rejected by the shipped `box-telemetry-contract` design);
+  a custom fmt correlation layer (build where adopt exists).
+- **Isolation**: a subscriber layer assembled inside the core telemetry module,
+  behind the same adapter boundary as the tracer.
 
-### Decision: metrics emission path — PENDING /opsx:decide
+### Decision: metrics emission path — Adopt OTel meter, migrate call sites (no metrics-facade bridge)
 
-- **Recommendation (Adopt + migrate call sites):** move the ~20 instrument call
-  sites from the `metrics` facade to the OTel meter API in the core crates,
-  keeping **the exact metric names** (`router_ext_proc_duration_seconds`,
+- **Status**: approved
+- **Why**: moving the ~20 instrument call sites from the `metrics` facade to the
+  OTel meter API keeps the whole telemetry surface on ONE pinned opentelemetry-rust
+  version, rather than adding a second, less-maintained dependency on the metrics
+  path. Exact metric names are preserved (`router_ext_proc_duration_seconds`,
   `sidecar_ext_proc_duration_seconds`, counters/gauges) so dashboard queries
-  survive; the sidecar's exponential native histogram maps to OTel exponential
-  histograms (Prometheus's OTLP receiver converts them to native histograms — the
-  `native-histograms` feature is already on). Scrape exposition runs in parallel
-  until parity is verified, then retires.
-- **Considered:** a `metrics`-facade→OTel recorder bridge (immature ecosystem —
-  re-check at decide time; would win if mature since it's zero call-site churn);
-  keeping scrape permanently for first-party (leaves the two-worlds split the
-  contract set out to end); collector-side prometheus scraping (receiver is not in
-  the core collector distribution; violates the push-generic story).
+  survive; the sidecar's exponential histogram maps losslessly to an OTel
+  exponential histogram, which Prometheus's OTLP receiver converts to a native
+  histogram (feature already on). Scrape exposition runs in parallel until parity
+  is verified, then retires.
+- **Considered**: the `metrics`→OTel recorder bridge `metrics-exporter-opentelemetry`
+  (near-zero call-site churn, but ~12k downloads / single maintainer / competes
+  with two other half-baked crates — a fragile second version-coupling point on
+  the metrics path); keeping scrape permanently for first-party (leaves the
+  two-worlds split the contract set out to end); collector-side Prometheus scraping
+  (receiver not in the core collector distribution; violates the push-generic story).
+- **Isolation**: instruments are created and held by the core telemetry module's
+  meter; call sites reference them, no OTel meter types leak into business logic.
 
-### Decision: hot-path export isolation — PENDING /opsx:decide
+### Decision: hot-path export isolation — Adopt SDK batch processors (config-level)
 
-- **Recommendation (Adopt, config-level):** batch span/log processors with bounded
-  queues and short export timeouts (drop-on-full, never block), providers built as
-  no-ops when the endpoint env is unset, init failures log-and-continue. This is
-  exporter configuration of the adopted SDK, not custom machinery.
-- **Considered:** synchronous/simple exporters (block the hot path — rejected);
-  custom buffering layer (build where the SDK already provides it).
+- **Status**: approved
+- **Why**: batch span/log processors with bounded queues, short export timeouts,
+  and drop-on-full are exporter *configuration* of the adopted SDK — not custom
+  machinery — and give the fail-open, never-block guarantee the ext_proc path
+  requires; providers build as no-ops when the endpoint env is unset, and init
+  failures log-and-continue.
+- **Considered**: synchronous/simple exporters (block the hot path — rejected); a
+  hand-written buffering layer (build where the SDK already provides it).
+- **Isolation**: processor/exporter construction is confined to the core telemetry
+  module's `init`; the hot path only opens spans and records instruments.
 
 ## Risks / Trade-offs
 
@@ -163,8 +187,10 @@ verified at apply.
 
 ## Open Questions
 
-- Does the `metrics`-facade→OTel bridge ecosystem clear the maturity bar at decide
-  time? (If yes, Phase B becomes a recorder swap instead of call-site migration.)
+- ~~Does the `metrics`-facade→OTel bridge clear the maturity bar?~~ **Resolved
+  (/opsx:decide 2026-07-05):** no — the bridge is a single-maintainer ~12k-download
+  crate; Phase B is a call-site migration to the OTel meter, keeping the whole
+  surface on one pinned OTel version.
 - Are the two hot-path spans as siblings under the edge span acceptable to
   operators, or is nesting (router → sidecar) worth synthesizing? (Lean siblings —
   it reflects reality.)

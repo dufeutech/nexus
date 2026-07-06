@@ -53,7 +53,7 @@ impl RouteAuth {
     /// surface rejects that combination, but a hand-edited row must not open
     /// an authorization-gated route to anonymous callers).
     #[must_use]
-    pub fn normalized(mut self) -> Self {
+    pub const fn normalized(mut self) -> Self {
         if self.has_requirements() {
             self.required = true;
         }

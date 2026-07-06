@@ -23,15 +23,19 @@ use std::error::Error;
 use std::future::pending;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
-use metrics::{counter, gauge};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Gauge};
 use sqlx::postgres::PgListener;
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn};
+// first-party-telemetry: each background pass / signal roots its own trace.
+use tracing::Instrument as _;
 
+use identity_core::telemetry;
 use identity_core::projection::{backstop_pass, sync_subject};
 use identity_core::store::{BoxError, ProfileStore};
 use identity_core::SourceMembershipReader;
@@ -51,16 +55,43 @@ fn env_num<T: FromStr>(key: &str, default: T) -> T {
     var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+// --------------------------------------------------------------------------- //
+// Metrics (first-party-telemetry): emitted through the OTel meter (push path via
+// identity_core::telemetry). Counter names DROP the Prometheus `_total` suffix —
+// Prometheus's OTLP receiver re-appends it, so the stored series keep their names
+// (membership_sync_subject_syncs_total, …) and dashboards keep working. The gauge
+// keeps its exact name.
+// --------------------------------------------------------------------------- //
+struct Metrics {
+    subject_syncs: Counter<u64>,
+    backstop_passes: Counter<u64>,
+    signals: Counter<u64>,
+    errors: Counter<u64>,
+    last_backstop_subjects: Gauge<u64>,
+}
+
+static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
+    let meter = global::meter("membership-sync");
+    Metrics {
+        subject_syncs: meter.u64_counter("membership_sync_subject_syncs").build(),
+        backstop_passes: meter.u64_counter("membership_sync_backstop_passes").build(),
+        signals: meter.u64_counter("membership_sync_signals").build(),
+        errors: meter.u64_counter("membership_sync_errors").build(),
+        last_backstop_subjects: meter.u64_gauge("membership_sync_last_backstop_subjects").build(),
+    }
+});
+
 /// Run one backstop pass (the convergence logic lives in `identity_core`) and emit
 /// metrics/logs around it.
+#[tracing::instrument(skip_all, name = "membership.backstop", fields(otel.kind = "internal"))]
 async fn run_backstop(
     reader: &dyn SourceMembershipReader,
     store: &dyn ProfileStore,
 ) -> Result<(), BoxError> {
     let stats = backstop_pass(reader, store).await?;
-    counter!("membership_sync_subject_syncs_total").increment(stats.written as u64);
-    counter!("membership_sync_backstop_passes_total").increment(1);
-    gauge!("membership_sync_last_backstop_subjects").set(stats.subjects as f64);
+    METRICS.subject_syncs.add(stats.written as u64, &[]);
+    METRICS.backstop_passes.add(1, &[]);
+    METRICS.last_backstop_subjects.record(stats.subjects as u64, &[]);
     info!(subjects = stats.subjects, written = stats.written, "backstop pass");
     Ok(())
 }
@@ -75,37 +106,30 @@ async fn listen_once(
     loop {
         let notification = listener.recv().await?;
         let sub = notification.payload().to_owned();
-        counter!("membership_sync_signals_total").increment(1);
-        match sync_subject(reader, store, &sub).await {
-            Ok(true) => counter!("membership_sync_subject_syncs_total").increment(1),
+        METRICS.signals.add(1, &[]);
+        // Root a trace per signal so its sync logs correlate (sub omitted from the
+        // span — a user id stays out of telemetry attributes per the hygiene rule).
+        let span = info_span!("membership.signal", otel.kind = "internal");
+        match sync_subject(reader, store, &sub).instrument(span).await {
+            Ok(true) => METRICS.subject_syncs.add(1, &[]),
             Ok(false) => {}
             Err(e) => {
-                counter!("membership_sync_errors_total").increment(1);
+                METRICS.errors.add(1, &[]);
                 warn!(error = %e, %sub, "signal subject sync failed; backstop will heal");
             }
         }
     }
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let level = env("LOG_LEVEL", "info");
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    if env("LOG_FORMAT", "") == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    init_tracing();
-    let metrics_port: u16 = env_num("METRICS_PORT", 9000_u16);
-    PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], metrics_port))
-        .install()?;
-    info!(port = metrics_port, "metrics listener up");
+    // Shared telemetry (first-party-telemetry): honors RUST_LOG/LOG_LEVEL/LOG_FORMAT
+    // as before, plus OTLP export when the endpoint env is set. Each backstop/signal
+    // pass roots its own trace; held for the process lifetime.
+    let _telemetry = telemetry::init("membership-sync");
+    // Metrics now push via the OTel meter (first-party-telemetry); the old
+    // Prometheus exporter listener is retired — the collector's metrics pipeline
+    // forwards to the store, no per-box scrape job.
 
     let profile_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
     // Read-only routing connection (least privilege: SELECT on routing.memberships +
@@ -140,7 +164,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Backfill/heal immediately on startup, before we depend on live signals.
     if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
-        counter!("membership_sync_errors_total").increment(1);
+        METRICS.errors.add(1, &[]);
         error!(error = %e, "initial backstop pass failed");
     }
 
@@ -160,7 +184,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 tokio::select! {
                     () = sleep(backstop_interval) => {
                         if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
-                            counter!("membership_sync_errors_total").increment(1);
+                            METRICS.errors.add(1, &[]);
                             error!(error = %e, "backstop pass failed");
                         }
                     }
@@ -177,7 +201,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             _ = rx.changed() => break,
             result = run_listener(&routing_url, reader.as_ref(), store.as_ref()) => {
                 if let Err(e) = result {
-                    counter!("membership_sync_errors_total").increment(1);
+                    METRICS.errors.add(1, &[]);
                     warn!(error = %e, "listener dropped; reconnecting");
                 }
                 // Brief backoff before reconnecting so a hard failure doesn't spin.

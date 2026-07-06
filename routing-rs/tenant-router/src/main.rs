@@ -25,23 +25,29 @@ use std::env::var;
 use std::error::Error;
 #[cfg(not(unix))]
 use std::future::pending;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use moka::future::Cache;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataMap;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn};
+// first-party-telemetry: continue the edge-rooted trace on the hot path. The OTel
+// machinery lives behind `router_core::telemetry`; here we only touch `tracing`.
+use tracing::field::Empty;
+use tracing::Instrument as _;
+use tracing::Span;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use opentelemetry::{global, KeyValue};
 
 use envoy_types::pb::envoy::config::core::v3::{
     header_value_option::HeaderAppendAction, HeaderValue, HeaderValueOption,
@@ -53,6 +59,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
 };
 use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 
+use router_core::telemetry;
 use router_core::auth::RouteAuth;
 use router_core::cache::SharedCache;
 use router_core::context::ClientContext;
@@ -62,6 +69,52 @@ use router_core::normalize::{normalize_host, parent_domain};
 use router_core::store::{BoxError, Invalidations, RoutingStore};
 use cache_redis::RedisCache;
 use store_postgres::{PgInvalidations, PgRoutingStore};
+
+// --------------------------------------------------------------------------- //
+// Metrics (first-party-telemetry): the RED baseline + operational gauges, emitted
+// through the OTel meter (push path via router_core::telemetry). Counter names DROP
+// the Prometheus `_total` suffix — Prometheus's OTLP receiver re-appends it, so the
+// stored series keep their names (router_ext_proc_requests_total, …) and dashboards
+// keep working. The duration histogram carries the same explicit buckets as before,
+// so `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))` is unchanged.
+// --------------------------------------------------------------------------- //
+struct Metrics {
+    ext_proc_duration: Histogram<f64>,
+    ext_proc_requests: Counter<u64>,
+    cache_hits: Counter<u64>,
+    cache_misses: Counter<u64>,
+    invalidations: Counter<u64>,
+    authorize: Counter<u64>,
+    cache_entries: Gauge<u64>,
+    ready: Gauge<u64>,
+    last_invalidation: Gauge<f64>,
+    time_to_warm: Gauge<f64>,
+}
+
+static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
+    let meter = global::meter("tenant-router");
+    Metrics {
+        ext_proc_duration: meter
+            .f64_histogram("router_ext_proc_duration_seconds")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+                0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ])
+            .build(),
+        ext_proc_requests: meter.u64_counter("router_ext_proc_requests").build(),
+        cache_hits: meter.u64_counter("router_cache_hits").build(),
+        cache_misses: meter.u64_counter("router_cache_misses").build(),
+        invalidations: meter.u64_counter("router_invalidations").build(),
+        authorize: meter.u64_counter("router_authorize").build(),
+        cache_entries: meter.u64_gauge("router_cache_entries").build(),
+        ready: meter.u64_gauge("router_ready").build(),
+        last_invalidation: meter
+            .f64_gauge("router_last_invalidation_timestamp_seconds")
+            .build(),
+        time_to_warm: meter.f64_gauge("router_time_to_warm_seconds").build(),
+    }
+});
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -96,10 +149,10 @@ impl AppState {
             return None;
         }
         if let Some(d) = self.l1.get(&key).await {
-            counter!("router_cache_hits_total", "tier" => "l1").increment(1);
+            METRICS.cache_hits.add(1, &[KeyValue::new("tier", "l1")]);
             return Some(d);
         }
-        counter!("router_cache_misses_total", "tier" => "l1").increment(1);
+        METRICS.cache_misses.add(1, &[KeyValue::new("tier", "l1")]);
 
         let store = self.store.clone();
         let l2 = self.l2.clone();
@@ -111,11 +164,11 @@ impl AppState {
                 if let Some(l2) = &l2 {
                     match l2.get(&key2).await {
                         Ok(Some(d)) => {
-                            counter!("router_cache_hits_total", "tier" => "l2").increment(1);
+                            METRICS.cache_hits.add(1, &[KeyValue::new("tier", "l2")]);
                             return Ok(Arc::new(d));
                         }
                         Ok(None) => {
-                            counter!("router_cache_misses_total", "tier" => "l2").increment(1);
+                            METRICS.cache_misses.add(1, &[KeyValue::new("tier", "l2")]);
                         }
                         Err(e) => warn!(error = %e, "L2 get failed; falling through to store"),
                     }
@@ -175,6 +228,29 @@ impl AppState {
 // Host extraction from the request headers (the routing key). Prefer the HTTP/2
 // `:authority` pseudo-header, fall back to `Host`.
 // --------------------------------------------------------------------------- //
+// --------------------------------------------------------------------------- //
+// Trace-context continuation (first-party-telemetry). The edge injects a W3C
+// `traceparent` (edge-rooted, carrying its head-sampling flag) into the request
+// headers that arrive here. Extract it so the router's processing span parents
+// under the edge trace — closing the first-party hole between edge and backend.
+// Only the two W3C headers are read (cheap); the sampled flag is honored by the
+// ParentBased sampler, so a not-sampled request produces no exported span.
+// --------------------------------------------------------------------------- //
+// The edge propagates each request's trace context as gRPC METADATA on the ext_proc
+// call (it traces the call itself as an egress span). The ext_proc HTTP headers do
+// NOT carry `traceparent` at this point — the edge injects that toward the backend
+// AFTER the ext_proc filters run — so the gRPC metadata is the correct source. One
+// ext_proc gRPC stream per HTTP request, so this metadata is this request's context.
+fn trace_metadata(metadata: &MetadataMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for name in ["traceparent", "tracestate"] {
+        if let Some(value) = metadata.get(name).and_then(|value| value.to_str().ok()) {
+            out.push((name.to_owned(), value.to_owned()));
+        }
+    }
+    out
+}
+
 fn extract_host(req: &ProcessingRequest) -> Option<String> {
     let headers = match &req.request {
         Some(processing_request::Request::RequestHeaders(h)) => h.headers.as_ref()?,
@@ -452,13 +528,27 @@ struct Router {
 }
 
 impl Router {
-    async fn handle(&self, req: ProcessingRequest) -> Option<ProcessingResponse> {
+    async fn handle(
+        &self,
+        req: ProcessingRequest,
+        trace_meta: &[(String, String)],
+    ) -> Option<ProcessingResponse> {
         if !matches!(
             req.request,
             Some(processing_request::Request::RequestHeaders(_))
         ) {
             return None;
         }
+        // Continue the edge trace: this span parents under the edge-rooted context
+        // (or, absent one, roots per the sampler). `result` is recorded on it after
+        // resolution for the trace view; the `info!` events inside are trace-stamped
+        // by the log appender, giving the two-way logs↔traces pivot.
+        let span = info_span!("router.resolve", route.result = Empty, otel.kind = "server");
+        telemetry::continue_trace(&span, trace_meta.to_vec());
+        self.resolve(req).instrument(span).await
+    }
+
+    async fn resolve(&self, req: ProcessingRequest) -> Option<ProcessingResponse> {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             let host = extract_host(&req).unwrap_or_default();
@@ -498,8 +588,9 @@ impl Router {
             warn!("not ready -> 503");
             (warming_503(), "not_ready")
         };
-        histogram!("router_ext_proc_duration_seconds").record(started.elapsed().as_secs_f64());
-        counter!("router_ext_proc_requests_total", "result" => result).increment(1);
+        METRICS.ext_proc_duration.record(started.elapsed().as_secs_f64(), &[]);
+        METRICS.ext_proc_requests.add(1, &[KeyValue::new("result", result.to_owned())]);
+        Span::current().record("route.result", result);
         Some(resp)
     }
 }
@@ -515,6 +606,9 @@ impl ExternalProcessor for Router {
         &self,
         request: Request<Streaming<ProcessingRequest>>,
     ) -> Result<Response<Self::ProcessStream>, Status> {
+        // Capture the edge's trace context from the ext_proc gRPC metadata before
+        // consuming the stream; it parents every span for this request.
+        let trace_meta = trace_metadata(request.metadata());
         let mut inbound = request.into_inner();
         let me = self.clone();
         let (tx, rx) = mpsc::channel(8);
@@ -522,7 +616,7 @@ impl ExternalProcessor for Router {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(req) => {
-                        if let Some(resp) = me.handle(req).await
+                        if let Some(resp) = me.handle(req, &trace_meta).await
                             && tx.send(Ok(resp)).await.is_err()
                         {
                             break;
@@ -573,7 +667,7 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
         {
             warn!(error = %e, "L2 invalidate failed");
         }
-        counter!("router_invalidations_total").increment(1);
+        METRICS.invalidations.add(1, &[]);
         state.last_apply_ms.store(now_ms(), Ordering::Relaxed);
         info!(domain = %domain, "invalidated");
     }
@@ -584,7 +678,7 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
 // localhost API: resolve debug (admin), health, metrics.
 // --------------------------------------------------------------------------- //
 mod api {
-    use super::{counter, AppState, Ordering};
+    use super::{AppState, KeyValue, Ordering, METRICS};
     use std::env::var;
     use std::time::Duration;
     use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -650,14 +744,14 @@ mod api {
         // Fail closed until the plane is ready: deny rather than authorize a cert
         // for a host we cannot yet evaluate.
         if domain.is_empty() || !s.ready.load(Ordering::Relaxed) {
-            counter!("router_authorize_total", "result" => "deny").increment(1);
+            METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
             return StatusCode::FORBIDDEN;
         }
         if s.resolve(&domain).await.is_some() {
-            counter!("router_authorize_total", "result" => "allow").increment(1);
+            METRICS.authorize.add(1, &[KeyValue::new("result", "allow")]);
             StatusCode::OK
         } else {
-            counter!("router_authorize_total", "result" => "deny").increment(1);
+            METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
             StatusCode::FORBIDDEN
         }
     }
@@ -690,16 +784,6 @@ fn env(key: &str, default: &str) -> String {
     var(key).unwrap_or_else(|_| default.to_owned())
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if env("LOG_FORMAT", "") == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-}
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = signal::ctrl_c().await;
@@ -723,24 +807,13 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    init_tracing();
-
-    // Classic-bucket latency histogram on the exporter's own listener (:9302),
-    // aggregatable across instances: histogram_quantile(0.99, sum by (le)(...)).
-    const LATENCY_BUCKETS: &[f64] = &[
-        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-        1.0, 2.5, 5.0,
-    ];
-    use metrics_exporter_prometheus::Matcher;
-    PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Full("router_ext_proc_duration_seconds".to_owned()),
-            LATENCY_BUCKETS,
-        )
-        .expect("set histogram buckets")
-        .with_http_listener("0.0.0.0:9302".parse::<SocketAddr>().unwrap())
-        .install()
-        .expect("install prometheus exporter");
+    // Shared telemetry (first-party-telemetry): stdout logs exactly as before, plus
+    // OTLP traces/logs/metrics when OTEL_EXPORTER_OTLP_ENDPOINT is set. Hold the
+    // guard for the process lifetime so it flushes on shutdown.
+    let _telemetry = telemetry::init("tenant-router");
+    // Metrics now push via the OTel meter (first-party-telemetry); the old
+    // Prometheus exporter listener (:9302) is retired — the collector's metrics
+    // pipeline forwards to the store, no per-box scrape job.
 
     let pg_url = env(
         "ROUTING_PG_URL",
@@ -811,14 +884,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let st = state.clone();
         tokio::spawn(async move {
             loop {
-                gauge!("router_cache_entries").set(st.l1.entry_count() as f64);
-                gauge!("router_ready")
-                    .set(if st.ready.load(Ordering::Relaxed) { 1.0 } else { 0.0 });
-                gauge!("router_last_invalidation_timestamp_seconds")
-                    .set(st.last_apply_ms.load(Ordering::Relaxed) as f64 / 1000.0);
+                METRICS.cache_entries.record(st.l1.entry_count(), &[]);
+                METRICS.ready.record(u64::from(st.ready.load(Ordering::Relaxed)), &[]);
+                METRICS.last_invalidation.record(st.last_apply_ms.load(Ordering::Relaxed) as f64 / 1000.0, &[]);
                 let wm = st.warm_ms.load(Ordering::Relaxed);
                 if wm > 0 {
-                    gauge!("router_time_to_warm_seconds").set(wm as f64 / 1000.0);
+                    METRICS.time_to_warm.record(wm as f64 / 1000.0, &[]);
                 }
                 sleep(Duration::from_secs(5)).await;
             }

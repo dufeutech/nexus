@@ -22,20 +22,24 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(not(unix))]
 use std::future::pending;
 
-use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::header::HOST;
 use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use tokio::signal;
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn};
+// first-party-telemetry: each background pass roots its own trace (no edge context).
+use tracing::Instrument as _;
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 
+use identity_core::telemetry;
 use identity_core::reconcile::{differs, reconciled_profile};
 use identity_core::store::{BoxError, ProfileStore};
 use identity_core::Profile;
@@ -50,6 +54,44 @@ fn env_num<T: FromStr>(key: &str, default: T) -> T {
 fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
+
+// --------------------------------------------------------------------------- //
+// Metrics (first-party-telemetry): the per-pass operational gauges + counters +
+// duration histogram, emitted through the OTel meter (push path via
+// identity_core::telemetry). Counter names DROP the Prometheus `_total` suffix —
+// Prometheus's OTLP receiver re-appends it, so the stored series keep their names
+// (reconcile_passes_total, …). Gauges and the histogram keep their exact names.
+// --------------------------------------------------------------------------- //
+struct Metrics {
+    scanned: Gauge<u64>,
+    last_drift_upserts: Gauge<u64>,
+    last_orphan_deletes: Gauge<u64>,
+    last_pass_timestamp: Gauge<f64>,
+    passes: Counter<u64>,
+    pass_errors: Counter<u64>,
+    pass_duration: Histogram<f64>,
+}
+
+static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
+    let meter = global::meter("reconciler");
+    Metrics {
+        scanned: meter.u64_gauge("reconcile_scanned").build(),
+        last_drift_upserts: meter.u64_gauge("reconcile_last_drift_upserts").build(),
+        last_orphan_deletes: meter.u64_gauge("reconcile_last_orphan_deletes").build(),
+        last_pass_timestamp: meter
+            .f64_gauge("reconcile_last_pass_timestamp_seconds")
+            .build(),
+        passes: meter.u64_counter("reconcile_passes").build(),
+        pass_errors: meter.u64_counter("reconcile_pass_errors").build(),
+        pass_duration: meter
+            .f64_histogram("reconcile_pass_duration_seconds")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+            ])
+            .build(),
+    }
+});
 
 #[derive(Clone)]
 struct Shard {
@@ -211,10 +253,10 @@ async fn reconcile_pass(idp: &Idp, store: &dyn ProfileStore, shard: &Shard) -> R
         warn!(page = idp.page, max_pages = idp.max_pages, "user list incomplete (page cap); skipping deletions this pass");
     }
 
-    gauge!("reconcile_scanned").set(users.len() as f64);
-    gauge!("reconcile_last_drift_upserts").set(upserted as f64);
-    gauge!("reconcile_last_orphan_deletes").set(deleted as f64);
-    gauge!("reconcile_last_pass_timestamp_seconds").set(now_secs());
+    METRICS.scanned.record(users.len() as u64, &[]);
+    METRICS.last_drift_upserts.record(upserted, &[]);
+    METRICS.last_orphan_deletes.record(deleted, &[]);
+    METRICS.last_pass_timestamp.record(now_secs(), &[]);
     info!(scanned = users.len(), drift_upserts = upserted, orphan_deletes = deleted, "pass");
     Ok(())
 }
@@ -234,25 +276,15 @@ async fn shutdown_signal() {
     tokio::select! { () = ctrl_c => {}, () = term => {} }
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let level = env("LOG_LEVEL", "info");
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    if env("LOG_FORMAT", "") == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    init_tracing();
-    let metrics_port: u16 = env_num("METRICS_PORT", 9000_u16);
-    PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], metrics_port))
-        .install()?;
-    info!(port = metrics_port, "metrics listener up");
+    // Shared telemetry (first-party-telemetry): honors RUST_LOG/LOG_LEVEL/LOG_FORMAT
+    // as before, plus OTLP export when the endpoint env is set. Each reconcile pass
+    // roots its own trace; held for the process lifetime.
+    let _telemetry = telemetry::init("reconciler");
+    // Metrics now push via the OTel meter (first-party-telemetry); the old
+    // Prometheus exporter listener is retired — the collector's metrics pipeline
+    // forwards to the store, no per-box scrape job.
 
     let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
     let interval = Duration::from_secs(env_num("RECONCILE_INTERVAL", 600_u64));
@@ -299,14 +331,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     loop {
         let started = Instant::now();
-        match reconcile_pass(&idp, store.as_ref(), &shard).await {
-            Ok(()) => counter!("reconcile_passes_total").increment(1),
+        // Root a trace for this pass so its logs correlate (spec: a reconcile pass is
+        // investigable, its records correlatable to the pass's trace).
+        let span = info_span!("reconcile.pass", otel.kind = "internal");
+        match reconcile_pass(&idp, store.as_ref(), &shard)
+            .instrument(span)
+            .await
+        {
+            Ok(()) => METRICS.passes.add(1, &[]),
             Err(e) => {
-                counter!("reconcile_pass_errors_total").increment(1);
+                METRICS.pass_errors.add(1, &[]);
                 error!(error = %e, "pass error");
             }
         }
-        histogram!("reconcile_pass_duration_seconds").record(started.elapsed().as_secs_f64());
+        METRICS.pass_duration.record(started.elapsed().as_secs_f64(), &[]);
 
         tokio::select! {
             () = sleep(interval) => {}

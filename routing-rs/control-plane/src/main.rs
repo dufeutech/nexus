@@ -17,6 +17,7 @@ use std::fmt;
 #[cfg(not(unix))]
 use std::future::pending;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -28,8 +29,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use tower_http::timeout::TimeoutLayer;
-use metrics::counter;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+// first-party-telemetry: a per-request span at INFO so admin operations root their
+// own trace (DEBUG default would be filtered out and never exported).
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing::Level;
+use opentelemetry::metrics::Counter;
+use opentelemetry::{global, KeyValue};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -38,6 +43,7 @@ use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
+use router_core::telemetry;
 use router_core::auth::RouteAuth;
 use router_core::domain::{PoolSet, WorkspaceConfig};
 use router_core::normalize::normalize_host;
@@ -48,6 +54,24 @@ use router_core::store::{
 };
 use router_core::verify::{challenge_name, ct_eq, token_matches, OwnershipProof};
 use store_postgres::{LeaderLease, PgRoutingStore};
+
+// --------------------------------------------------------------------------- //
+// Metrics (first-party-telemetry): every control mutation is counted through the
+// OTel meter (push path via router_core::telemetry). The counter name DROPS the
+// Prometheus `_total` suffix — Prometheus's OTLP receiver re-appends it, so the
+// stored series keeps its name (control_mutations_total) and dashboards keep
+// working. The `op` label carries the mutation kind, exactly as before.
+// --------------------------------------------------------------------------- //
+struct Metrics {
+    mutations: Counter<u64>,
+}
+
+static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
+    let meter = global::meter("control-plane");
+    Metrics {
+        mutations: meter.u64_counter("control_mutations").build(),
+    }
+});
 
 /// Stable advisory-lock id electing the single verification-poll leader (RFC C4).
 const VERIFY_POLL_LOCK_KEY: i64 = 9_204_001;
@@ -76,12 +100,15 @@ where
     router
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
+        // Root a trace per admin operation (first-party-telemetry). INFO so it isn't
+        // filtered out; the handler's logs correlate to it and it exports when OTLP
+        // is enabled. No-op cost when telemetry is off (span still cheap).
+        .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().level(Level::INFO)))
 }
 
 #[derive(Clone)]
 struct App {
     store: Arc<PgRoutingStore>,
-    metrics: PrometheusHandle,
     /// Data-driven plan → domain-limit table for the declare quota gate (RFC C5).
     limits: Arc<PlanLimits>,
     /// Data-driven allow-list of backend pools (RFC C15). Loaded from config so a
@@ -189,8 +216,8 @@ fn env(key: &str, default: &str) -> String {
 
 /// Admin-token gate (RFC C16 admin boundary): every DATA endpoint requires
 /// `Authorization: Bearer <CONTROL_AUTH_TOKEN>`. The token is compared in
-/// constant time. `/healthz` and `/metrics` are intentionally NOT behind this
-/// (liveness + scrape). When `auth_token` is `None` the operator explicitly
+/// constant time. `/healthz` is intentionally NOT behind this (liveness). When
+/// `auth_token` is `None` the operator explicitly
 /// disabled auth at startup, so requests pass through.
 async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Response {
     let Some(expected) = s.auth_token.as_deref() else {
@@ -204,7 +231,7 @@ async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Respons
     match &bearer {
         Some(auth) if ct_eq(auth.token(), expected) => next.run(req).await,
         _ => {
-            counter!("control_mutations_total", "op" => "unauthorized").increment(1);
+            METRICS.mutations.add(1, &[KeyValue::new("op", "unauthorized")]);
             // Emit an audit line (not only a metric) so a rejected admin attempt is
             // visible in the log trail. Method + path only — never the presented
             // credential. `bearer.is_some()` distinguishes a bad token from a
@@ -276,7 +303,7 @@ async fn upsert_tenant(State(s): State<App>, Json(body): Json<TenantBody>) -> im
             for d in &domains {
                 s.invalidate(d).await;
             }
-            counter!("control_mutations_total", "op" => "upsert_tenant").increment(1);
+            METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_tenant")]);
             info!(tenant = ?body.tenant_id, invalidated = domains.len(), "tenant upserted");
         }
         Err(e) => warn!(error = %e, "domains_for_tenant failed; relying on TTL"),
@@ -321,7 +348,7 @@ async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainBody>) -> im
         return internal(e);
     }
     s.invalidate(&domain).await;
-    counter!("control_mutations_total", "op" => "upsert_domain").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_domain")]);
     info!(domain = %domain, tenant = ?body.tenant_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
     (
         StatusCode::OK,
@@ -389,7 +416,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
                 Err(e) => return internal(e),
             };
             if let Err(q) = s.limits.check(&plan, used) {
-                counter!("control_mutations_total", "op" => "declare_quota_exceeded").increment(1);
+                METRICS.mutations.add(1, &[KeyValue::new("op", "declare_quota_exceeded")]);
                 // 402: a billing/plan limit ("upgrade to proceed"), not an auth
                 // failure — clients MUST NOT treat it as a credential problem.
                 return (
@@ -433,7 +460,7 @@ async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> 
         Ok(c) => c,
         Err(e) => return internal(e),
     };
-    counter!("control_mutations_total", "op" => "declare_domain").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "declare_domain")]);
     info!(domain = %domain, tenant = ?body.tenant_id, "domain declared (pending)");
     (
         StatusCode::OK,
@@ -496,7 +523,7 @@ async fn verify_one(s: &App, domain: &str) -> VerifyOutcome {
         // the domain and cannot re-grant anything.
         warn!(error = %e, domain, "challenge retire failed (non-fatal)");
     }
-    counter!("control_mutations_total", "op" => "verify_domain").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "verify_domain")]);
     info!(domain, "domain verified via ownership proof");
     VerifyOutcome::Verified
 }
@@ -579,8 +606,9 @@ async fn verification_poll(app: App, interval_secs: u64) {
         if app.pending_ttl > 0 {
             match app.store.expire_pending_domains(app.pending_ttl).await {
                 Ok(expired) if !expired.is_empty() => {
-                    counter!("control_mutations_total", "op" => "expire_pending")
-                        .increment(expired.len() as u64);
+                    METRICS
+                        .mutations
+                        .add(expired.len() as u64, &[KeyValue::new("op", "expire_pending")]);
                     info!(count = expired.len(), "verification poll: expired pending domains");
                 }
                 Ok(_) => {}
@@ -620,7 +648,7 @@ async fn delete_domain(
         return internal(e);
     }
     s.invalidate(&domain).await;
-    counter!("control_mutations_total", "op" => "delete_domain").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "delete_domain")]);
     info!(domain = %domain, "domain deleted");
     (StatusCode::OK, Json(json!({ "result": "ok", "domain": domain }))).into_response()
 }
@@ -675,7 +703,7 @@ impl App {
     /// contradictory (requirements imply authentication): the gate would leak
     /// authorization policy as 403s to callers who were never asked to log in.
     /// Rejected at write time so such a rule never enters the store.
-    fn inconsistent_requirements(auth: &RouteAuth) -> bool {
+    const fn inconsistent_requirements(auth: &RouteAuth) -> bool {
         auth.has_requirements() && !auth.required
     }
 }
@@ -722,7 +750,7 @@ async fn upsert_auth_route(
         return internal(e);
     }
     s.invalidate_tenant(&tenant_id, "upsert_auth_route").await;
-    counter!("control_mutations_total", "op" => "upsert_auth_route").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_auth_route")]);
     (
         StatusCode::OK,
         Json(json!({
@@ -747,7 +775,7 @@ async fn delete_auth_route(
         return internal(e);
     }
     s.invalidate_tenant(&tenant_id, "delete_auth_route").await;
-    counter!("control_mutations_total", "op" => "delete_auth_route").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "delete_auth_route")]);
     (StatusCode::OK, Json(json!({ "result": "ok", "tenant_id": tenant_id, "path_prefix": body.path_prefix })))
         .into_response()
 }
@@ -804,7 +832,7 @@ async fn provision_account(State(s): State<App>, Json(body): Json<AccountBody>) 
     if let Err(e) = s.store.add_account_member(&body.account_id, &body.owner_sub, "owner").await {
         return internal(e);
     }
-    counter!("control_mutations_total", "op" => "provision_account").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "provision_account")]);
     info!(account = %body.account_id, owner = %body.owner_sub, created, "account provisioned");
     (
         StatusCode::OK,
@@ -899,7 +927,7 @@ async fn upsert_workspace(State(s): State<App>, Json(body): Json<WorkspaceBody>)
             for d in &domains {
                 s.invalidate(d).await;
             }
-            counter!("control_mutations_total", "op" => "upsert_workspace").increment(1);
+            METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_workspace")]);
             info!(workspace = %body.workspace_id, invalidated = domains.len(), "workspace upserted");
         }
         Err(e) => warn!(error = %e, "domains_for_workspace failed; relying on TTL"),
@@ -954,7 +982,7 @@ async fn transfer_workspace(
         }
         Err(e) => return internal(e),
     };
-    counter!("control_mutations_total", "op" => "transfer_workspace").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "transfer_workspace")]);
     info!(workspace = %workspace_id, new_account = %body.account_id, staff_removed, "workspace transferred");
     (
         StatusCode::OK,
@@ -1032,7 +1060,7 @@ async fn upsert_membership(
     if let Err(e) = s.store.notify_membership_change(&m.user_sub).await {
         warn!(error = %e, user = %m.user_sub, "membership-change notify failed; backstop will heal");
     }
-    counter!("control_mutations_total", "op" => "upsert_membership").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_membership")]);
     info!(workspace = %workspace_id, user = %m.user_sub, member_type = %m.member_type, "membership granted");
     (
         StatusCode::OK,
@@ -1053,7 +1081,7 @@ async fn delete_membership(
     if let Err(e) = s.store.notify_membership_change(&user_sub).await {
         warn!(error = %e, user = %user_sub, "membership-change notify failed; backstop will heal");
     }
-    counter!("control_mutations_total", "op" => "delete_membership").increment(1);
+    METRICS.mutations.add(1, &[KeyValue::new("op", "delete_membership")]);
     (StatusCode::OK, Json(json!({ "result": "ok", "workspace_id": workspace_id, "user_sub": user_sub })))
         .into_response()
 }
@@ -1069,23 +1097,8 @@ async fn list_memberships(State(s): State<App>, Path(workspace_id): Path<String>
 }
 
 // --------------------------------------------------------------------------- //
-async fn metrics_handler(State(s): State<App>) -> impl IntoResponse {
-    s.metrics.render()
-}
-
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
-}
-
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let level = env("LOG_LEVEL", "info");
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    if env("LOG_FORMAT", "") == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
 }
 
 async fn shutdown_signal() {
@@ -1108,8 +1121,13 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    init_tracing();
-    let metrics = PrometheusBuilder::new().install_recorder()?;
+    // Shared telemetry (first-party-telemetry): honors RUST_LOG/LOG_LEVEL/LOG_FORMAT
+    // exactly as before, plus OTLP export when the endpoint env is set. Held for the
+    // process lifetime to flush on shutdown.
+    let _telemetry = telemetry::init("control-plane");
+    // Metrics now push via the OTel meter (first-party-telemetry); the old Prometheus
+    // /metrics scrape endpoint is retired — the collector's metrics pipeline forwards
+    // to the store, so there is no per-box scrape job.
 
     let pg_url = env(
         "ROUTING_PG_URL",
@@ -1156,7 +1174,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let app = App {
         store,
-        metrics,
         limits: Arc::new(load_plan_limits()),
         pools: Arc::new(load_pools()),
         verifier: Arc::new(DnsOwnershipProof::public()),
@@ -1210,12 +1227,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     // Admin API (:9400) — the data endpoints behind the token gate, plus /healthz
-    // for liveness. /metrics is deliberately NOT served here: it would share the
-    // port with the admin API, and an L4 NetworkPolicy cannot allow a scrape peer
-    // to reach /metrics WITHOUT also granting it the admin endpoints — punching a
-    // hole in the broker-only guarantee (RFC C16) for every metrics peer. /metrics
-    // moves to the separate ops port below so the policy can gate the two
-    // independently (admin = broker-only; ops = scrapers + kubelet).
+    // for liveness. Metrics are no longer scraped here (or anywhere): they push via
+    // the OTel meter (first-party-telemetry), so no /metrics endpoint exists and the
+    // NetworkPolicy keeps the admin port broker-only with no scrape hole to punch.
     let req_timeout = request_timeout();
 
     let admin = resilient(
@@ -1227,12 +1241,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .with_state(app.clone());
 
-    // Ops surface (:9401) — /metrics for scrapers and /healthz for kubelet probes.
-    // Carries nothing sensitive and no mutation, so the NetworkPolicy can open it
-    // to Prometheus (and the node, for probes) without exposing the admin API.
-    // (No body cap needed on GET-only ops, so only the timeout layer applies.)
+    // Ops surface (:9401) — /healthz for kubelet probes. Carries nothing sensitive
+    // and no mutation, so the NetworkPolicy can open it to the node (for probes)
+    // without exposing the admin API. (No body cap needed on GET-only ops, so only
+    // the timeout layer applies.)
     let ops = Router::new()
-        .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, req_timeout))
         .with_state(app);
@@ -1242,7 +1255,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(
         "control plane: admin on :9400 (/accounts, /workspaces[+/members,/transfer,/auth-routes], \
          /domains, /domains/declare, /tenants[deprecated], /healthz); \
-         ops on :9401 (/metrics, /healthz)"
+         ops on :9401 (/healthz)"
     );
     // Serve both concurrently; either erroring (or a shutdown signal) brings the
     // process down so the kubelet restarts it cleanly.

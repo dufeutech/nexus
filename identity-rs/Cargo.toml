@@ -26,6 +26,16 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry (first-party-telemetry): the ONE telemetry stack — spans via the
+# tracing-opentelemetry bridge, trace-correlated logs via the appender, RED metrics
+# via the meter. Pre-1.0 (0.32/0.33, July 2026); ALL otel types are confined to
+# identity_core::telemetry so a version bump is a two-file change (design.md). OTLP
+# over gRPC/tonic to match the edge's exporter and reuse the tonic already in-tree.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
 # Control-plane services
 axum = "0.8"
 # HTTP-aware per-request timeout layer (returns 408) for the axum servers.

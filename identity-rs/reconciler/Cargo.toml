@@ -21,8 +21,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener", "async-runtime"] }
+opentelemetry.workspace = true
 
 [lints]
 workspace = true

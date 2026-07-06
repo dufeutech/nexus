@@ -18,6 +18,16 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+# Telemetry (first-party-telemetry): the shared init lives here so all identity-plane
+# binaries wire it identically. tracing/tracing-subscriber move onto the core crate
+# because the telemetry module owns the subscriber stack (previously per-binary).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
 
 [dev-dependencies]
 # Async test runtime for the projection orchestration tests (fake in-memory ports).

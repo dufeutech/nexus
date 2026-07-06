@@ -29,8 +29,10 @@ axum.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-metrics.workspace = true
-metrics-exporter-prometheus.workspace = true
+# first-party-telemetry: RED + operational metrics go through the OTel meter (push
+# path). Only the API crate is a direct dep — the SDK/OTLP pipeline stays in
+# router-core::telemetry; instruments are held in this binary's `metrics` module.
+opentelemetry.workspace = true
 
 [dev-dependencies]
 # http-request-resilience tests: oneshot a router without binding a socket.

@@ -39,6 +39,9 @@ services:
       ROUTING_L2_TTL: ${ROUTING_L2_TTL:-600}
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9300/healthz"]
       interval: 10s
@@ -55,6 +58,9 @@ services:
     environment:
       ROUTING_PG_URL: ${ROUTING_PG_URL:?set ROUTING_PG_URL to your external Postgres}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Pool allow-list (RFC C15). Empty -> the control plane's built-in default
       # (application, api, checkout, assets), which matches the pool_* clusters in
@@ -86,6 +92,9 @@ services:
       READINESS_DELAY_SECONDS: ${READINESS_DELAY_SECONDS:-0}
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9200/healthz"]
       interval: 10s
@@ -106,6 +115,9 @@ services:
       WEBHOOK_SELF_URL: ${WEBHOOK_SELF_URL:?set WEBHOOK_SELF_URL ZITADEL can reach}
       PAT_FILE: /secrets/zitadel-admin-sa.pat
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ./secrets:/secrets:ro
@@ -124,6 +136,9 @@ services:
       RECONCILE_PAGE_LIMIT: ${RECONCILE_PAGE_LIMIT:-1000}
       METRICS_PORT: "9000"
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - ./secrets:/secrets:ro
