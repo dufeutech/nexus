@@ -34,11 +34,15 @@ images:
     repository: REGISTRY/control-plane
     tag: ""
     pullPolicy: IfNotPresent
-  # Stock upstream edge proxy. PIN this to a concrete patch version in production
-  # (the rolling tag is for convenience only).
+  # Stock upstream edge proxy, pinned to a concrete patch version + immutable
+  # digest (the rolling `v1.34-latest` tag must never reach production). The
+  # digest is what `v1.34.14` resolved to on 2026-07-06; re-resolve on bump with
+  #   docker buildx imagetools inspect envoyproxy/envoy:<tag> | grep Digest
+  # This value also governs the combined edge in the edge-platform umbrella
+  # (its edge-deployment reads routing-plane.images.envoy).
   envoy:
     repository: envoyproxy/envoy
-    tag: v1.34-latest
+    tag: v1.34.14@sha256:cfc0678bc03cca19cbb031688acb31d510bff501ff97e163026a375fe0515d69
     pullPolicy: IfNotPresent
 
 imagePullSecrets: []
