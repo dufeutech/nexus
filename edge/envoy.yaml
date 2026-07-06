@@ -211,7 +211,6 @@ static_resources:
                           - remove: "x-user-id"
                           - remove: "x-user-org"
                           - remove: "x-user-roles"
-                          - remove: "x-user-roles-source"
                           - remove: "x-user-entitlements"
                           - remove: "x-user-suspended"
                           - remove: "x-user-enriched-by"
@@ -285,11 +284,9 @@ static_resources:
                         oidc:
                           # D7 single source: this authority MUST equal the iss the
                           # OIDC provider mints, i.e. localhost:${ZITADEL_EXTERNALPORT}
-                          # (default 8080 in docker-compose.yaml) — the same value
-                          # the workers' ZITADEL_HOST derives from. Drift here is
-                          # silent-but-fatal (sync works, every authenticated
-                          # request 401s); scripts/helm-guards-test.sh asserts the
-                          # two stay equal.
+                          # (default 8080 in docker-compose.yaml). Drift here is
+                          # silent-but-fatal (every authenticated request 401s);
+                          # scripts/helm-guards-test.sh asserts the two stay equal.
                           issuer: "http://localhost:8080"
                           remote_jwks:
                             # uri authority -> Host header (must match ZITADEL's

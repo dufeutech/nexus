@@ -1,7 +1,15 @@
 //! The canonical Profile — the single definition shared by the sidecar (reads),
-//! the sync-worker (writes from change events), and the reconciler (writes from
-//! the authoritative list). Field identifiers are normalized lower `snake_case`
-//! (RFC §3.8); mapping from the provider's casing happens at the boundary.
+//! the membership-sync worker (membership projection writes), and the authz-admin
+//! surface (authorization authoring writes). Field identifiers are normalized lower
+//! `snake_case` (RFC §3.8); mapping from the provider's casing happens at the
+//! boundary.
+//!
+//! Authorization fields (`roles`, `entitlements`, `is_suspended`) are
+//! **nexus-authored and authoritative** — never sourced from the token or the OIDC
+//! provider (`nexus-native-authorization` spec). In Model 1 the Profile is the
+//! nexus-native authorization store; the [`crate::AuthzResolver`] /
+//! [`crate::AuthzAuthoring`] ports read/write them so a future engine is an adapter
+//! swap.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,8 +19,6 @@ use crate::membership::{Membership, ResolvedMembership};
 pub struct Profile {
     #[serde(default)]
     pub sub: String,
-    #[serde(default)]
-    pub org_id: Option<String>,
     /// The subject's home organization, denormalized for display/context only.
     /// **Informational — NEVER an authorization input**: it does not influence
     /// [`Profile::resolve_membership`] or the emitted acting scope (the `x-user-org`
@@ -31,10 +37,15 @@ pub struct Profile {
     pub display_name: Option<String>,
     #[serde(default)]
     pub preferred_language: Option<String>,
+    /// Nexus-authored global roles (spec R1). Authored ONLY via [`crate::AuthzAuthoring`];
+    /// never from the token or the provider.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Nexus-authored global entitlements (spec R1).
     #[serde(default)]
     pub entitlements: Vec<String>,
+    /// Whether nexus has suspended the subject (spec R1). Revocation-sensitive: the
+    /// sidecar sources it live so a suspension denies within seconds (spec R3).
     #[serde(default)]
     pub is_suspended: bool,
     /// The user's typed workspace memberships (staff|customer + role),
@@ -76,6 +87,26 @@ impl Profile {
     #[must_use]
     pub fn with_memberships(mut self, memberships: Vec<Membership>) -> Self {
         self.memberships = memberships;
+        self
+    }
+
+    /// Return this profile with its nexus-authored authorization facts (roles,
+    /// entitlements, suspension) replaced, preserving every other field. The
+    /// no-clobber convergence point for the authz-authoring writer, mirroring
+    /// [`Profile::with_memberships`]: an authorization write never touches memberships
+    /// or display identity, and a membership/identity write never touches authz. So
+    /// the three writers (authz authoring + membership projection + identity display)
+    /// converge on the same document without clobbering each other.
+    #[must_use]
+    pub fn with_authz(
+        mut self,
+        roles: Vec<String>,
+        entitlements: Vec<String>,
+        is_suspended: bool,
+    ) -> Self {
+        self.roles = roles;
+        self.entitlements = entitlements;
+        self.is_suspended = is_suspended;
         self
     }
 }
@@ -158,7 +189,6 @@ mod tests {
     fn with_memberships_replaces_only_memberships() {
         let base = Profile {
             sub: "u1".into(),
-            org_id: Some("org1".into()),
             home_org: Some("org-home".into()),
             username: Some("alice".into()),
             roles: vec!["admin".into()],
@@ -173,10 +203,38 @@ mod tests {
         assert_eq!(merged.memberships.len(), 1);
         assert_eq!(merged.memberships[0].workspace_id, "ws-a");
         // ...every other field preserved unchanged.
-        assert_eq!(merged.org_id, base.org_id);
         assert_eq!(merged.home_org, base.home_org);
         assert_eq!(merged.username, base.username);
         assert_eq!(merged.roles, base.roles);
+        assert_eq!(merged.version, base.version);
+    }
+
+    #[test]
+    fn with_authz_replaces_only_authz_facts() {
+        let base = Profile {
+            sub: "u1".into(),
+            home_org: Some("org-home".into()),
+            username: Some("alice".into()),
+            roles: vec!["old-role".into()],
+            entitlements: vec!["old-ent".into()],
+            is_suspended: false,
+            memberships: vec![member("ws-a", MemberType::Staff, "owner")],
+            version: 7,
+            ..Default::default()
+        };
+        let merged = base.clone().with_authz(
+            vec!["admin".into()],
+            vec!["pro".into()],
+            true,
+        );
+        // Authz facts swapped to the newly authored set...
+        assert_eq!(merged.roles, vec!["admin".to_owned()]);
+        assert_eq!(merged.entitlements, vec!["pro".to_owned()]);
+        assert!(merged.is_suspended);
+        // ...memberships + display identity + version preserved (no clobber).
+        assert_eq!(merged.memberships, base.memberships);
+        assert_eq!(merged.home_org, base.home_org);
+        assert_eq!(merged.username, base.username);
         assert_eq!(merged.version, base.version);
     }
 

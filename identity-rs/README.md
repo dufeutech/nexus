@@ -7,11 +7,11 @@ identity and authorization service.
 
 | Crate | Description |
 |-------|-------------|
-| `identity-core` | Core identity domain types and reconciliation logic. |
-| `store-postgres` | PostgreSQL store adapter (authoritative store + LISTEN/NOTIFY change feed). |
-| `identity-sidecar` | Envoy `ext_authz` sidecar serving identity decisions. |
-| `sync-worker` | Worker that syncs identity profile changes. |
-| `reconciler` | Reconciliation worker. |
+| `identity-core` | Core identity domain types + the authorization ports (`AuthzResolver`/`AuthzAuthoring`). |
+| `store-postgres` | PostgreSQL store adapter (authoritative store + LISTEN/NOTIFY change feed; nexus-native authz adapter). |
+| `identity-sidecar` | Envoy `ext_proc` sidecar serving identity + nexus-authored authorization decisions. |
+| `authz-admin` | Nexus-native authorization authoring surface (roles/entitlements/suspension). |
+| `membership-sync` | Projects routing-plane memberships into `Profile.memberships`. |
 
 ## License
 

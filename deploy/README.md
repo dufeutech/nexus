@@ -16,10 +16,10 @@ dependency is **external** and operated outside this project:
 
 | External dependency | Used by            | Why it's external                                  |
 | ------------------- | ------------------ | -------------------------------------------------- |
-| **PostgreSQL** (`identitydb`) | identity sidecar / sync-worker / reconciler | nexus-owned identity store + LISTEN/NOTIFY change feed (RFC C4); session connection required; app creates the `identity` schema. Separate database from the IdP (identity-data-residency) |
+| **PostgreSQL** (`identitydb`) | identity sidecar / authz-admin / membership-sync | nexus-owned identity store + LISTEN/NOTIFY change feed (RFC C4); session connection required; app creates the `identity` schema. Separate database from the IdP (identity-data-residency) |
 | **PostgreSQL** (`routing`) | tenant-router / control-plane | nexus-owned authoritative routing store (RFC decision 14); separate database from the IdP |
 | **Redis** (optional) | tenant-router     | OPTIONAL L2 cache (RFC decision 9) — never a correctness dependency |
-| **OIDC provider** (IdP) | edge jwt_authn / sync-worker / reconciler | credential issuer; ANY conformant OIDC provider by config (oidc-provider-independence). Owns ONLY authentication — not nexus's data. Run its own chart / a managed instance |
+| **OIDC provider** (IdP) | edge jwt_authn | credential issuer; ANY conformant OIDC provider by config (oidc-provider-independence). Owns ONLY authentication (JWKS for token verification) — NOT authorization and not nexus's data (`nexus-native-authorization`). No admin PAT / directory integration. Run its own chart / a managed instance |
 | **Backend pools**   | edge router        | your applications — the finite set routing selects among (RFC C15) |
 
 Two equivalent topologies, **same images, same env-var contract** (topology
@@ -28,7 +28,7 @@ independence, `../INFO.md` §4/§7):
 ```
 deploy/
   helm/
-    identity-plane/   identity edge + sync-worker + reconciler   (external Postgres)
+    identity-plane/   identity edge + authz-admin + membership-sync   (external Postgres)
     routing-plane/    routing edge + control-plane               (external Postgres, optional Redis)
     edge-platform/    umbrella: both planes, one tenant-first edge (RFC C17)
   compose/
@@ -63,7 +63,7 @@ and pushes them to GitHub Container Registry. It runs automatically on a `v*` ta
 and has a **manual "Run workflow" button**: GitHub → **Actions** → **Build images**
 → **Run workflow** (optionally enter a tag like `0.1.0`; the short commit SHA is
 always tagged). Auth uses the built-in `GITHUB_TOKEN` — no secrets to set up. The
-images land at `ghcr.io/<owner>/{identity-sidecar-rs,identity-sync-worker,identity-reconciler,tenant-router,control-plane}`.
+images land at `ghcr.io/<owner>/{identity-sidecar-rs,identity-authz-admin,identity-membership-sync,tenant-router,control-plane}`.
 
 [![Build images](https://github.com/OWNER/REPO/actions/workflows/build-images.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/build-images.yml)
 
@@ -80,9 +80,9 @@ images land at `ghcr.io/<owner>/{identity-sidecar-rs,identity-sync-worker,identi
 
 ```bash
 # identity plane
-docker build --target sidecar     -t REGISTRY/identity-sidecar-rs:0.1.0  ../identity-rs
-docker build --target sync-worker -t REGISTRY/identity-sync-worker:0.1.0 ../identity-rs
-docker build --target reconciler  -t REGISTRY/identity-reconciler:0.1.0  ../identity-rs
+docker build --target sidecar         -t REGISTRY/identity-sidecar-rs:0.1.0      ../identity-rs
+docker build --target authz-admin     -t REGISTRY/identity-authz-admin:0.1.0     ../identity-rs
+docker build --target membership-sync -t REGISTRY/identity-membership-sync:0.1.0 ../identity-rs
 # routing plane
 docker build --target tenant-router -t REGISTRY/tenant-router:0.1.0 ../routing-rs
 docker build --target control-plane -t REGISTRY/control-plane:0.1.0 ../routing-rs
@@ -99,9 +99,9 @@ Runs the full first-party stack against your external infrastructure.
 
 ```bash
 cd compose
-cp .env.example .env                      # fill in Postgres / Redis / ZITADEL
-printf '%s' '<zitadel-admin-PAT>' > secrets/zitadel-admin-sa.pat
-$EDITOR envoy/envoy.yaml                   # set oidc_jwks + pool_* upstreams
+cp .env.example .env                       # fill in Postgres / Redis; set IDENTITY_ADMIN_TOKEN
+                                           # (authz-admin) + CONTROL_AUTH_TOKEN (control-plane)
+$EDITOR envoy/envoy.yaml                    # set oidc_jwks + pool_* upstreams
 docker compose up -d --build               # builds from ../../identity-rs and ../../routing-rs
 ```
 
@@ -118,12 +118,12 @@ one tenant-first edge. North–south TLS is terminated by your ingress controlle
 # Identity plane (external Postgres required; session connection)
 helm install identity ./helm/identity-plane -n identity --create-namespace \
   --set images.sidecar.repository=REGISTRY/identity-sidecar-rs \
-  --set images.syncWorker.repository=REGISTRY/identity-sync-worker \
-  --set images.reconciler.repository=REGISTRY/identity-reconciler \
+  --set images.authzAdmin.repository=REGISTRY/identity-authz-admin \
+  --set images.membershipSync.repository=REGISTRY/identity-membership-sync \
   --set postgres.existingSecret=identity-pg \
   --set oidc.issuer=https://auth.example.com \
-  --set oidc.internalUrl=https://zitadel.zitadel.svc.cluster.local:8443 \
-  --set oidc.patSecret.existingSecret=zitadel-pat \
+  --set oidc.jwksInternalUrl=https://zitadel.zitadel.svc.cluster.local:8443 \
+  --set authzAdmin.existingSecret=identity-authz-admin \
   --set oidc.jwksTls.enabled=true \
   --set originEnforcement.networkPolicy.enabled=true \
   --set originEnforcement.networkPolicy.backendSelector.app=myapp \
@@ -218,8 +218,8 @@ must emit — is the "Box telemetry contract" section of
   ingestion is version-gated in both stores. Bump pins deliberately and re-run
   the telemetry smoke checks.
 - **First-party services now push, not scrape (Change B — `first-party-telemetry`,
-  shipped):** the six Rust services (tenant-router, control-plane, identity sidecar,
-  sync-worker, reconciler, membership-sync) emit RED + operational metrics through
+  shipped):** the Rust services (tenant-router, control-plane, identity sidecar,
+  authz-admin, membership-sync) emit RED + operational metrics through
   the OTel meter to the collector — the same push path as any box. Their Prometheus
   scrape jobs and ServiceMonitors were retired; only Envoy's own admin stats
   (`:9901`) remain scrape-based (Envoy is outside the box telemetry contract). Metric
@@ -326,7 +326,7 @@ that response owns every "verified" identity. Now the stamping edges
 
 - **`oidc.jwksTls.enabled=true`** (preferred): the JWKS is fetched over TLS
   with server-cert verification (trusted CA + SNI + SAN pin). Point
-  `oidc.internalUrl` at a TLS port; for a private CA, mount your bundle
+  `oidc.jwksInternalUrl` at a TLS port; for a private CA, mount your bundle
   into the Envoy pod and set `oidc.jwksTls.caFile`; set
   `oidc.jwksTls.sni` when the cert is issued for a name other than the
   dialed host.
@@ -374,6 +374,47 @@ kubectl -n "$NS" run np-probe --rm -it --restart=Never --image=curlimages/curl -
 # CNI is NOT enforcing NetworkPolicy; the trusted-header family is forgeable.
 ```
 
+### 3. Nexus-native authorization + deny-by-default cutover (`nexus-native-authorization`)
+
+The OIDC provider now answers ONLY "who am I" (authentication + basic profile);
+**nexus authors ALL authorization** — roles, entitlements, and suspension — itself.
+The provider is never an authorization source: a `roles` claim in the token confers
+**nothing**, and the ZITADEL directory integration (the `reconciler`, `sync-worker`,
+admin PAT, and Actions webhook) is **deleted**. This removes `ZITADEL_HOST`,
+`ZITADEL_INTERNAL_URL`, `PAT_FILE`/`WEBHOOK_SELF_URL` env and the `oidc.patSecret` /
+`oidc.internalUrl` Helm values (the JWKS dial is now `oidc.jwksInternalUrl`).
+
+**BREAKING (operational) — deny-by-default.** A subject nexus holds no authorization
+facts about is authenticated but **unprivileged** (no roles, no entitlements, not
+suspended). Any elevated access that previously rode on an IdP-sourced role now
+requires an explicit **nexus grant**. At cutover, every such user has **zero** nexus
+roles until re-provisioned — provision the grants *before or with* the cutover.
+
+**Authoring surface.** The identity-plane **`authz-admin`** service (`:9300`,
+auth-gated by `IDENTITY_ADMIN_TOKEN` fail-closed, like the control-plane's
+`CONTROL_AUTH_TOKEN`) is the single source of record. It resolves live and revokes
+within seconds over the existing change feed (no new token):
+
+```sh
+# T = IDENTITY_ADMIN_TOKEN, SUB = the subject's `sub`
+curl -sf -X PUT  -H "Authorization: Bearer $T" -H 'content-type: application/json' \
+     -d '{"role":"admin"}' http://authz-admin:9300/authz/$SUB/roles      # assign role
+curl -sf -X POST -H "Authorization: Bearer $T" http://authz-admin:9300/authz/$SUB/suspend    # suspend
+curl -sf -X DELETE -H "Authorization: Bearer $T" http://authz-admin:9300/authz/$SUB/roles/admin  # revoke
+curl -sf -H "Authorization: Bearer $T" http://authz-admin:9300/authz/$SUB    # read effective facts
+```
+
+**Bootstrap (from an empty store).** Set `AUTHZ_BOOTSTRAP_ADMIN_SUB` (Helm
+`authzAdmin.bootstrapAdminSub`) to a subject `sub`: it is granted `AUTHZ_ADMIN_ROLE`
+at startup **iff no administrator exists yet** — idempotent break-glass, so the
+surface is never unreachable. Rotate/disable the bootstrap secret once a real admin
+has been authored.
+
+**Provisioning migration (pre-prod).** Re-author the grants your users previously
+received from the IdP directly through `authz-admin` (a re-provision, not an ETL —
+the store is rebuildable pre-prod). There is no enumerate/backfill pass without the
+reconciler by design: a subject nexus has no opinion about is the safe (absent) row.
+
 ## Production deployment checklist
 
 The platform itself is gated: every spec-asserted security boundary is enforced
@@ -398,6 +439,12 @@ supply the *truth*):**
       Envoy pod can read (`jwksTls.caFile`) and the right `jwksTls.sni`. Use
       `jwksPlaintextTrustedPath=true` ONLY for a genuinely in-cluster hop you
       have assessed — it is an acknowledgment, not a control.
+- [ ] **Nexus authorization is provisioned (deny-by-default).** The OIDC provider
+      is NOT an authorization source; every privileged subject needs an explicit
+      nexus grant (`nexus-native-authorization`, §3 above). Set the `authz-admin`
+      token (`authzAdmin.adminToken`/`.existingSecret`, fail-closed), bootstrap the
+      first admin (`authzAdmin.bootstrapAdminSub`), and re-author existing users'
+      grants before cutover — until then they are authenticated but unprivileged.
 - [ ] **The consuming backend implements its half of the stamp contract.** Nexus
       emits `x-identity-contract` and the spec scopes the rule, but rejecting an
       absent/unknown stamp on identity-enriched routes is the BACKEND's code

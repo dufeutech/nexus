@@ -4,8 +4,8 @@ Edge Resolution Platform (both planes, tenant-first) deployed as release
 Topology:
   - combined edge : Envoy + tenant-router + identity-sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
                     chain: strip -> tenant resolve (C18) -> verify (C1) -> enrich (C2) -> forward
-  - routing plane : control-plane              (subchart, edge disabled; Postgres + optional Redis are external)
-  - identity plane: sync-worker + reconciler   (subchart, edge disabled; PostgreSQL is external)
+  - routing plane : control-plane                  (subchart, edge disabled; Postgres + optional Redis are external)
+  - identity plane: authz-admin + membership-sync  (subchart, edge disabled; PostgreSQL is external)
 
 The combined edge dials:
   - routing store secret : {{ include "edge-platform.routingPgSecret" . }} (key {{ include "edge-platform.routingPgSecretKey" . }})
@@ -37,6 +37,9 @@ Before trusting in production:
      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "edge-platform.routingFullname" . }}-control-plane 9400:9400
      # then POST /tenants and verified /domains (see routing-plane NOTES)
   2. Confirm the OIDC issuer above matches what your provider mints (RFC §6.6).
-  3. Provide the admin PAT secret for sync-worker/reconciler (identity-plane.oidc.patSecret).
+  3. Provision nexus authorization (roles/entitlements) via the authz-admin surface —
+     the OIDC provider is NOT an authorization source (nexus-native-authorization).
+     Set the admin token (identity-plane.authzAdmin.adminToken / .existingSecret) and,
+     for an empty store, identity-plane.authzAdmin.bootstrapAdminSub.
 
 Open production items: see deploy/README.md and run deploy/load/ (load/soak/failover).

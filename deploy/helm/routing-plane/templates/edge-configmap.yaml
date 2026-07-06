@@ -147,7 +147,6 @@ data:
                               - remove: "x-user-id"
                               - remove: "x-user-org"
                               - remove: "x-user-roles"
-                              - remove: "x-user-roles-source"
                               - remove: "x-user-entitlements"
                               - remove: "x-user-suspended"
                               - remove: "x-user-enriched-by"

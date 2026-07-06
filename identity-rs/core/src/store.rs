@@ -41,7 +41,7 @@ pub type ChangeFeed = BoxStream<'static, Result<ChangeEvent, BoxError>>;
 /// scan for reconciliation, and a live change feed for cache freshness.
 ///
 /// The hot path uses only `get` (on a cache miss). `watch` backs the push-update
-/// path (C4). `scan_all` is the reconciler's authoritative diff input — at 1B
+/// path (C4). `scan_all` is the membership backstop's convergence input — at 1B
 /// scale an adapter MUST partition it; the small-scale reference scans all.
 #[async_trait]
 pub trait ProfileStore: Send + Sync {
@@ -54,8 +54,9 @@ pub trait ProfileStore: Send + Sync {
     /// Remove the profile for a subject (idempotent — missing is not an error).
     async fn delete(&self, sub: &str) -> Result<(), BoxError>;
 
-    /// All stored profiles (reconciler input). The reconciler derives both the
-    /// desired-vs-stored diff and the set of stored keys from this.
+    /// All stored profiles (membership backstop input). The backstop derives the set
+    /// of subjects still carrying a stale projection from this, to heal missed
+    /// revokes (paired with the source-of-record member set).
     async fn scan_all(&self) -> Result<Vec<Profile>, BoxError>;
 
     /// Open a live, **resumable** change feed (C4). `after = Some(token)` resumes

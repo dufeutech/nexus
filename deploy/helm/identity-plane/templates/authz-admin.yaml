@@ -1,0 +1,103 @@
+{{- if .Values.authzAdmin.enabled -}}
+{{- $fullName := include "identity-plane.fullname" . -}}
+# Nexus-native authorization authoring surface (nexus-native-authorization). The
+# SINGLE source of record for roles/entitlements/suspension: it authors them into the
+# identity Profile store via the AuthzAuthoring port; the sidecar picks the change up
+# over the identity change feed within seconds. The OIDC provider is NEVER an
+# authorization source. Keep it on an administrative boundary — do NOT expose it
+# publicly; auth-gated fail-closed by a bearer token (or explicitly authDisabled).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-authz-admin
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "authz-admin") | nindent 4 }}
+spec:
+  # Not on the hot path; the authoring writes are idempotent. One replica is plenty.
+  replicas: {{ .Values.authzAdmin.replicas }}
+  selector:
+    matchLabels:
+      {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "authz-admin") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity-plane.labels" . | nindent 8 }}
+        {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "authz-admin") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: authz-admin
+          image: {{ include "identity-plane.image" (dict "repo" .Values.images.authzAdmin.repository "tag" .Values.images.authzAdmin.tag "ctx" .) }}
+          imagePullPolicy: {{ .Values.images.authzAdmin.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: PROFILE_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "identity-plane.pgSecretName" . }}
+                  key: {{ include "identity-plane.pgSecretKey" . }}
+            {{- if .Values.authzAdmin.authDisabled }}
+            # Explicit opt-out — the surface runs UNAUTHENTICATED (trusted network only).
+            - name: IDENTITY_ADMIN_AUTH_DISABLED
+              value: "true"
+            {{- else }}
+            - name: IDENTITY_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "identity-plane.authzAdminSecretName" . }}
+                  key: {{ include "identity-plane.authzAdminSecretKey" . }}
+            {{- end }}
+            # Bootstrap the first administrator from an empty store (R4).
+            - name: AUTHZ_ADMIN_ROLE
+              value: {{ .Values.authzAdmin.adminRole | quote }}
+            - name: AUTHZ_BOOTSTRAP_ADMIN_SUB
+              value: {{ .Values.authzAdmin.bootstrapAdminSub | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.authzAdmin.logFormat | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.authzAdmin.logLevel | quote }}
+          ports:
+            - { name: http, containerPort: 9300 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources: {{- toYaml .Values.authzAdmin.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-authz-admin
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "authz-admin") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "authz-admin") | nindent 4 }}
+  ports:
+    # Carries the authoring API + /healthz. Reachable on an admin boundary only.
+    - { name: http, port: 9300, targetPort: http, protocol: TCP }
+{{- end }}

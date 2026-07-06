@@ -23,7 +23,8 @@ use std::env;
 use std::time::Duration;
 
 use futures::StreamExt;
-use identity_core::membership::{MemberType, SourceMembershipReader};
+use identity_core::authz::{AuthzAuthoring, AuthzResolver};
+use identity_core::membership::{MemberType, Membership, SourceMembershipReader};
 use identity_core::store::{Change, ProfileStore};
 use identity_core::Profile;
 use sqlx::postgres::PgPoolOptions;
@@ -309,6 +310,102 @@ async fn reader_projects_active_memberships_only() {
 
     // A subject with no rows is a member of nothing.
     assert!(reader.memberships_for("ghost").await.unwrap().is_empty());
+}
+
+// --------------------------------------------------------------------------- //
+// Nexus-native authorization adapter (nexus-native-authorization).
+// --------------------------------------------------------------------------- //
+
+/// spec R2 + R3/R4 mechanism: an absent subject resolves to deny-by-default facts;
+/// authoring assigns/revokes and the resolver reflects it (read-merge-write).
+/// Idempotent assign; suspend/reactivate flip the live flag.
+#[tokio::test]
+async fn authz_authoring_roundtrip_and_facts() {
+    let (store, _guard) = skip_if_no_db!(store);
+
+    // Absent subject → deny-by-default zero value (spec R2), never an error.
+    let absent = store.facts("u1").await.unwrap();
+    assert!(absent.roles.is_empty() && absent.entitlements.is_empty() && !absent.is_suspended);
+
+    // Authoring creates the row and reflects each fact (spec R4).
+    store.assign_role("u1", "admin").await.unwrap();
+    store.assign_role("u1", "admin").await.unwrap(); // idempotent — no duplicate
+    store.grant_entitlement("u1", "pro").await.unwrap();
+    store.suspend("u1").await.unwrap();
+    let authored = store.facts("u1").await.unwrap();
+    assert_eq!(authored.roles, vec!["admin".to_owned()], "role assigned once");
+    assert_eq!(authored.entitlements, vec!["pro".to_owned()]);
+    assert!(authored.is_suspended);
+    assert!(store.has_role("u1", "admin").await.unwrap());
+    assert!(!store.has_role("u1", "viewer").await.unwrap());
+
+    // Revocation clears each fact (spec R3: a revoked grant stops being effective).
+    store.revoke_role("u1", "admin").await.unwrap();
+    store.revoke_entitlement("u1", "pro").await.unwrap();
+    store.reactivate("u1").await.unwrap();
+    let cleared = store.facts("u1").await.unwrap();
+    assert!(cleared.roles.is_empty() && cleared.entitlements.is_empty() && !cleared.is_suspended);
+    // Revoking an unheld role is a no-op (idempotent), not an error.
+    store.revoke_role("u1", "never-held").await.unwrap();
+}
+
+/// spec R3 mechanism (revocation within seconds) + task 2.3 no-clobber: an authz
+/// write preserves memberships/identity AND emits the change-feed signal the sidecar
+/// consumes, so a grant/suspend propagates over the SAME feed within seconds.
+#[tokio::test]
+async fn authz_authoring_preserves_memberships_and_emits_feed() {
+    let (store, _guard) = skip_if_no_db!(store);
+    // A profile already carries a membership projection + display identity.
+    let base = Profile {
+        sub: "u1".into(),
+        username: Some("alice".into()),
+        memberships: vec![Membership {
+            workspace_id: "ws-a".into(),
+            member_type: MemberType::Staff,
+            role: "admin".into(),
+            entitlements: vec![],
+        }],
+        ..Default::default()
+    };
+    store.put(&base).await.unwrap();
+
+    // Open the feed from now, then author a role — the sidecar's live-update path.
+    let mut feed = store.watch(None).await.unwrap();
+    sleep(Duration::from_millis(200)).await;
+    store.suspend("u1").await.unwrap();
+
+    let ev = timeout(Duration::from_secs(5), feed.next())
+        .await
+        .expect("feed yields within 5s")
+        .expect("stream not ended")
+        .expect("change event ok");
+    // The feed emits the FULL updated profile: suspension applied, but the membership
+    // projection + display identity preserved (no clobber — task 2.3).
+    assert!(
+        matches!(&ev.change, Change::Upsert(p)
+            if p.is_suspended
+            && p.username.as_deref() == Some("alice")
+            && p.memberships.len() == 1
+            && p.memberships.first().map(|m| m.workspace_id.as_str()) == Some("ws-a")),
+        "authored suspension reached the feed with membership + display preserved (no clobber)"
+    );
+}
+
+/// spec R4 bootstrap gate: `any_subject_has_role` is false on an empty store and
+/// true once an admin is authored — the exact query the authz-admin bootstrap uses
+/// to seed the first administrator iff none exists.
+#[tokio::test]
+async fn any_subject_has_role_backs_the_bootstrap_gate() {
+    let (store, _guard) = skip_if_no_db!(store);
+    assert!(!store.any_subject_has_role("admin").await.unwrap(), "no admin on an empty store");
+    store.assign_role("boot", "admin").await.unwrap();
+    assert!(store.any_subject_has_role("admin").await.unwrap(), "admin now exists");
+    assert!(!store.any_subject_has_role("superuser").await.unwrap(), "only the authored role matches");
+    // A suspended admin still counts (present, not deleted); a fully revoked one does not.
+    store.suspend("boot").await.unwrap();
+    assert!(store.any_subject_has_role("admin").await.unwrap(), "suspended admin still holds the role");
+    store.revoke_role("boot", "admin").await.unwrap();
+    assert!(!store.any_subject_has_role("admin").await.unwrap(), "revoked → no admin remains");
 }
 
 #[tokio::test]

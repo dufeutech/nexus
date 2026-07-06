@@ -2,8 +2,9 @@ Identity Enrichment Plane deployed as release "{{ .Release.Name }}" in namespace
 
 Components:
   - edge        : Envoy + identity sidecar (per-pod), {{ .Values.edge.replicas }} replica(s)
-  - sync-worker : {{ .Values.syncWorker.replicas }} replica (single webhook owner)
-  - reconciler  : {{ .Values.reconciler.replicas }} replica, interval {{ .Values.reconciler.intervalSeconds }}s
+{{- if .Values.authzAdmin.enabled }}
+  - authz-admin : {{ .Values.authzAdmin.replicas }} replica — nexus-native authorization authoring surface (roles/entitlements/suspension). Auth-gated{{ if .Values.authzAdmin.authDisabled }} DISABLED (unauthenticated!){{ else }} by Secret {{ include "identity-plane.authzAdminSecretName" . }} (key {{ include "identity-plane.authzAdminSecretKey" . }}){{ end }}.
+{{- end }}
 {{- if .Values.membershipSync.enabled }}
   - membership-sync : {{ .Values.membershipSync.replicas }} replica — projects routing memberships into Profile.memberships (LISTEN routing_membership_changes + backstop {{ .Values.membershipSync.backstopIntervalSeconds }}s). Reads the routing DB read-only via Secret {{ include "identity-plane.routingPgSecretName" . }} (key {{ include "identity-plane.routingPgSecretKey" . }}).
 {{- end }}
@@ -19,14 +20,19 @@ Edge entry point:
 Verify before trusting in production:
   1. Token issuer matches:   {{ .Values.oidc.issuer }}
      A token whose `iss` differs is rejected by Envoy jwt_authn (fail-closed).
-  2. ZITADEL can reach the sync-worker webhook:
-     {{ .Values.syncWorker.selfUrl | default (printf "http://%s-sync-worker.%s.svc.cluster.local:8080/webhook" (include "identity-plane.fullname" .) .Release.Namespace) }}
-  3. The admin PAT secret "{{ include "identity-plane.patSecretName" . }}" exists and is valid.
+  2. Authorization is nexus-authored (nexus-native-authorization): the OIDC provider
+     is NOT an authorization source. Provision roles/entitlements via the authz-admin
+     surface; a subject with no nexus grants is authenticated but unprivileged
+     (deny-by-default). Bootstrap the first admin with authzAdmin.bootstrapAdminSub.
+{{- if not .Values.authzAdmin.authDisabled }}
+  3. The admin-token secret "{{ include "identity-plane.authzAdminSecretName" . }}" exists and is valid.
+{{- end }}
 
 Smoke test (from inside the cluster):
-  TOKEN=<a real ZITADEL access token>
+  TOKEN=<a real access token from your OIDC provider>
   curl -s -H "Authorization: Bearer $TOKEN" https://{{ .Values.edge.ingress.host }}/ | grep -i '^x-user'
-  # expect x-user-id / x-user-roles / x-user-suspended (x-user-org is retired)
+  # expect x-user-id / x-user-roles / x-user-suspended (roles are nexus-authored;
+  # x-user-org and x-user-roles-source are retired)
 
 External dependencies (operated OUTSIDE this chart): see deploy/README.md
   - PostgreSQL (identity store + LISTEN/NOTIFY change feed on channel
@@ -38,5 +44,6 @@ External dependencies (operated OUTSIDE this chart): see deploy/README.md
     SELECT `routing.memberships`. Grant least privilege (SELECT + LISTEN, no write);
     it MUST be a direct/session connection (a txn-mode pooler swallows LISTEN).
 {{- end }}
-  - ZITADEL (the IdP) + its database; re-verify event + claim contracts (RFC §6.6)
+  - The OIDC provider (the IdP) + its database; used ONLY for token verification
+    (JWKS) — re-verify the issuer/JWKS contract (RFC §6.6). No directory integration.
   - The protected backend the edge forwards to (backend.host/port)

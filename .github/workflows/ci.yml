@@ -144,7 +144,7 @@ jobs:
           # jwksTls + originEnforcement are fail-closed guards: rendering an
           # identity-enriched edge requires an explicit choice for each
           # (edge-trust-anchor-integrity / edge-origin-trust).
-          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set oidc.patSecret.value=dummy --set routingPg.url=postgres://u:p@h:5432/routing \
+          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing \
                 --set oidc.jwksTls.enabled=true \
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint identity-plane $ARGS
@@ -166,7 +166,7 @@ jobs:
         run: |
           helm dependency update edge-platform
           ARGS="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity \
-                --set identity-plane.oidc.patSecret.value=dummy \
+                --set identity-plane.authzAdmin.adminToken=ci-dummy \
                 --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.postgres.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.controlPlane.auth.token=ci-dummy \

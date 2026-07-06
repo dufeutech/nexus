@@ -1,39 +1,37 @@
 # Identity Enrichment Plane — Helm values.
 #
 # This chart deploys the components THIS repo owns: the edge (Envoy + the Rust
-# identity sidecar, co-located for hot-path latency), the sync-worker, and the
-# reconciler. The durable store (Postgres — source of truth + seq-cursor change
-# feed over LISTEN/NOTIFY, RFC C4) is EXTERNAL, wired in via `postgres:` below.
+# identity sidecar, co-located for hot-path latency), the authz-admin authorization
+# authoring surface, and the membership-sync projection worker. The durable store
+# (Postgres — source of truth + seq-cursor change feed over LISTEN/NOTIFY, RFC C4) is
+# EXTERNAL, wired in via `postgres:` below.
 #
-# It treats ZITADEL, its Postgres, and the protected backend as EXTERNAL
-# dependencies you point at via config (see `zitadel:` and `backend:` below).
-# ZITADEL ships its own official Helm chart — run it (or a managed instance)
-# separately and wire its issuer/JWKS/admin-PAT in here.
+# It treats the OIDC provider, its Postgres, and the protected backend as EXTERNAL
+# dependencies you point at via config (see `oidc:` and `backend:` below). The
+# provider answers ONLY "who am I" (authentication + basic profile); nexus authors
+# ALL authorization itself (nexus-native-authorization). Run the provider (e.g.
+# ZITADEL's official Helm chart, or a managed instance) separately and wire its
+# issuer/JWKS in here — no admin PAT or directory integration is needed.
 
 # -------------------------------------------------------------------------- #
 # Images. The lab builds these from source (`build:` in docker-compose); for
 # k8s you MUST build and push them to a registry you control, then set the refs
-# here. There is no public image for the sidecar/worker/reconciler.
+# here. There is no public image for the sidecar/authz-admin/membership-sync.
 # -------------------------------------------------------------------------- #
 images:
   # All three are built from the one ../../identity-rs workspace (shared `core`
   # crate), selected by Docker build target:
-  #   docker build --target sidecar     -t REGISTRY/identity-sidecar-rs:0.1.0  ../../identity-rs
-  #   docker build --target sync-worker -t REGISTRY/identity-sync-worker:0.1.0 ../../identity-rs
-  #   docker build --target reconciler  -t REGISTRY/identity-reconciler:0.1.0  ../../identity-rs
+  #   docker build --target sidecar         -t REGISTRY/identity-sidecar-rs:0.1.0      ../../identity-rs
+  #   docker build --target authz-admin     -t REGISTRY/identity-authz-admin:0.1.0     ../../identity-rs
+  #   docker build --target membership-sync -t REGISTRY/identity-membership-sync:0.1.0 ../../identity-rs
   sidecar:
     repository: REGISTRY/identity-sidecar-rs
     tag: ""            # defaults to .Chart.AppVersion when empty
     pullPolicy: IfNotPresent
-  syncWorker:
-    repository: REGISTRY/identity-sync-worker
+  authzAdmin:
+    repository: REGISTRY/identity-authz-admin
     tag: ""
     pullPolicy: IfNotPresent
-  reconciler:
-    repository: REGISTRY/identity-reconciler
-    tag: ""
-    pullPolicy: IfNotPresent
-  #   docker build --target membership-sync -t REGISTRY/identity-membership-sync:0.1.0 ../../identity-rs
   membershipSync:
     repository: REGISTRY/identity-membership-sync
     tag: ""
@@ -59,13 +57,13 @@ oidc:
   # Public issuer exactly as the provider mints it into the `iss` claim. Envoy's
   # jwt_authn rejects any token whose issuer differs. e.g. https://auth.example.com
   issuer: "https://auth.example.com"
-  # In-cluster endpoint Envoy/sync-worker/reconciler actually dial. The JWKS is
-  # fetched here while the `Host` header is set to the issuer's authority, so we
-  # avoid egress TLS and the provider's external-domain Host check still passes
-  # (the load-bearing trick from the lab's envoy.yaml). (The sync-worker/reconciler
-  # reuse this as the directory Management-API base until that integration is
-  # removed in change oidc-agnostic-identity-source.)
-  internalUrl: "http://zitadel.zitadel.svc.cluster.local:8080"
+  # In-cluster endpoint Envoy actually dials for the JWKS. The JWKS is fetched here
+  # while the `Host` header is set to the issuer's authority, so we avoid egress TLS
+  # and the provider's external-domain Host check still passes (the load-bearing
+  # trick from the lab's envoy.yaml). This is the ONLY thing nexus dials the provider
+  # for — token verification. There is NO directory integration (no admin PAT, no
+  # Management API): authorization is nexus-authored (nexus-native-authorization).
+  jwksInternalUrl: "http://zitadel.zitadel.svc.cluster.local:8080"
   # Host header value sent on the JWKS fetch — must equal the issuer authority.
   # Defaults to the issuer's host:port when empty.
   jwksHost: ""
@@ -85,10 +83,10 @@ oidc:
   jwksTls:
     # Fetch the JWKS over TLS with server-certificate verification (Envoy
     # UpstreamTlsContext on the oidc_jwks cluster: trusted CA + SNI + SAN
-    # match). oidc.internalUrl must then point at a TLS port.
+    # match). oidc.jwksInternalUrl must then point at a TLS port.
     enabled: false
     # SNI + certificate SAN the server must present. Defaults to the dialed
-    # host (oidc.internalUrl authority) when empty; set it when the cert is
+    # host (oidc.jwksInternalUrl authority) when empty; set it when the cert is
     # issued for a different name (e.g. the public issuer host).
     sni: ""
     # CA bundle (inside the Envoy container) used to verify the server chain.
@@ -100,16 +98,6 @@ oidc:
   # plaintext JWKS fetch is acceptable. This is an ACKNOWLEDGMENT, not a
   # control — prefer jwksTls. One of the two must be set or rendering fails.
   jwksPlaintextTrustedPath: false
-  # Admin service-account PAT used by sync-worker (register webhook) and
-  # reconciler (list users/grants). Provide via an existing Secret (recommended)
-  # or inline (discouraged — ends up in the release manifest).
-  patSecret:
-    # Name of a pre-created Secret holding the PAT. Leave empty to have the
-    # chart create one from `patSecret.value`.
-    existingSecret: ""
-    key: "pat"
-    # Inline PAT — used only when existingSecret is empty. PREFER existingSecret.
-    value: ""
 
 # -------------------------------------------------------------------------- #
 # Backend — the protected upstream Envoy routes to after enrichment (your app).
@@ -220,28 +208,35 @@ sidecar:
   rustLog: "info"
 
 # -------------------------------------------------------------------------- #
-# Sync worker (real-time webhook -> KV). Self-registers an Actions v2 webhook
-# on startup, so ZITADEL must be able to reach its Service (selfUrl below).
+# authz-admin — the nexus-native authorization authoring surface
+# (nexus-native-authorization). The SINGLE source of record for
+# roles/entitlements/suspension; it writes them into the identity Profile store and
+# the sidecar picks them up over the change feed within seconds. The OIDC provider is
+# NEVER an authorization source. Keep it on an administrative boundary.
 # -------------------------------------------------------------------------- #
-syncWorker:
-  replicas: 1                   # webhook target is single-owner; >1 splits the signing key
+authzAdmin:
+  # Set false to skip the authoring surface (e.g. if authorization is provisioned
+  # out-of-band via your own AuthzAuthoring adapter). Default true.
+  enabled: true
+  replicas: 1                   # not on the hot path; idempotent writes
   logFormat: "json"
   logLevel: "INFO"
-  resources:
-    requests: { cpu: "50m", memory: "64Mi" }
-    limits: { cpu: "500m", memory: "128Mi" }
-  # URL ZITADEL calls back. Defaults to the in-cluster Service DNS when empty.
-  selfUrl: ""
-
-# -------------------------------------------------------------------------- #
-# Reconciler (periodic authoritative diff -> KV; closes the no-retry gap, C8).
-# -------------------------------------------------------------------------- #
-reconciler:
-  replicas: 1
-  intervalSeconds: 600          # RFC §6.2
-  pageLimit: 1000
-  logFormat: "json"
-  logLevel: "INFO"
+  # Admin bearer-token gate, fail-closed (like the routing control-plane's
+  # CONTROL_AUTH_TOKEN). Provide the token via an existing Secret (preferred) or
+  # inline (chart wraps it in a managed Secret). Rendering REQUIRES one of:
+  # adminToken, existingSecret, or authDisabled=true.
+  existingSecret: ""            # Secret holding the token; key below
+  existingSecretKey: "token"
+  # Inline token — used only when existingSecret is empty. PREFER existingSecret.
+  adminToken: ""
+  # Set true ONLY on a trusted network / dev to run the surface UNAUTHENTICATED.
+  authDisabled: false
+  # Bootstrap the first administrator (nexus-native-authorization R4): the subject
+  # `sub` granted `adminRole` at startup IFF no administrator exists yet (idempotent
+  # break-glass). Empty bootstrapAdminSub => no seed; author the first grants via the
+  # admin API. Rotate/disable the bootstrap after a real admin is authored.
+  adminRole: "admin"
+  bootstrapAdminSub: ""
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
     limits: { cpu: "500m", memory: "128Mi" }

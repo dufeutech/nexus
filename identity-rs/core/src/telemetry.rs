@@ -1,6 +1,6 @@
 //! telemetry — the ONE place the identity plane assembles observability.
 //!
-//! Every identity-plane binary (sidecar, sync-worker, reconciler, membership-sync)
+//! Every identity-plane binary (sidecar, authz-admin, membership-sync)
 //! calls [`init`] once at startup and holds the returned [`TelemetryGuard`] for the
 //! process lifetime. This is the box-telemetry-contract made first-party: one
 //! endpoint, all signals, standard resource identity, trace-correlated logs,

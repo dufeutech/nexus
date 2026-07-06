@@ -12,7 +12,7 @@ Filter order is load-bearing:
 */ -}}
 {{- $iv := index .Values "identity-plane" -}}
 {{- $rv := index .Values "routing-plane" -}}
-{{- $u := $iv.oidc.internalUrl | trimPrefix "http://" | trimPrefix "https://" | trimSuffix "/" -}}
+{{- $u := $iv.oidc.jwksInternalUrl | trimPrefix "http://" | trimPrefix "https://" | trimSuffix "/" -}}
 {{- $zHost := $u -}}
 {{- $zPort := "8080" -}}
 {{- if contains ":" $u -}}
@@ -194,7 +194,6 @@ data:
                               - remove: "x-user-id"
                               - remove: "x-user-org"
                               - remove: "x-user-roles"
-                              - remove: "x-user-roles-source"
                               - remove: "x-user-entitlements"
                               - remove: "x-user-suspended"
                               - remove: "x-user-enriched-by"

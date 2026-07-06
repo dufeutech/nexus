@@ -37,9 +37,9 @@ jobs:
       matrix:
         include:
           # Identity plane — one workspace, three targets (../identity-rs)
-          - { name: identity-sidecar-rs,  context: identity-rs, target: sidecar }
-          - { name: identity-sync-worker, context: identity-rs, target: sync-worker }
-          - { name: identity-reconciler,  context: identity-rs, target: reconciler }
+          - { name: identity-sidecar-rs,     context: identity-rs, target: sidecar }
+          - { name: identity-authz-admin,    context: identity-rs, target: authz-admin }
+          - { name: identity-membership-sync, context: identity-rs, target: membership-sync }
           # Routing plane — one workspace, two targets (../routing-rs)
           - { name: tenant-router,        context: routing-rs,  target: tenant-router }
           - { name: control-plane,        context: routing-rs,  target: control-plane }

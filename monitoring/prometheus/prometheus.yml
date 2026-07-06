@@ -23,7 +23,7 @@ storage:
     out_of_order_time_window: 30m
 
 # first-party-telemetry (Change B): the first-party Rust services (tenant-router,
-# control-plane, identity-sidecar, sync-worker, reconciler, membership-sync) NO
+# control-plane, identity-sidecar, authz-admin, membership-sync) NO
 # LONGER expose scrape endpoints — they PUSH OTLP metrics through the collector to
 # Prometheus's native OTLP receiver (see the `otlp:` block above). Their scrape jobs
 # were retired here. Only Envoy (its own /stats) and Prometheus self-scrape remain.

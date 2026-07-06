@@ -163,9 +163,21 @@ resource-ownership checks.
 | `x-workspace-id`                                   | the **authorized acting workspace** (live membership check)        | shipped (`x-tenant-id` = legacy fallback only — pin the rename) |
 | `x-user-id`                                        | the user, for audit                                                | shipped                       |
 | `x-user-roles`, `x-user-entitlements`, `x-auth-method` | enrichment inputs (also enforced at the edge per-route, N4 Phase 2) | shipped (injected + enforced) |
+| `x-user-suspended`                                 | whether nexus has suspended the subject (live, revocation within seconds) | shipped |
 | `x-auth-required`, `x-auth-requires-*`, `x-auth-min-aal` | edge-internal policy signals (jwt_authn branch + sidecar 403 gate); stripped, never reach boxes | shipped                       |
 | `x-identity-contract: v1`                          | versioned contract stamp = the acting-org tripwire (a valid `vN` carries acting `x-workspace-id` + `x-user-type`); boxes reject unknown/absent versions on enriched routes | shipped (the backend must switch its check to this — N5) |
 | `traceparent`                                      | W3C trace context, **always edge-rooted** (client copies stripped; sampled flag = the edge's head decision) | shipped (boxes still fail open when absent) |
+
+> **AuthN vs. AuthZ (change `oidc-agnostic-identity`, 2026-07-06).** The OIDC provider
+> answers only "who am I" (authentication + basic profile); **nexus authors ALL
+> authorization** — `x-user-roles`, `x-user-entitlements`, and `x-user-suspended` come
+> from the nexus-native authorization store via the resolver, **never from the token or
+> the provider** (`nexus-native-authorization`). The header *shape* is unchanged, so
+> boxes need no change; two contract facts to pin: (1) a provider-asserted `roles` claim
+> now confers nothing (deny-by-default — a subject with no nexus grant is authenticated
+> but unprivileged), and (2) the `x-user-roles-source` header is **retired** (the source
+> is always nexus now). Roles/entitlements/suspension are provisioned through the
+> identity-plane `authz-admin` surface.
 
 ---
 
@@ -220,7 +232,7 @@ with no custom telemetry code.
 
 **First-party services are compliant boxes too (Change B — `first-party-telemetry`,
 2026-07-05).** The nexus Rust planes — tenant-router, control-plane, identity sidecar,
-sync-worker, reconciler, membership-sync — now emit all three signals through the same
+authz-admin, membership-sync — now emit all three signals through the same
 one endpoint: they continue the edge-rooted trace on the ext_proc hot path (the routing
 and enrichment spans sit inside the edge trace, no first-party hole), stamp `trace_id`
 on their logs, and push RED + operational metrics to the collector (their Prometheus
