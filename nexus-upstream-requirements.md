@@ -1,14 +1,13 @@
 # Nexus upstream integration requirements
 
-Requirements that downstream consumers — **toolify** (infra/entry), **jsbox/runlet** (the
-first backend box), and every future box on the internal network — place on **nexus**, plus
-the header contract nexus publishes back to them. nexus is the authoritative core: routing,
-domain lifecycle, identity enrichment, and edge policy live here; boxes stay thin and trust
-the headers the edge injects.
+Requirements that downstream consumers — **toolify** (infra/entry) and the **backend
+services** ("boxes") on the internal network — place on **nexus**, plus the header contract
+nexus publishes back to them. nexus is the authoritative core: routing, domain lifecycle,
+identity enrichment, and edge policy live here; boxes stay thin and trust the headers the
+edge injects. The contract is service-agnostic — any backend in any language is a box.
 
-**This file is canonical in the nexus repo.** Consumers (jsbox today) keep a mirror of the
-sections that concern them; any change here must be reflected there ("pin any rename in
-both repos").
+**This file is canonical in the nexus repo.** Consumers keep a mirror of the sections that
+concern them; any change here must be reflected there ("pin any rename in both repos").
 
 ---
 
@@ -20,7 +19,7 @@ both repos").
 | **N2** | ✅ SHIPPED                   | `routing-rs/control-plane/src/main.rs` — `/domains/declare`, `/domains/{d}/verify`, leader-elected TXT poll |
 | **N3** | finding only                 | no work — kept below in case wildcard tiers are ever wanted                                                |
 | **N4** | ✅ SHIPPED (both phases)     | phase 1 auth gate + phase 2 role/entitlement/AAL gate (change `edge-role-entitlement-gate`, 2026-07-02)    |
-| **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **open action is jsbox-side** |
+| **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **open action is backend-side** |
 | **N6** | ✅ SHIPPED                   | edge-rooted W3C tracing (change `edge-rooted-tracing`, 2026-07-03): Envoy OTel tracer → collector → Tempo; client trace context stripped at C3 |
 
 ---
@@ -76,7 +75,7 @@ All three names are in the C3 strip list. An anonymous caller on a gated route
 still gets the Phase-1 **401** (requirements imply authentication), so
 authorization policy is never disclosed to anonymous callers. Rollout order:
 sidecar (enforcer) before tenant-router (emitter) — pinned in `deploy/README.md`'s
-production checklist. Backends like jsbox keep only resource-ownership checks;
+production checklist. Backends keep only resource-ownership checks;
 role/plan route gates are the edge's job now, both phases.
 
 Default = pass-through: **no rows for a workspace means `auth: none`** (the `/` row is an
@@ -87,10 +86,10 @@ constraints; gating is opt-in.
 
 ## Open work in nexus
 
-### N5 — acting-org assurance — ✅ shipped in nexus (superseded form); **open action is jsbox-side**
+### N5 — acting-org assurance — ✅ shipped in nexus (superseded form); **open action is backend-side**
 
 Both halves of N5 are live in nexus, but the tripwire shipped in a different (better)
-form than the original ask, and jsbox must adapt to it (decided 2026-07-02):
+form than the original ask, and the consuming backend must adapt to it (decided 2026-07-02):
 
 - **Semantics (shipped):** the identity sidecar authors the acting workspace from a
   **live membership check** of the resolved workspace (`identity-rs/sidecar/src/main.rs`,
@@ -107,15 +106,15 @@ form than the original ask, and jsbox must adapt to it (decided 2026-07-02):
   client-supplied `x-identity-contract` (C3), and header-shape drift is a version bump
   that fails closed on partial rollout.
 
-**jsbox action (the remaining N5 work, box-side):** replace runlet's
+**Backend action (the remaining N5 work, box-side):** replace the legacy
 `x-tenant-scope == acting` check with the contract check — reject a tenant-scoped
 request unless `x-identity-contract` is an accepted version (`v1` today) AND the acting
 `x-workspace-id` + `x-user-type` are present; else `403`. Equivalent strength (both are
 trusted-boundary tripwires, not cryptographic proof). Bring-up ordering concern
-disappears: nexus already emits the stamp, so jsbox can switch enforcement any time.
+disappears: nexus already emits the stamp, so a backend can switch enforcement any time.
 Bump `v1` → `v2` in BOTH repos together on any future header-shape change.
 
-**Naming pin (part of the same jsbox action):** nexus injects `x-workspace-id`;
+**Naming pin (part of the same backend action):** nexus injects `x-workspace-id`;
 `x-tenant-id` survives only as a legacy read-fallback inside the sidecar. Boxes read
 `x-workspace-id` (their trusted-header names are configurable box-side).
 
@@ -148,7 +147,7 @@ ONE canonical matching spec that the router and any other gate implement identic
 
 ---
 
-## Downstream header contract (what boxes like jsbox may rely on)
+## Downstream header contract (what any box may rely on)
 
 The edge strips all client-supplied `x-*` before the identity sidecar injects trusted
 headers. Boxes treat these as authoritative and pre-authorized; they add only
@@ -165,7 +164,7 @@ resource-ownership checks.
 | `x-user-id`                                        | the user, for audit                                                | shipped                       |
 | `x-user-roles`, `x-user-entitlements`, `x-auth-method` | enrichment inputs (also enforced at the edge per-route, N4 Phase 2) | shipped (injected + enforced) |
 | `x-auth-required`, `x-auth-requires-*`, `x-auth-min-aal` | edge-internal policy signals (jwt_authn branch + sidecar 403 gate); stripped, never reach boxes | shipped                       |
-| `x-identity-contract: v1`                          | versioned contract stamp = the acting-org tripwire (a valid `vN` carries acting `x-workspace-id` + `x-user-type`); boxes reject unknown/absent versions on enriched routes | shipped (jsbox must switch its check to this — N5) |
+| `x-identity-contract: v1`                          | versioned contract stamp = the acting-org tripwire (a valid `vN` carries acting `x-workspace-id` + `x-user-type`); boxes reject unknown/absent versions on enriched routes | shipped (the backend must switch its check to this — N5) |
 | `traceparent`                                      | W3C trace context, **always edge-rooted** (client copies stripped; sampled flag = the edge's head decision) | shipped (boxes still fail open when absent) |
 
 ---
@@ -173,7 +172,7 @@ resource-ownership checks.
 ## Box telemetry contract (the observability twin of the header contract)
 
 **Published 2026-07-03** (change `box-telemetry-contract`). What any box on the internal
-network — jsbox/runlet today, a Python or Node service tomorrow — can rely on nexus for,
+network — any backend service, in any language — can rely on nexus for,
 and what it must emit to be observable. Anchored on OTLP + the OTel semantic conventions
 so a box in ANY language complies with off-the-shelf instrumentation and zero nexus-side
 integration work.
@@ -259,11 +258,11 @@ cost ceiling).
 | per-route auth policy resolve + `x-auth-*` emit (N4)                                  | **nexus tenant-router** (resolve/emit) + **control-plane** (policy CRUD)     |
 | per-route 403 gate: role / entitlement / min-AAL enforcement (N4 Phase 2)             | **nexus identity sidecar**                                                   |
 | acting-org authorization + trusted header injection + contract stamp (N5)             | **nexus identity sidecar**                                                   |
-| contract-stamp enforcement (`x-identity-contract` version check)                      | **backend boxes** (jsbox/runlet, …)                                          |
+| contract-stamp enforcement (`x-identity-contract` version check)                      | **backend boxes** (any downstream service)                                   |
 | trace rooting + `traceparent` injection (N6)                                          | **nexus edge (Envoy)** + monitoring collector                                |
 | telemetry collection endpoint + stores + Grafana pivot (box telemetry contract)       | **nexus monitoring stack** (collector/Tempo/Prometheus/Loki)                 |
-| contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (jsbox/runlet, any future service) **+ the nexus first-party planes** (Change B) |
+| contract-compliant emission (identity attrs, RED histograms, correlated logs, hygiene) | **backend boxes** (any downstream service) **+ the nexus first-party planes** (Change B) |
 | authentication method (password/passkey/MFA/social/SSO)                               | **ZITADEL** (per-org login policy)                                           |
 | ingress `edge.<base_domain>`, shared cert store, Caddy on-demand wiring, `plan→limit` | **toolify / infra**                                                          |
 | `CNAME <domain> → edge.<base_domain>` + the `_nexus-challenge` TXT                    | **tenant**                                                                   |
-| resource ownership ("does this user own THIS order"), scope-header enforcement       | **backend boxes** (jsbox/runlet, …)                                          |
+| resource ownership ("does this user own THIS order"), scope-header enforcement       | **backend boxes** (any downstream service)                                   |

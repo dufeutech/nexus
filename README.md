@@ -18,7 +18,7 @@ Three planes plus one edge. Everything is Rust; the edge is stock Envoy driven b
 ```mermaid
 flowchart LR
     client([Client])
-    box([Box<br/>jsbox · runlet · your service])
+    box([Box<br/>any downstream service])
 
     subgraph edge["The edge — Envoy"]
         direction TB

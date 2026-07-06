@@ -1,7 +1,7 @@
 # Box consumer contract
 
 **Audience:** anyone building or operating a "box" — a backend that sits behind the nexus
-edge (jsbox, runlet, or any Python/Node/Go service). This is the complete wire reference for
+edge (any Python/Node/Go/… service). This is the complete wire reference for
 the trusted headers the edge injects and what your box must do with them.
 
 This document is the **header-level companion** to the canonical
