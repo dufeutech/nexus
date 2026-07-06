@@ -1,0 +1,12 @@
+{
+  "//": "SeaweedFS S3 identities — the object-storage tier's well-known LAB credentials (telemetry-cost-controls). Deliberately-insecure loopback lab posture, exactly like the Password1!/masterkey defaults in docker-compose.yaml. In PRODUCTION the stores point the SAME config at a cloud object store (S3/GCS) or a self-hosted SeaweedFS via env (TELEMETRY_S3_*); this file is never used there. One identity with full actions: the only clients are the stores (Tempo blocks, Loki chunks), which create/read/write their own buckets.",
+  "identities": [
+    {
+      "name": "nexus-lab",
+      "credentials": [
+        { "accessKey": "nexuslab", "secretKey": "nexuslabsecret" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

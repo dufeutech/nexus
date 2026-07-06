@@ -16,15 +16,27 @@ server:
   http_listen_port: 3100
 
 common:
-  # Single-binary, local-disk lab shape — the same minimal-ops default as
-  # Tempo. Object storage is the production-scale option; swapping is a config
-  # change here only (single-egress: producers never notice).
+  # Object-storage backend (telemetry-cost-controls): chunks + index live on an
+  # S3-compatible tier — cheap, scalable, decoupled from any host's disk. The
+  # lab tier is the in-network SeaweedFS emulator; production points the SAME
+  # config at cloud object storage (S3/GCS) by changing TELEMETRY_S3_* env only.
+  # Endpoint/bucket/creds are env (resolved by -config.expand-env), never
+  # literals (single-egress discipline). Only the WAL/compactor scratch stays on
+  # local disk (path_prefix below).
   replication_factor: 1
   path_prefix: /loki
   storage:
-    filesystem:
-      chunks_directory: /loki/chunks
-      rules_directory: /loki/rules
+    s3:
+      endpoint: ${TELEMETRY_S3_ENDPOINT}
+      bucketnames: ${LOKI_S3_BUCKET}
+      region: ${TELEMETRY_S3_REGION}
+      access_key_id: ${TELEMETRY_S3_ACCESS_KEY}
+      secret_access_key: ${TELEMETRY_S3_SECRET_KEY}
+      # Lab: plaintext http to the in-network emulator + path-style addressing
+      # (SeaweedFS and most S3-compatible stores). Prod over https sets
+      # TELEMETRY_S3_INSECURE=false.
+      insecure: ${TELEMETRY_S3_INSECURE}
+      s3forcepathstyle: true
   ring:
     kvstore:
       store: inmemory
@@ -32,10 +44,10 @@ common:
 schema_config:
   configs:
     # v13 + TSDB: the schema line that supports structured metadata (which the
-    # native OTLP endpoint requires).
+    # native OTLP endpoint requires). object_store is the S3 tier above.
     - from: "2024-04-01"
       store: tsdb
-      object_store: filesystem
+      object_store: s3
       schema: v13
       index:
         prefix: index_
@@ -44,15 +56,38 @@ schema_config:
 limits_config:
   # Required for native OTLP ingestion (trace_id et al. live here).
   allow_structured_metadata: true
-  # Logs outlive traces on purpose: traces settled on 48h as a debugging
-  # signal; logs are the investigation trail — 7 days is the lab default. A config
-  # value, not a contract term; retention economics is Change C.
-  retention_period: 168h
+  # Retention as an OWNED budget (telemetry-cost-controls): logs outlive traces
+  # on purpose — traces settled on 48h as a debugging signal; logs are the
+  # investigation trail. This is an explicit, stated value (env-driven), not an
+  # implicit default; the compactor reclaims data past the window on the object
+  # tier.
+  retention_period: ${LOKI_RETENTION_PERIOD}
+  # Log volume/noise ceiling (telemetry-cost-controls): bound what any one
+  # producer can cost store-side, where Loki's limits are most mature. A box
+  # that floods logs has its OWN excess refused (429 → its exporter buffers/drops
+  # fail-open); other producers' logs arrive intact, and the shared store + bill
+  # are protected. Discards are reported via loki_discarded_samples_total{reason}
+  # (scraped — see prometheus.yml), so an engaged ceiling is observable, never a
+  # silent gap. Lab-sized values; raise via env for real traffic.
+  #   · per-stream caps bound a single noisy stream (one service.name/env).
+  ingestion_rate_mb: ${LOKI_INGESTION_RATE_MB}
+  ingestion_burst_size_mb: ${LOKI_INGESTION_BURST_MB}
+  per_stream_rate_limit: ${LOKI_PER_STREAM_RATE}
+  per_stream_rate_limit_burst: ${LOKI_PER_STREAM_BURST}
+  #   · stream/label caps bound cardinality of the log store itself.
+  max_streams_per_user: ${LOKI_MAX_STREAMS}
+  max_label_names_per_series: ${LOKI_MAX_LABEL_NAMES}
+  max_line_size: ${LOKI_MAX_LINE_SIZE}
+  # Reject far-out-of-window timestamps (a cheap noise/abuse guard); bounded to
+  # the retention window.
+  reject_old_samples: true
+  reject_old_samples_max_age: ${LOKI_RETENTION_PERIOD}
 
 compactor:
   working_directory: /loki/compactor
   retention_enabled: true
-  delete_request_store: filesystem
+  # Delete-request markers live on the object tier now (was filesystem).
+  delete_request_store: s3
 
 analytics:
   reporting_enabled: false

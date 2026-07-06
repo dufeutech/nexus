@@ -22,39 +22,34 @@ storage:
     # out-of-order window is the documented companion to the OTLP receiver.
     out_of_order_time_window: 30m
 
+# first-party-telemetry (Change B): the first-party Rust services (tenant-router,
+# control-plane, identity-sidecar, sync-worker, reconciler, membership-sync) NO
+# LONGER expose scrape endpoints — they PUSH OTLP metrics through the collector to
+# Prometheus's native OTLP receiver (see the `otlp:` block above). Their scrape jobs
+# were retired here. Only Envoy (its own /stats) and Prometheus self-scrape remain.
 scrape_configs:
-  - job_name: identity-sidecar-rs
-    # Prefer protobuf so native histograms are scraped (they don't exist in text).
-    scrape_protocols:
-      ["PrometheusProto", "OpenMetricsText1.0.0", "PrometheusText0.0.4"]
-    static_configs:
-      - targets: ["identity-sidecar-rs:9202"]
-
   - job_name: envoy
     metrics_path: /stats/prometheus
     static_configs:
       - targets: ["envoy:9901"]
 
-  - job_name: sync-worker
-    metrics_path: /metrics
-    static_configs:
-      - targets: ["sync-worker:8080"]
-
-  - job_name: reconciler
-    static_configs:
-      - targets: ["reconciler:9000"]
-
-  # --- routing plane ---
-  - job_name: tenant-router
-    static_configs:
-      - targets: ["tenant-router:9302"]
-
-  - job_name: control-plane
-    metrics_path: /metrics
-    # Metrics are on the ops port :9401, kept off the admin API port :9400.
-    static_configs:
-      - targets: ["control-plane:9401"]
-
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
+
+  # Cost-ceiling observability (telemetry-cost-controls): the collector's own
+  # self-telemetry (:8888) — accepted/refused/dropped points per processor,
+  # memory_limiter engagement, exporter send failures. This is where an engaged
+  # egress ceiling is visible: otelcol_processor_refused_metric_points rising =
+  # the volume/memory guard is dropping load; a flat metric-series count under a
+  # cardinality bomb = the transform guard is collapsing attributes.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # Log-store ceiling observability: Loki reports refused/discarded log volume
+  # via loki_discarded_samples_total{reason=...} when limits_config engages — so
+  # a bounded log flood is a positive, queryable signal, never a silent gap.
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]

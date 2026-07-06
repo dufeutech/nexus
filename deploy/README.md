@@ -231,6 +231,86 @@ must emit — is the "Box telemetry contract" section of
   resume on their own when the collector returns. Producers deliberately do
   not `depends_on` the collector.
 
+## Telemetry cost controls (the cost posture of the stack)
+
+The stack above is functionally complete; this is its **cost shape** (change
+`telemetry-cost-controls`). Two bill problems are solved by standard
+configuration of the stores/collector already running — nothing hand-built, no
+producer change: the **baseline** (volume × retention × storage tier) and the
+**worst case** (one box adds an unbounded label or a chatty log and the series
+count / log volume explode). It is config-first and rolls back to local disk by
+reverting config only; the emission contract and every producer are untouched.
+
+**Cluster (helm) pattern — identical to how tracing and the box contract
+shipped: the object-storage tier is EXTERNAL to the charts, exactly like
+Prometheus/Postgres.** There are **no chart code changes** and none are needed:
+
+- **Object storage is an external dependency you operate.** Point the stores at
+  your cloud object store (S3/GCS) or a self-hosted SeaweedFS via the **same
+  store config the lab uses**, differing only by endpoint + credentials supplied
+  through env / a Secret — never a literal in a manifest. The stores are the only
+  clients; producers never learn the address (single-egress discipline).
+
+  | Env (both stores)        | Lab default            | Production                              |
+  | ------------------------ | ---------------------- | --------------------------------------- |
+  | `TELEMETRY_S3_ENDPOINT`  | `seaweedfs:8333`       | your S3/GCS endpoint (or self-hosted)   |
+  | `TELEMETRY_S3_ACCESS_KEY`/`_SECRET_KEY` | well-known lab creds | from a Secret, never inline |
+  | `TELEMETRY_S3_REGION`    | `us-east-1`            | your region                             |
+  | `TELEMETRY_S3_INSECURE`  | `true` (lab http)      | `false` (https)                         |
+  | `TEMPO_S3_BUCKET` / `LOKI_S3_BUCKET` | `tempo-traces` / `loki-chunks` | your buckets (pre-create them) |
+
+- **The lab bundles a self-contained S3 tier** (SeaweedFS + a one-shot bucket
+  seeder in `../docker-compose.yaml`) so a clean `docker compose up` runs the
+  **same cost topology** with no cloud account. Production is the same config
+  with the env above repointed. (SeaweedFS is the mature, Apache-2.0 MinIO
+  replacement after MinIO Community Edition was archived; adopt, never build.)
+
+- **Pin the collector image.** Cost control graduated the collector **core →
+  contrib** (the metric cardinality guard uses the contrib-only `transform`
+  processor). Pin `otel/opentelemetry-collector-contrib` to a concrete tag
+  (`OTELCOL_VERSION` in compose; the image tag in your workload spec) — a
+  deliberate, provenance-changing bump, re-run the cost-ceiling checks.
+
+**The cost model — what you are paying for and the knobs that bound it:**
+
+- **Storage tier:** all three signals on object storage (Tempo blocks + Loki
+  chunks/index on S3; Prometheus keeps its local TSDB — object-store/downsampled
+  metrics via Mimir/Thanos is the deferred successor). ~10–20× cheaper per GB
+  than host disk and decoupled from any one host.
+
+- **Per-signal retention — an owned budget, not a default** (each a config value;
+  the store reclaims past the window automatically):
+
+  | Signal  | Store      | Retention (env)                        | Why                                   |
+  | ------- | ---------- | -------------------------------------- | ------------------------------------- |
+  | Traces  | Tempo (S3) | **48h** (`TEMPO_BLOCK_RETENTION`)      | short-lived debugging signal          |
+  | Logs    | Loki (S3)  | **7d** (`LOKI_RETENTION_PERIOD`)       | investigation trail                   |
+  | Metrics | Prometheus | **15d** (`PROM_RETENTION`)             | cheapest by volume → longest window   |
+
+- **Egress cost ceiling — bounds what any one producer can cost, so a misbehaving
+  box degrades its OWN fidelity, never the shared bill/store/request path:**
+  - **Metric cardinality guard** (collector `transform`/`keep_keys`): a datapoint's
+    attributes are collapsed to an **allow-list** — identity (`service.*`) + RED
+    (`http.request.method`, `http.response.status_code`, `http.route`,
+    `rpc.grpc.status_code`, …). An unbounded label (`user_id`, raw path, request
+    id) is dropped at the egress before Prometheus. The allow-list lives in one
+    place (`monitoring/otel-collector/otel-collector.yaml`) — start permissive,
+    tighten with evidence; a change is a config edit, never a producer redeploy.
+  - **Log volume/noise caps** (Loki `limits_config`): per-stream ingestion-rate +
+    burst, max streams, max label names, max line size (`LOKI_*` env). A chatty
+    box's excess is refused (429 → its exporter buffers/drops, fail-open).
+  - **`memory_limiter`** on the collector so a volume flood can't OOM it.
+  - **An engaged ceiling is observable, never a silent gap:** the collector
+    exports its own pipeline counters (`otelcol_processor_*` — accepted / refused /
+    dropped points) on `:8888`, and Loki reports `loki_discarded_samples_total`
+    `{reason="rate_limited"}`; both are scraped (`monitoring/prometheus/prometheus.yml`).
+
+- **Trace cost stays head-governed.** The edge's head-sampling decision
+  (`TRACE_SAMPLING_PCT`) remains the trace cost ceiling — it saves generation +
+  transport + storage. There is **no tail sampling** and no downstream
+  trace-buffering stage (an explicit non-goal): lowering trace cost is the
+  head-sampling rate and the storage tier, nothing stateful added.
+
 ## BREAKING — upgrading to the fail-closed edge guards
 
 Two guards now make previously-implicit security choices explicit. A chart

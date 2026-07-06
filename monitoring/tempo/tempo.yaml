@@ -21,19 +21,35 @@ distributor:
 
 storage:
   trace:
-    # Local-disk storage: minimal-ops lab default. Object storage is the
-    # production-scale option; swapping is a config change here only.
-    backend: local
-    local:
-      path: /var/tempo/blocks
+    # Object-storage backend (telemetry-cost-controls): trace blocks live on an
+    # S3-compatible tier — cheap, scalable, decoupled from any host's disk. The
+    # lab tier is the in-network SeaweedFS emulator; production points the SAME
+    # config at cloud object storage (S3/GCS) by changing TELEMETRY_S3_* env
+    # only — no config edit. Endpoint/bucket/creds are env (resolved by
+    # -config.expand-env), never literals (single-egress discipline). Only the
+    # local WAL stays on disk (write buffer before blocks flush to object store).
+    backend: s3
+    s3:
+      endpoint: ${TELEMETRY_S3_ENDPOINT}
+      bucket: ${TEMPO_S3_BUCKET}
+      region: ${TELEMETRY_S3_REGION}
+      access_key: ${TELEMETRY_S3_ACCESS_KEY}
+      secret_key: ${TELEMETRY_S3_SECRET_KEY}
+      # Lab: plaintext http to the in-network emulator + path-style addressing
+      # (SeaweedFS and most S3-compatible stores). Prod over TLS sets insecure
+      # false via env if the endpoint is https.
+      insecure: ${TELEMETRY_S3_INSECURE}
+      forcepathstyle: true
     wal:
       path: /var/tempo/wal
 
-# Short retention on purpose: traces are a debugging signal, not the audit
-# record — the audit access log owns long retention (see the phase-4 roadmap
-# in openspec/changes/edge-rooted-tracing/design.md). Tempo 3 sets retention
-# as a per-tenant override (the standalone `compactor` block is gone).
+# Retention as an OWNED budget (telemetry-cost-controls): 48h is an explicit,
+# stated value, not a default — traces are a short-lived debugging signal, not
+# the audit record (the audit access log owns long retention; see the phase-4
+# roadmap in openspec/changes/edge-rooted-tracing/design.md). The compactor
+# reclaims blocks older than this window on the object tier. Tempo 3 sets
+# retention as a per-tenant override (the standalone `compactor` block is gone).
 overrides:
   defaults:
     compaction:
-      block_retention: 48h
+      block_retention: ${TEMPO_BLOCK_RETENTION}

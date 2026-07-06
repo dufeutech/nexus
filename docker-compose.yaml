@@ -99,6 +99,8 @@ services:
       ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
       WEBHOOK_SELF_URL: http://sync-worker:8080/webhook
       PAT_FILE: /machinekey/zitadel-admin-sa.pat
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     volumes:
       - ./machinekey:/machinekey:ro
     depends_on:
@@ -120,6 +122,8 @@ services:
       ZITADEL_HOST: localhost:${ZITADEL_EXTERNALPORT:-8080}
       PAT_FILE: /machinekey/zitadel-admin-sa.pat
       RECONCILE_INTERVAL: "30"   # ~600 in prod (RFC §6.2); short here to observe
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     volumes:
       - ./machinekey:/machinekey:ro
     depends_on:
@@ -144,6 +148,8 @@ services:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       ROUTING_PG_RO_URL: postgres://postgres:postgres@postgres:5432/zitadel
       MEMBERSHIP_BACKSTOP_INTERVAL: "30"   # ~600 in prod; short here to observe
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     depends_on:
       postgres:
         condition: service_healthy
@@ -211,6 +217,8 @@ services:
       # deliberately-insecure loopback lab — same posture as Password1! above);
       # override via the CONTROL_AUTH_TOKEN env for anything beyond loopback.
       CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
       - "9400:9400"   # admin API (domains/tenants) + healthz
       - "9401:9401"   # ops: /metrics + /healthz (scraped by Prometheus)
@@ -234,6 +242,10 @@ services:
       ROUTING_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       REDIS_URL: redis://redis:6379
       ROUTING_CACHE_TTL: ${ROUTER_CACHE_TTL:-600}
+      # first-party-telemetry: the ONE telemetry address (OTLP/gRPC to the collector).
+      # Unset would disable export and log to stdout exactly as before.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
       - "9300:9300"   # resolve debug API + healthz
       - "9302:9302"   # metrics
@@ -327,6 +339,8 @@ services:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/zitadel
       CACHE_TTL_SECONDS: ${SIDECAR_CACHE_TTL:-43200}
       READINESS_DELAY_SECONDS: ${SIDECAR_READINESS_DELAY:-0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)
@@ -419,6 +433,12 @@ services:
       # Push-path metrics ingestion (box-telemetry-contract): the collector
       # forwards boxes' OTLP metrics here; scrape jobs are unaffected.
       - --web.enable-otlp-receiver
+      # Retention as an OWNED budget (telemetry-cost-controls): metrics are the
+      # cheapest signal by volume, so they keep the longest window — an explicit,
+      # stated value, not the implicit 15d default. Prometheus reclaims TSDB
+      # blocks past this window. Long-term/downsampled metric retention
+      # (Mimir/Thanos) is the deferred successor change.
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-15d}
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -451,7 +471,13 @@ services:
   # telemetry is fail-open (an outage must never affect request handling), and
   # the boxes' bring-up-order contract stays flexible.
   otel-collector:
-    image: otel/opentelemetry-collector:latest
+    # CONTRIB distribution, PINNED (telemetry-cost-controls): the metric
+    # cardinality guard uses the `transform` processor, which lives in contrib
+    # (not core). This is the deliberate core→contrib graduation the
+    # box-telemetry-contract design foresaw ("the contrib switch rides a change
+    # that needs it") — here, cost control. Image provenance changed on purpose
+    # and is pinned; bump deliberately and re-run the cost-ceiling checks.
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_VERSION:-0.135.0}
     container_name: zitadel-lab-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otelcol/otel-collector.yaml"]
@@ -470,40 +496,132 @@ services:
       # (not published).
       - "127.0.0.1:${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318"
       - "127.0.0.1:${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317"
+      # Collector self-telemetry (cost-ceiling observability): its own pipeline
+      # counters — accepted/refused/dropped points, memory_limiter engagement —
+      # exposed for Prometheus to scrape (see prometheus.yml). An engaged ceiling
+      # is observable here, never a silent gap.
+      - "127.0.0.1:${OTEL_COLLECTOR_METRICS_PORT:-8888}:8888"
     depends_on:
       - tempo
       - loki
       - prometheus
 
+  # Object-storage tier (telemetry-cost-controls): SeaweedFS S3 gateway — the
+  # clean-checkout stand-in for cloud object storage (S3/GCS in prod). Apache
+  # 2.0, production-mature; the drop-in MinIO replacement after MinIO Community
+  # Edition was archived (Feb 2026). Written ONLY by the stores (Tempo blocks,
+  # Loki chunks) — no producer knows this address. `server -s3` runs
+  # master+volume+filer+S3 in one process (single-node lab shape). Prod points
+  # Tempo/Loki at real object storage via the SAME env (TELEMETRY_S3_*), no
+  # config edit; this emulator is a lab-only service.
+  seaweedfs:
+    image: chrislusf/seaweedfs:${SEAWEEDFS_VERSION:-3.80}
+    container_name: zitadel-lab-seaweedfs
+    restart: unless-stopped
+    command:
+      - server
+      - -dir=/data
+      - -s3
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -s3.port=8333
+    volumes:
+      - ./monitoring/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweedfs-data:/data:rw
+    ports:
+      # S3 endpoint on loopback for operator/debug (aws --endpoint-url); the
+      # stores reach it in-network (seaweedfs:8333).
+      - "127.0.0.1:${SEAWEEDFS_S3_PORT:-8333}:8333"
+
+  # One-shot: create the per-signal buckets the stores expect (Tempo and Loki do
+  # NOT auto-create buckets). Waits for the S3 API, makes the buckets
+  # idempotently, exits. Tempo/Loki gate on its success so a clean `docker
+  # compose up` comes up deterministically on the object tier. Mirrors the
+  # routing-seed one-shot pattern above.
+  seaweedfs-seed:
+    image: amazon/aws-cli:${AWSCLI_VERSION:-2.17.0}
+    container_name: zitadel-lab-seaweedfs-seed
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${TELEMETRY_S3_ACCESS_KEY:-nexuslab}
+      AWS_SECRET_ACCESS_KEY: ${TELEMETRY_S3_SECRET_KEY:-nexuslabsecret}
+      AWS_REGION: ${TELEMETRY_S3_REGION:-us-east-1}
+    depends_on:
+      - seaweedfs
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        until aws --endpoint-url http://seaweedfs:8333 s3 ls >/dev/null 2>&1; do echo 'waiting for seaweedfs s3'; sleep 2; done;
+        aws --endpoint-url http://seaweedfs:8333 s3 mb "s3://${TEMPO_S3_BUCKET:-tempo-traces}" 2>/dev/null || true;
+        aws --endpoint-url http://seaweedfs:8333 s3 mb "s3://${LOKI_S3_BUCKET:-loki-chunks}" 2>/dev/null || true;
+        echo 'seaweedfs bucket seed complete'
+
   # Log store (box-telemetry-contract): Loki, written ONLY by the collector
   # (native OTLP), read ONLY by Grafana. PINNED: native OTLP ingestion +
   # structured metadata are version-gated (Loki 3.x) — bump deliberately,
-  # re-running the telemetry smoke checks.
+  # re-running the telemetry smoke checks. Storage backend is the object tier
+  # above (telemetry-cost-controls); -config.expand-env resolves TELEMETRY_S3_*.
   loki:
     image: grafana/loki:${LOKI_VERSION:-3.5.3}
     container_name: zitadel-lab-loki
     restart: unless-stopped
-    command: ["-config.file=/etc/loki/loki.yaml"]
+    command: ["-config.file=/etc/loki/loki.yaml", "-config.expand-env=true"]
+    environment:
+      TELEMETRY_S3_ENDPOINT: ${TELEMETRY_S3_ENDPOINT:-seaweedfs:8333}
+      TELEMETRY_S3_REGION: ${TELEMETRY_S3_REGION:-us-east-1}
+      TELEMETRY_S3_ACCESS_KEY: ${TELEMETRY_S3_ACCESS_KEY:-nexuslab}
+      TELEMETRY_S3_SECRET_KEY: ${TELEMETRY_S3_SECRET_KEY:-nexuslabsecret}
+      TELEMETRY_S3_INSECURE: ${TELEMETRY_S3_INSECURE:-true}
+      LOKI_S3_BUCKET: ${LOKI_S3_BUCKET:-loki-chunks}
+      LOKI_RETENTION_PERIOD: ${LOKI_RETENTION_PERIOD:-168h}
+      # Log volume/noise ceiling (telemetry-cost-controls) — lab-sized defaults;
+      # raise for real traffic. See monitoring/loki/loki.yaml limits_config.
+      LOKI_INGESTION_RATE_MB: ${LOKI_INGESTION_RATE_MB:-4}
+      LOKI_INGESTION_BURST_MB: ${LOKI_INGESTION_BURST_MB:-6}
+      LOKI_PER_STREAM_RATE: ${LOKI_PER_STREAM_RATE:-3MB}
+      LOKI_PER_STREAM_BURST: ${LOKI_PER_STREAM_BURST:-5MB}
+      LOKI_MAX_STREAMS: ${LOKI_MAX_STREAMS:-5000}
+      LOKI_MAX_LABEL_NAMES: ${LOKI_MAX_LABEL_NAMES:-15}
+      LOKI_MAX_LINE_SIZE: ${LOKI_MAX_LINE_SIZE:-256KB}
     volumes:
       - ./monitoring/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      # Local scratch only (WAL/compactor working dir); chunks + index live in
+      # object storage now, not this volume.
       - loki-data:/loki:rw
     ports:
       # Query API on loopback for operator/debug queries; Grafana reaches it
       # in-network (loki:3100).
       - "127.0.0.1:${LOKI_HTTP_PORT:-3100}:3100"
+    depends_on:
+      seaweedfs-seed:
+        condition: service_completed_successfully
 
   tempo:
     image: grafana/tempo:latest
     container_name: zitadel-lab-tempo
     restart: unless-stopped
-    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    command: ["-config.file=/etc/tempo/tempo.yaml", "-config.expand-env=true"]
+    environment:
+      TELEMETRY_S3_ENDPOINT: ${TELEMETRY_S3_ENDPOINT:-seaweedfs:8333}
+      TELEMETRY_S3_REGION: ${TELEMETRY_S3_REGION:-us-east-1}
+      TELEMETRY_S3_ACCESS_KEY: ${TELEMETRY_S3_ACCESS_KEY:-nexuslab}
+      TELEMETRY_S3_SECRET_KEY: ${TELEMETRY_S3_SECRET_KEY:-nexuslabsecret}
+      TEMPO_S3_BUCKET: ${TEMPO_S3_BUCKET:-tempo-traces}
+      TEMPO_BLOCK_RETENTION: ${TEMPO_BLOCK_RETENTION:-48h}
+      # Lab: plaintext http to the in-network emulator. Prod over https sets
+      # TELEMETRY_S3_INSECURE=false.
+      TELEMETRY_S3_INSECURE: ${TELEMETRY_S3_INSECURE:-true}
     volumes:
       - ./monitoring/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      # Local scratch only (WAL); trace blocks live in object storage now.
       - tempo-data:/var/tempo:rw
     ports:
       # Query API on loopback for operator/debug queries; Grafana reaches it
       # in-network (tempo:3200).
       - "127.0.0.1:${TEMPO_HTTP_PORT:-3200}:3200"
+    depends_on:
+      seaweedfs-seed:
+        condition: service_completed_successfully
 
 networks:
   # edge-origin-trust: the internal network that makes "backends accept requests
@@ -517,3 +635,7 @@ volumes:
   postgres-data:
   tempo-data:
   loki-data:
+  # Object-storage tier (telemetry-cost-controls): the emulator's backing store.
+  # Lab durability is best-effort (single node); prod relies on the cloud store's
+  # durability. No test depends on this surviving a restart.
+  seaweedfs-data:

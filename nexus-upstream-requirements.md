@@ -225,6 +225,24 @@ scrape endpoints retired; metric names unchanged). The single knob is the same
 first-party RED baseline contract-shaped, which is the prerequisite for the policy layer
 (Change C: SLO targets, burn-rate alerts, keep policy) to build on.
 
+**Cardinality and volume are bounded at the collector — a box cannot blow up the shared
+bill (change `telemetry-cost-controls`, 2026-07-06).** The cost of any one producer is
+now capped at the single egress and the stores, downstream of every box: high-cardinality
+**metric attributes** are collapsed to an identity + RED allow-list at the collector
+(a box that stamps a `user_id`/raw-path/request-id label on a metric has that dimension
+dropped before it reaches the store — its series stay within budget), and **log volume**
+is per-stream rate-limited store-side (a chatty box has its own excess refused, reported
+via `loki_discarded_samples_total`). A misbehaving box degrades **its own** telemetry
+fidelity, never another producer's signals, the shared store, or the request path (the
+guards sit downstream of the fail-open emission contract — nothing here changes what a box
+emits). The stores also run on an **object-storage tier** with explicit, owned per-signal
+retention (traces 48h, logs 7d, metrics 15d — config values, not defaults). Successor work
+is recorded in the change's `design.md` roadmap, not here: long-term/downsampled metric
+retention (Mimir/Thanos), the SLO + burn-rate policy layer on the RED baseline, and
+signal-quality (error-biased) trace retention — the last explicitly a signal feature, not
+a cost lever (tail sampling is a ruled-out non-goal: the edge head decision stays the trace
+cost ceiling).
+
 ---
 
 ## Ownership

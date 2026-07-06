@@ -8,11 +8,21 @@
 # edit HERE — never a producer config change. Do not point any producer
 # directly at Tempo, Loki, or Prometheus.
 #
-# Distribution note: this config runs on the CORE distribution on purpose —
-# both store paths are native OTLP (Loki 3.x /otlp, Prometheus 3.x
-# /api/v1/otlp), so no contrib-only component is needed. The contrib switch is
-# deferred until a change actually needs it (tail sampling; see the
-# box-telemetry-contract design).
+# Distribution note: this config runs on the CONTRIB distribution
+# (telemetry-cost-controls) — the metric cardinality guard below uses the
+# `transform` processor, which is contrib-only (`filter` is in core, but
+# collapsing high-cardinality attributes needs `transform`). This is the
+# deliberate core→contrib graduation the box-telemetry-contract design foresaw
+# ("the contrib switch rides a change that needs it"): here, the cost ceiling.
+# The image tag is pinned in compose/helm.
+#
+# COST CEILING (telemetry-cost-controls): this single egress is where any one
+# producer's telemetry cost is bounded — a misbehaving box degrades ITS OWN
+# fidelity (its high-cardinality attrs collapse; its excess volume is refused),
+# never the shared bill, the stores, or another producer. Enforcement lives here
+# and store-side (Loki limits_config); producers are unchanged. The head-sampling
+# decision at the edge remains the trace cost ceiling — this config adds no
+# stateful trace-buffering / tail-sampling stage (an explicit non-goal).
 
 receivers:
   otlp:
@@ -27,6 +37,41 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  # Self-protection (telemetry-cost-controls): the collector must not OOM under a
+  # volume flood — it soft-limits memory, refusing incoming data (and applying
+  # back-pressure to producers, who buffer/drop fail-open) rather than dying.
+  # Refusals are counted in the collector's self-telemetry (otelcol_processor_*),
+  # so an engaged ceiling is observable. MUST be the FIRST processor in every
+  # pipeline so it sees data before anything buffers it.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Metric cardinality guard (telemetry-cost-controls): collapse any metric
+  # datapoint's attributes down to an ALLOW-LIST — the identity set + RED labels.
+  # A producer that emits an unbounded/high-cardinality attribute (a user id, a
+  # raw path, a request id) has that dimension DROPPED here, before Prometheus,
+  # so total series stay within budget; other producers are unaffected. The
+  # allow-list is the single place this policy lives — start permissive, tighten
+  # with evidence (a mistake is a config edit here, never a producer redeploy).
+  # `transform`/`keep_keys` is the mature choice over the alpha
+  # `cardinality_guardian` processor (see design decision).
+  transform/cardinality:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - >-
+            keep_keys(attributes, [
+              "service.name", "service.version", "service.namespace",
+              "service.instance.id",
+              "deployment.environment", "deployment.environment.name",
+              "http.request.method", "http.response.status_code",
+              "http.route", "rpc.grpc.status_code", "rpc.method",
+              "rpc.service", "otel.scope.name", "error.type"
+            ])
+
   # Batch before export — standard back-pressure hygiene for the OTLP exporters.
   batch: {}
 
@@ -56,18 +101,40 @@ exporters:
       insecure: true
 
 service:
+  # Cost-ceiling observability (telemetry-cost-controls): the collector exports
+  # its OWN pipeline metrics — accepted/refused/dropped points per processor,
+  # memory_limiter engagement, exporter send failures — on a Prometheus endpoint
+  # (:8888), scraped by Prometheus (see the `otel-collector` job in
+  # prometheus.yml). This is what makes an engaged ceiling observable rather than
+  # a silent gap: a cardinality collapse shows as flat metric-series growth, a
+  # refused flood shows as rising otelcol_processor_refused_* .
+  telemetry:
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   pipelines:
     # Pipelines are independent on purpose: a slow/failed store for one signal
     # never blocks another, and each signal stays fail-open end to end.
+    # memory_limiter is FIRST in every pipeline (self-protection before buffering).
     traces:
       receivers: [otlp]
-      processors: [batch]
+      # No tail-sampling / stateful trace stage here: trace cost stays governed
+      # by the edge head-sampling decision (explicit non-goal). memory_limiter +
+      # batch only.
+      processors: [memory_limiter, batch]
       exporters: [otlp/tempo]
     metrics:
       receivers: [otlp]
-      processors: [batch]
+      # Cardinality guard sits between the limiter and the batcher: collapse
+      # high-cardinality attributes before they are batched toward Prometheus.
+      processors: [memory_limiter, transform/cardinality, batch]
       exporters: [otlphttp/prometheus]
     logs:
       receivers: [otlp]
-      processors: [batch]
+      processors: [memory_limiter, batch]
       exporters: [otlphttp/loki]
