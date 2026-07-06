@@ -128,7 +128,29 @@ decision. See §4.
 ## 3. Why the headers are trustworthy: the strip (anti-forgery)
 
 The edge removes all client-supplied copies of the trusted family in **three independent
-layers**, so a forged inbound header cannot survive to your box:
+layers** (hexagons below), so a forged inbound header cannot survive to your box:
+
+```mermaid
+flowchart TB
+    client(["Client request<br/>may carry forged x-*"])
+    box(["Box<br/>sees only edge-authored headers"])
+
+    subgraph edge["The edge — Envoy filter chain"]
+        direction TB
+        l1{{"Layer 1 · early_header_mutation<br/>strip traceparent / tracestate<br/>before the tracer decides"}}
+        l2{{"Layer 2 · C3 strip filter — first HTTP filter<br/>strip the entire trusted family"}}
+        tr["tenant-router ext_proc<br/>inject authoritative x-workspace-* · x-route-pool · …"]
+        jwt["jwt_authn · verify credential"]
+        l3{{"Layer 3 · identity sidecar ext_proc<br/>inject x-user-* · x-identity-contract<br/>+ strip anything it did not author"}}
+        l1 --> l2 --> tr --> jwt --> l3
+    end
+
+    client -->|forged x-*| l1
+    l3 -->|trusted headers only| box
+```
+
+Both ext_proc filters (`tenant-router`, `identity sidecar`) run `failure_mode_allow: false`,
+so a plane failure **fails closed** — the request is rejected, never forwarded unstripped.
 
 1. **Early header mutation** — `traceparent` / `tracestate` are removed *before* Envoy's
    tracer makes its root-vs-join decision, so a forged `traceparent` can't graft the request
@@ -140,8 +162,6 @@ layers**, so a forged inbound header cannot survive to your box:
 3. **Sidecar defense-in-depth** — the identity sidecar adds to its own remove-list any
    identity header it does not author on the current path, independent of Envoy's filter
    order.
-
-Both ext_proc filters run `failure_mode_allow: false` — a plane failure **fails closed**.
 
 > **Maintainer note — keep the two edge configs in sync.** `edge/envoy.yaml` (lab) and
 > `deploy/compose/envoy/envoy.yaml` (compose) strip the *same* header list — this is a
