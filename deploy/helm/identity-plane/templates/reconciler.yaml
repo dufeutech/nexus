@@ -33,7 +33,7 @@ spec:
                   name: {{ include "identity-plane.pgSecretName" . }}
                   key: {{ include "identity-plane.pgSecretKey" . }}
             - name: ZITADEL_INTERNAL_URL
-              value: {{ .Values.zitadel.internalUrl | quote }}
+              value: {{ .Values.oidc.internalUrl | quote }}
             - name: ZITADEL_HOST
               value: {{ include "identity-plane.jwksHost" . | quote }}
             - name: PAT_FILE
@@ -67,7 +67,7 @@ spec:
           secret:
             secretName: {{ include "identity-plane.patSecretName" . }}
             items:
-              - key: {{ .Values.zitadel.patSecret.key }}
+              - key: {{ .Values.oidc.patSecret.key }}
                 path: zitadel-admin-sa.pat
         - name: tmp
           emptyDir: {}

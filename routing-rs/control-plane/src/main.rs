@@ -1131,7 +1131,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let pg_url = env(
         "ROUTING_PG_URL",
-        "postgres://postgres:postgres@postgres:5432/zitadel",
+        "postgres://postgres:postgres@postgres:5432/routing",
     );
 
     // Connect + own the idempotent schema bootstrap (the router only reads).

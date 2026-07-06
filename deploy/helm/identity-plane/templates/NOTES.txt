@@ -17,7 +17,7 @@ Edge entry point:
 {{- end }}
 
 Verify before trusting in production:
-  1. Token issuer matches:   {{ .Values.zitadel.issuer }}
+  1. Token issuer matches:   {{ .Values.oidc.issuer }}
      A token whose `iss` differs is rejected by Envoy jwt_authn (fail-closed).
   2. ZITADEL can reach the sync-worker webhook:
      {{ .Values.syncWorker.selfUrl | default (printf "http://%s-sync-worker.%s.svc.cluster.local:8080/webhook" (include "identity-plane.fullname" .) .Release.Namespace) }}

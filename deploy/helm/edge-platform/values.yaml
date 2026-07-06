@@ -25,7 +25,7 @@ routing-plane:
 # -------------------------------------------------------------------------- #
 # Identity plane (subchart) — deploys sync-worker + reconciler (its edge is
 # disabled; this umbrella runs the combined one). The durable store (PostgreSQL)
-# is EXTERNAL. Set images.*, zitadel.*, postgres.* (external), backend here.
+# is EXTERNAL. Set images.*, oidc.*, postgres.* (external), backend here.
 # -------------------------------------------------------------------------- #
 identity-plane:
   edge:

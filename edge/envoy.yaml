@@ -279,9 +279,12 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
                       providers:
-                        zitadel:
-                          # D7 single source: this authority MUST equal the iss
-                          # ZITADEL mints, i.e. localhost:${ZITADEL_EXTERNALPORT}
+                        # oidc-provider-independence: vendor-neutral provider name.
+                        # ZITADEL is the currently deployed OIDC provider; any
+                        # conformant provider works by setting issuer + remote_jwks.
+                        oidc:
+                          # D7 single source: this authority MUST equal the iss the
+                          # OIDC provider mints, i.e. localhost:${ZITADEL_EXTERNALPORT}
                           # (default 8080 in docker-compose.yaml) — the same value
                           # the workers' ZITADEL_HOST derives from. Drift here is
                           # silent-but-fatal (sync works, every authenticated
@@ -296,14 +299,14 @@ static_resources:
                             # trust anchor in plaintext ONLY because the path is
                             # the compose-internal hop to the lab's own ZITADEL —
                             # the explicitly asserted trusted path (the Helm charts
-                            # call it zitadel.jwksPlaintextTrustedPath). On any
+                            # call it oidc.jwksPlaintextTrustedPath). On any
                             # untrusted path this fails the spec: use HTTPS + give
-                            # the zitadel_jwks cluster a TLS transport_socket
+                            # the oidc_jwks cluster a TLS transport_socket
                             # (trusted CA + SNI + SAN match — a plaintext JWKS lets
                             # a MITM swap keys → full auth bypass).
                             http_uri:
                               uri: "http://localhost:8080/oauth/v2/keys"
-                              cluster: zitadel_jwks
+                              cluster: oidc_jwks
                               timeout: 5s
                             cache_duration: { seconds: 600 }
                           payload_in_metadata: verified
@@ -334,7 +337,7 @@ static_resources:
                               ]
                           requires: { allow_missing: {} }
                         - match: { prefix: "/" }
-                          requires: { provider_name: zitadel }
+                          requires: { provider_name: oidc }
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
@@ -421,11 +424,14 @@ static_resources:
                     socket_address:
                       { address: tenant-router, port_value: 50052 }
 
-    - name: zitadel_jwks
+    # oidc_jwks: upstream to the OIDC provider's JWKS endpoint. The socket address
+    # is the provider's in-network service (the lab's ZITADEL); point it at your
+    # provider to swap IdPs.
+    - name: oidc_jwks
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
-        cluster_name: zitadel_jwks
+        cluster_name: oidc_jwks
         endpoints:
           - lb_endpoints:
               - endpoint:

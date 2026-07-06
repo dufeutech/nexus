@@ -50,22 +50,26 @@ images:
 imagePullSecrets: []
 
 # -------------------------------------------------------------------------- #
-# ZITADEL (external IdP). The "verify, don't guess" facts (RFC §6.6) were
-# settled against the lab instance; re-confirm issuer/JWKS against YOUR ZITADEL.
+# OIDC provider (external IdP). oidc-provider-independence: nexus verifies tokens
+# against ANY conformant OIDC provider selected by this config — ZITADEL is the
+# currently deployed one. The "verify, don't guess" facts (RFC §6.6) were settled
+# against the lab instance; re-confirm issuer/JWKS against YOUR provider.
 # -------------------------------------------------------------------------- #
-zitadel:
-  # Public issuer exactly as ZITADEL mints it into the `iss` claim. Envoy's
+oidc:
+  # Public issuer exactly as the provider mints it into the `iss` claim. Envoy's
   # jwt_authn rejects any token whose issuer differs. e.g. https://auth.example.com
   issuer: "https://auth.example.com"
   # In-cluster endpoint Envoy/sync-worker/reconciler actually dial. The JWKS is
   # fetched here while the `Host` header is set to the issuer's authority, so we
-  # avoid egress TLS and ZITADEL's external-domain Host check still passes
-  # (the load-bearing trick from the lab's envoy.yaml).
+  # avoid egress TLS and the provider's external-domain Host check still passes
+  # (the load-bearing trick from the lab's envoy.yaml). (The sync-worker/reconciler
+  # reuse this as the directory Management-API base until that integration is
+  # removed in change oidc-agnostic-identity-source.)
   internalUrl: "http://zitadel.zitadel.svc.cluster.local:8080"
   # Host header value sent on the JWKS fetch — must equal the issuer authority.
   # Defaults to the issuer's host:port when empty.
   jwksHost: ""
-  # JWKS path on ZITADEL.
+  # JWKS path on the OIDC provider.
   jwksPath: "/oauth/v2/keys"
   jwksCacheSeconds: 600
   # ---- Trust-anchor transport integrity (edge-trust-anchor-integrity) ------ #
@@ -80,11 +84,11 @@ zitadel:
   # assert the plaintext path is trusted via jwksPlaintextTrustedPath.
   jwksTls:
     # Fetch the JWKS over TLS with server-certificate verification (Envoy
-    # UpstreamTlsContext on the zitadel_jwks cluster: trusted CA + SNI + SAN
-    # match). zitadel.internalUrl must then point at a TLS port.
+    # UpstreamTlsContext on the oidc_jwks cluster: trusted CA + SNI + SAN
+    # match). oidc.internalUrl must then point at a TLS port.
     enabled: false
     # SNI + certificate SAN the server must present. Defaults to the dialed
-    # host (zitadel.internalUrl authority) when empty; set it when the cert is
+    # host (oidc.internalUrl authority) when empty; set it when the cert is
     # issued for a different name (e.g. the public issuer host).
     sni: ""
     # CA bundle (inside the Envoy container) used to verify the server chain.

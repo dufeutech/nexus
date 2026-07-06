@@ -817,7 +817,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let pg_url = env(
         "ROUTING_PG_URL",
-        "postgres://postgres:postgres@postgres:5432/zitadel",
+        "postgres://postgres:postgres@postgres:5432/routing",
     );
     // Optional: a SEPARATE endpoint for the read pool (cache-miss point reads),
     // e.g. a transaction-mode PgBouncer. The LISTEN invalidation feed (below) and

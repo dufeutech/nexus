@@ -286,7 +286,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Prometheus exporter listener is retired — the collector's metrics pipeline
     // forwards to the store, no per-box scrape job.
 
-    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/zitadel");
+    let pg_url = env("PROFILE_PG_URL", "postgres://postgres:postgres@postgres:5432/identitydb");
     let interval = Duration::from_secs(env_num("RECONCILE_INTERVAL", 600_u64));
     let shard = Shard { total: env_num("SHARD_TOTAL", 1_u64).max(1), index: env_num("SHARD_INDEX", 0_u64) };
 
