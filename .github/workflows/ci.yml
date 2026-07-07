@@ -47,7 +47,7 @@ jobs:
     env:
       STORE_PG_TEST_URL: postgres://postgres:postgres@localhost:5432/nexus_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install protoc
         if: ${{ matrix.protoc }}
@@ -77,7 +77,7 @@ jobs:
           - { workspace: identity-rs, protoc: true }
           - { workspace: routing-rs,  protoc: false }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install protoc
         if: ${{ matrix.protoc }}
@@ -110,7 +110,7 @@ jobs:
       matrix:
         workspace: [identity-rs, routing-rs]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -130,7 +130,7 @@ jobs:
       run:
         working-directory: deploy/helm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -188,14 +188,16 @@ jobs:
   # Release gate (production-readiness-gate 6.4): boot the reference topology
   # from a CLEAN checkout (no .env, auth ENABLED — production parity) and run
   # every edge e2e suite against it: the anonymous trust-contract assertions,
-  # the N4 per-route auth gate (incl. encoded-traversal), and the
-  # authenticated-member positive path (real ZITADEL JWT + seeded membership).
+  # the N4 per-route auth gate (incl. encoded-traversal), the authenticated-member
+  # positive path (real ZITADEL JWT + seeded membership), and the nexus-native
+  # global-authorization path (deny-by-default -> authz-admin grant/revoke/suspend
+  # resolved live through the edge).
   e2e-gate:
     name: e2e release gate (reference stack)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Boot the reference stack
         run: |
@@ -225,6 +227,9 @@ jobs:
 
       - name: Authenticated-member e2e (positive scope path)
         run: sh scripts/tenancy-edge-auth-e2e.sh
+
+      - name: Global authorization e2e (nexus-native authz)
+        run: sh scripts/authz-global-e2e.sh
 
       - name: Stack logs (on failure)
         if: failure()

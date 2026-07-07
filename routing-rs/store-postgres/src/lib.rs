@@ -184,9 +184,8 @@ impl PgRoutingStore {
         // NOTHING` also makes re-provisioning an existing solo account a no-op.
         //   Member seeding (the account owner + the per-user `staff` memberships) is
         // deliberately NOT done here: like the identity Profile projection it is a
-        // rebuildable, broker-seeded native CRUD write, not a routing-side ETL — the
-        // routing schema holds no user roster to seed from (see MIGRATION.md's
-        // "no ETL" model and the change's design.md Migration section).
+        // broker-seeded native CRUD write, not a routing-side ETL — the routing schema
+        // holds no user roster to seed from.
         sqlx::query(
             "INSERT INTO routing.accounts (account_id, name) \
              SELECT workspace_id, workspace_id FROM routing.workspaces \

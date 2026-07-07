@@ -45,7 +45,7 @@ jobs:
           - { name: control-plane,        context: routing-rs,  target: control-plane }
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # GHCR image names must be lowercase; the repo owner may not be.
       - name: Compute image base
