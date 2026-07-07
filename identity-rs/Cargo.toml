@@ -51,10 +51,12 @@ hex = "0.4"
 # (ES256). Pure-Rust via `ring` (no OpenSSL DLL); the `jwk` module also parses the
 # published JWKS in tests. Confined to the sidecar's signer adapter — no jsonwebtoken
 # type crosses the identity_core `ContractSigner` port. See the change's design.md.
-# `rust_crypto` selects the pure-Rust ECDSA provider (RustCrypto) — jsonwebtoken 10
-# requires exactly one crypto backend; the pure-Rust one keeps OpenSSL/aws-lc C
-# toolchains out of the build. `use_pem` (default) enables from_ec_pem / from_jwk.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# ES256 signer for the identity contract. Pinned to 9.x, which uses `ring` for crypto
+# (already in-tree via rustls/sqlx, and already accepted by cargo-deny) rather than the
+# pure-Rust `rsa` crate that jsonwebtoken 10's rust_crypto backend force-bundles. `rsa`
+# carries RUSTSEC-2023-0071 (unfixed RSA timing side-channel) which cargo-deny rejects,
+# and we only ever use ES256. `use_pem` (default) enables from_ec_pem / from_jwk.
+jsonwebtoken = "9"
 
 # ──────────────────────────────────────────────────────────────
 # Rustc lints — deny everything allowed-by-default that matters

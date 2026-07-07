@@ -114,8 +114,14 @@ done
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")
 ok "$([ "$CODE" = "200" ] && echo 1 || echo 0)" "authenticated member request -> 200 (got $CODE)"
 
+# identity-contract-signing: x-identity-contract is now a SIGNED token minted only when
+# signing is configured (no plain-string `v1`). The reference stack boots with signing
+# OFF (no key), so the member path carries no contract here — which also guards against the
+# legacy `v1` string sneaking back. The signed-member path (a verifiable JWS) is covered by
+# scripts/contract-signing-e2e.sh against a signing-enabled stack, plus the sidecar unit
+# tests. The membership-derived scope below is what this suite proves.
 V=$(hdr_val "$BODY" "X-Identity-Contract")
-ok "$([ "$V" = "v1" ] && echo 1 || echo 0)" "contract stamp is v1 on the enriched member request (got '${V:-<none>}')"
+ok "$([ -z "$V" ] && echo 1 || echo 0)" "no plain contract stamp with signing off (got '${V:-<none>}')"
 
 ANON=$(hdr_val "$BODY" "X-Auth-Anonymous")
 ok "$([ "$ANON" = "false" ] && echo 1 || echo 0)" "x-auth-anonymous is false (got '${ANON:-<none>}')"
