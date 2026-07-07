@@ -23,6 +23,10 @@ tokio-stream = "0.1"
 futures.workspace = true
 moka = { version = "0.12", features = ["future"] }
 serde_json.workspace = true
+# identity-contract-signing: ES256 signer for the x-identity-contract token. The
+# ONLY crate that touches jsonwebtoken — isolated in `signer.rs` behind the
+# identity_core::ContractSigner port.
+jsonwebtoken.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

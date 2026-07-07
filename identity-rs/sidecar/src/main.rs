@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -59,6 +60,12 @@ use identity_core::telemetry;
 use identity_core::store::{BoxError, Change, ProfileStore, WatchToken};
 use identity_core::Profile;
 use store_postgres::PgProfileStore;
+
+// identity-contract-signing: the ES256 signer adapter (mints the signed
+// x-identity-contract token) and the dedicated JWKS listener that publishes the
+// operator-supplied public keys for boxes to verify against.
+mod jwks;
+mod signer;
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): the RED baseline + operational gauges, emitted
@@ -106,16 +113,16 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
 const JWT_NS: &str = "envoy.filters.http.jwt_authn";
 const PAYLOAD_KEY: &str = "verified";
 
-/// Version of the edge→backend identity-header contract this sidecar emits, stamped
-/// on every enriched request as `x-identity-contract`. It is the single coordination
-/// gate for the whole `x-workspace-*`/`x-user-*` family: any drift in that family's
-/// shape (a rename, a removed/added field, a changed meaning) is a version bump, so a
-/// partially-deployed contract change fails closed instead of feeding the backend
-/// headers it silently misreads. A well-formed `vN` request also carries the
-/// authoritative acting scope (`x-workspace-id`/`x-user-type`), so the acting-scope
-/// guarantee is PART of this version, not a separate sentinel header. SHARED CONTRACT:
-/// the number is coordinated cross-repo with the consuming backend/box — bump both
-/// sides together.
+/// Version of the edge→backend identity-header contract this sidecar emits. Since
+/// `identity-contract-signing`, `x-identity-contract` is a *signed token* and this
+/// value rides inside it as the `ctr` claim (it is no longer the raw header value). It
+/// is the single coordination gate for the whole `x-workspace-*`/`x-user-*` family:
+/// any drift in that family's shape (a rename, a removed/added field, a changed
+/// meaning) is a version bump, so a partially-deployed contract change fails closed
+/// instead of feeding the backend headers it silently misreads. A well-formed token
+/// also carries the authoritative acting scope (`workspace_id`/`member_type`/`role`),
+/// so the acting-scope guarantee is PART of this version. SHARED CONTRACT: the value is
+/// coordinated cross-repo with the consuming backend/box — bump both sides together.
 const IDENTITY_CONTRACT_VERSION: &str = "v1";
 
 /// Per-route requirement signals (N4 phase 2), emitted by the tenant-router from
@@ -149,6 +156,14 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Wall-clock seconds since the Unix epoch — the `iat`/`exp` basis for a minted
+/// contract token (identity-contract-signing).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 #[derive(Clone)]
 struct AppState {
     cache: Cache<String, Arc<Profile>>,
@@ -168,6 +183,10 @@ struct AppState {
     /// The method→AAL ordering the min-AAL requirement compares against
     /// (`SIDECAR_AAL_LEVELS`, default [`DEFAULT_AAL_LEVELS`]).
     aal_levels: Arc<HashMap<String, u8>>,
+    /// The ES256 signer for the `x-identity-contract` token (identity-contract-signing).
+    /// `None` when signing is not configured (`SIGNING_KEY_PATH` unset) — then no token
+    /// is minted and any client copy is stripped, so a verifying box fails closed.
+    signer: Option<Arc<signer::Signer>>,
 }
 
 /// The outcome of resolving a subject's profile — distinguishes "no row" (a
@@ -318,6 +337,19 @@ fn extract_acting_workspace(req: &ProcessingRequest) -> Option<String> {
     find_header(map, "x-workspace-id").or_else(|| find_header(map, "x-tenant-id"))
 }
 
+/// The destination box for this request, from the tenant-router's trusted
+/// `x-route-pool` (edge-stripped from client input). Used as the signed contract's
+/// `aud` so a token minted for one box cannot be replayed at another. `None` when no
+/// pool is resolved — then no token is minted (the request is not a routed data door).
+fn extract_route_pool(req: &ProcessingRequest) -> Option<String> {
+    let Some(processing_request::Request::RequestHeaders(HttpHeaders { headers: Some(map), .. })) =
+        &req.request
+    else {
+        return None;
+    };
+    find_header(map, "x-route-pool")
+}
+
 /// The per-route requirements resolved by the tenant-router for THIS request,
 /// read from its trusted signals. `min_aal` is kept raw: an unparseable value is
 /// a requirement we cannot evaluate, which must DENY (fail-closed), not vanish.
@@ -401,26 +433,31 @@ fn enforce_route_requirements(
     authorize_route(reqs, roles, entitlements, aal_levels.get(method).copied())
 }
 
+/// The inputs for minting the signed identity contract, bundled so `enrich_response`
+/// stays within the argument budget: the configured signer (absent = signing off),
+/// the destination box (`aud`, from `x-route-pool`), and the current epoch seconds.
+struct SignContext<'a> {
+    signer: Option<&'a signer::Signer>,
+    route_pool: Option<&'a str>,
+    now: u64,
+}
+
 fn enrich_response(
     sub: &str,
     profile: Option<Arc<Profile>>,
     authenticated: bool,
     acting_workspace: Option<&str>,
+    sign_ctx: &SignContext<'_>,
 ) -> ProcessingResponse {
     // Trusted auth-state, emitted on EVERY request (incl. the no-credential path)
     // so a backend never has to infer it from the absence of a header. Standards:
     // RFC 6750 bearer presence drives is-anonymous; richer assurance (NIST
     // SP 800-63B AAL, mTLS) can extend `x-auth-method` later. These are stripped
     // from client input (C3) so a client cannot self-assert as authenticated.
+    // `x-identity-contract` is NO LONGER authored here unconditionally: since
+    // identity-contract-signing it is a signed token minted only for a resolved
+    // identity (see the mint-or-strip block after the acting-scope resolution).
     let mut set = vec![
-        // The contract stamp: a DRIFT/version signal telling the backend which
-        // shape of the x-workspace-*/x-user-* family this edge emits — NOT proof
-        // of edge origin (that guarantee is edge-origin-trust origin enforcement:
-        // backends are reachable only via the edge). Authored on EVERY enriched
-        // request; since it is always in `set` (OverwriteIfExistsOrAdd) it needs
-        // no entry in `remove` — the overwrite is order-independent, and the edge
-        // C3 strip already discards any client copy.
-        header("x-identity-contract", IDENTITY_CONTRACT_VERSION),
         header("x-auth-anonymous", if authenticated { "false" } else { "true" }),
         header("x-auth-method", if authenticated { "bearer" } else { "none" }),
         header("x-user-id", sub),
@@ -472,6 +509,38 @@ fn enrich_response(
         remove.push("x-workspace-id".to_owned());
         remove.push("x-user-type".to_owned());
         remove.push("x-user-role".to_owned());
+    }
+    // The signed identity contract (identity-contract-signing). `x-identity-contract` is
+    // ALWAYS a signed token — there is no plain-string form. It is minted ONLY for a
+    // fully-resolved request (authenticated AND a member of the acting workspace, with a
+    // signer configured and a destination box for `aud`, which scopes replay per box). On
+    // every other path — anonymous, profile-miss, non-member, a signing failure, or no
+    // signer configured — nothing is authored and any client copy is STRIPPED, so a
+    // verifying box fails closed.
+    let minted = match (sign_ctx.signer, acting.as_ref(), sign_ctx.route_pool) {
+        (Some(active_signer), Some(m), Some(aud)) if authenticated => {
+            let role_list: &[String] = profile.as_ref().map_or(&[], |p| p.roles.as_slice());
+            active_signer
+                .mint(&signer::MintInput {
+                    sub,
+                    aud,
+                    workspace_id: &m.workspace_id,
+                    member_type: m.member_type.as_str(),
+                    role: &m.role,
+                    roles: role_list,
+                    now: sign_ctx.now,
+                })
+                .map_err(|e| {
+                    warn!(error = %e, "contract signing failed -> no token stamped (fail-closed)");
+                })
+                .ok()
+        }
+        _ => None,
+    };
+    if let Some(token) = &minted {
+        set.push(header("x-identity-contract", token));
+    } else {
+        remove.push("x-identity-contract".to_owned());
     }
     // `x-user-org` is retired (workspace-tenancy): the fixed home org is no longer
     // an authorization input, so it is NEVER authored and ALWAYS stripped from
@@ -589,6 +658,8 @@ impl Sidecar {
                 // workspace the router resolved (not a client-chosen one).
                 let acting_workspace = extract_acting_workspace(&req);
                 let ws = acting_workspace.as_deref();
+                // The destination box (`x-route-pool`) → the signed contract's `aud`.
+                let route_pool = extract_route_pool(&req);
                 // The per-route requirements the tenant-router resolved (N4 phase 2).
                 let requirements = extract_requirements(&req);
                 // `sub` is a user identifier (PII): keep it out of per-request info
@@ -640,7 +711,20 @@ impl Sidecar {
                     info!(reason, "route requirements unsatisfied -> 403");
                     break 'decide (forbidden_403(), "forbidden");
                 }
-                (enrich_response(&sub, profile, authenticated, ws), result)
+                (
+                    enrich_response(
+                        &sub,
+                        profile,
+                        authenticated,
+                        ws,
+                        &SignContext {
+                            signer: self.state.signer.as_deref(),
+                            route_pool: route_pool.as_deref(),
+                            now: now_secs(),
+                        },
+                    ),
+                    result,
+                )
             }
         } else {
             warn!("not ready -> 503");
@@ -827,6 +911,56 @@ mod api {
     }
 }
 
+/// Construct the ES256 contract signer from the environment (identity-contract-signing).
+///
+/// Fail-fast on MISCONFIGURATION: when `SIGNING_KEY_PATH` is set but the key cannot be
+/// loaded, return an error so the process exits at startup rather than silently running
+/// unsigned — which would reject every authenticated request at the box, at request time.
+///
+/// When `SIGNING_KEY_PATH` is unset, signing is explicitly OFF (a deliberate dev/eval
+/// choice): return `None`. Anonymous traffic is unaffected either way — the signing key is
+/// only ever used to mint a token for an authenticated member — so keyless mode still
+/// serves anonymous requests normally; only authenticated requests then carry no contract.
+fn build_signer() -> Result<Option<Arc<signer::Signer>>, Box<dyn Error>> {
+    let Some(key_path) = env::var("SIGNING_KEY_PATH").ok().filter(|p| !p.is_empty()) else {
+        warn!("SIGNING_KEY_PATH unset -> x-identity-contract signing OFF (anonymous unaffected; authenticated requests carry no contract)");
+        return Ok(None);
+    };
+    let kid = env::var("SIGNING_KID").unwrap_or_else(|_| "nexus-1".to_owned());
+    let issuer =
+        env::var("SIGNING_ISSUER").unwrap_or_else(|_| "https://identity.nexus".to_owned());
+    let ttl = env::var("CONTRACT_TOKEN_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let built = signer::Signer::from_pem_file(
+        &key_path,
+        kid,
+        issuer,
+        IDENTITY_CONTRACT_VERSION.to_owned(),
+        ttl,
+    )
+    .map_err(|e| {
+        format!("SIGNING_KEY_PATH={key_path} is set but the signing key could not be loaded: {e}")
+    })?;
+    info!(ttl_s = ttl, "x-identity-contract ES256 signing ENABLED");
+    Ok(Some(Arc::new(built)))
+}
+
+/// Load the operator-supplied JWKS document to publish verbatim
+/// (identity-contract-signing). `None` (endpoint not started) when `JWKS_FILE` is
+/// unset or unreadable.
+fn load_jwks() -> Option<Arc<String>> {
+    let path = env::var("JWKS_FILE").ok().filter(|p| !p.is_empty())?;
+    match fs::read_to_string(&path) {
+        Ok(doc) => Some(Arc::new(doc)),
+        Err(e) => {
+            error!(error = %e, path, "failed to read JWKS document -> JWKS endpoint DISABLED");
+            None
+        }
+    }
+}
+
 /// Resolves when the process receives SIGINT or (on unix) SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -905,6 +1039,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         start: Instant::now(),
         fail_open,
         aal_levels: Arc::new(aal_levels),
+        // Fail-fast if a signing key is configured but unloadable (misconfiguration);
+        // `None` when signing is deliberately off (anonymous still served).
+        signer: build_signer()?,
     };
 
     // Periodically publish the gauge-style snapshots (the exporter's own listener
@@ -953,6 +1090,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (tx, _r) = watch::channel(false);
     let mut r_http = tx.subscribe();
     let mut r_grpc = tx.subscribe();
+
+    // Dedicated public JWKS listener (identity-contract-signing) — SEPARATE from the
+    // internal :9200 profile API so publishing the public keys never exposes
+    // `/profile/{sub}`. Subscribed to the shutdown fan-out BEFORE `tx` moves into the
+    // signal task below; only started when a JWKS document is configured.
+    if let Some(doc) = load_jwks() {
+        let jwks_addr = env::var("JWKS_LISTEN").unwrap_or_else(|_| "0.0.0.0:9210".to_owned());
+        let mut r_jwks = tx.subscribe();
+        let app = jwks::router(doc);
+        drop(tokio::spawn(async move {
+            match TcpListener::bind(&jwks_addr).await {
+                Ok(listener) => {
+                    info!(addr = %jwks_addr, path = jwks::JWKS_PATH, "JWKS listener up");
+                    let _ = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = r_jwks.changed().await;
+                        })
+                        .await;
+                }
+                Err(e) => error!(error = %e, addr = %jwks_addr, "failed to bind JWKS listener"),
+            }
+        }));
+    }
+
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = tx.send(true);
@@ -996,6 +1157,45 @@ mod tests {
     use super::*;
     use identity_core::{MemberType, Membership};
     use std::collections::HashMap;
+
+    /// Embedded test signing key (matches `testdata/test-jwks.json`), for the
+    /// signed-contract tests.
+    const TEST_PEM: &str = include_str!("testdata/test-ec-p256.pem");
+
+    /// A signer over the embedded test key (identity-contract-signing tests).
+    fn test_signer() -> signer::Signer {
+        signer::Signer::from_pem(
+            TEST_PEM.as_bytes(),
+            "test-key-1".to_owned(),
+            "https://identity.nexus".to_owned(),
+            "v1".to_owned(),
+            60,
+        )
+        .expect("valid test key")
+    }
+
+    /// Test wrapper preserving the pre-signing 4-arg call shape: no signer, no route
+    /// pool → no token minted (`x-identity-contract` stripped). Shadows the 7-arg
+    /// `super::enrich_response` for the many tests that do not exercise signing.
+    fn enrich_response(
+        sub: &str,
+        profile: Option<Arc<Profile>>,
+        authenticated: bool,
+        acting_workspace: Option<&str>,
+    ) -> ProcessingResponse {
+        super::enrich_response(
+            sub,
+            profile,
+            authenticated,
+            acting_workspace,
+            &SignContext { signer: None, route_pool: None, now: 0 },
+        )
+    }
+
+    /// Build a `SignContext` wired to the embedded test signer, aud `evenout`.
+    fn signed_ctx(signer: &signer::Signer) -> SignContext<'_> {
+        SignContext { signer: Some(signer), route_pool: Some("evenout"), now: 1_000_000 }
+    }
 
     /// A Profile holding one workspace membership, for the resolution matrix.
     fn member_profile(ws: &str, ty: MemberType, role: &str) -> Arc<Profile> {
@@ -1196,12 +1396,63 @@ mod tests {
     }
 
     #[test]
-    fn contract_stamp_is_emitted_on_every_enriched_path() {
-        // The contract stamp proves the identity headers came from the trusted edge.
-        // It is authored on EVERY forwarded path — member, non-member, profile miss,
-        // and anonymous — so the backend can reject an absent stamp as a bypass.
+    fn signed_contract_is_minted_only_for_a_resolved_member() {
+        // identity-contract-signing: the signed x-identity-contract is minted ONLY
+        // when authenticated AND a member of the acting workspace (there is an
+        // authoritative scope to sign). Member path -> a compact JWS is stamped and
+        // NOT stripped.
+        let signer = test_signer();
+        let member = super::enrich_response(
+            "u1",
+            Some(member_profile("ws_1", MemberType::Staff, "admin")),
+            true,
+            Some("ws_1"),
+            &signed_ctx(&signer),
+        );
+        let h = set_headers(&member);
+        let token = h
+            .get("x-identity-contract")
+            .expect("member path must carry a signed contract");
+        assert_eq!(
+            token.split('.').count(),
+            3,
+            "must be a compact JWS (header.payload.signature)",
+        );
+        assert!(
+            !remove_headers(&member).contains(&"x-identity-contract".to_owned()),
+            "an authored token must never be stripped",
+        );
+
+        // Non-member, anonymous, and profile-miss have no resolved identity to sign:
+        // NO token is stamped and the header is STRIPPED so a client copy cannot
+        // survive — a verifying box then fails closed on an enriched route.
+        let non_member = super::enrich_response(
+            "u1",
+            Some(member_profile("ws_1", MemberType::Staff, "admin")),
+            true,
+            Some("ws_other"),
+            &signed_ctx(&signer),
+        );
+        let anon = super::enrich_response("anonymous", None, false, None, &signed_ctx(&signer));
+        let miss = super::enrich_response("u1", None, true, None, &signed_ctx(&signer));
+        for (label, resp) in [("non_member", &non_member), ("anonymous", &anon), ("miss", &miss)] {
+            assert!(
+                !set_headers(resp).contains_key("x-identity-contract"),
+                "{label} path must not stamp a contract",
+            );
+            assert!(
+                remove_headers(resp).contains(&"x-identity-contract".to_owned()),
+                "{label} path must strip any client-supplied contract",
+            );
+        }
+    }
+
+    #[test]
+    fn no_contract_and_stripped_without_a_signer() {
+        // identity-contract-signing: there is NO plain-string contract. With no signer
+        // configured, x-identity-contract is authored by no one on every path and any
+        // client copy is stripped, so a verifying box fails closed.
         let cases = [
-            // (label, response)
             (
                 "member",
                 enrich_response(
@@ -1211,29 +1462,16 @@ mod tests {
                     Some("ws_1"),
                 ),
             ),
-            (
-                "non_member",
-                enrich_response(
-                    "u1",
-                    Some(member_profile("ws_1", MemberType::Staff, "admin")),
-                    true,
-                    Some("ws_other"),
-                ),
-            ),
-            ("miss", enrich_response("u1", None, true, None)),
             ("anonymous", enrich_response("anonymous", None, false, None)),
         ];
         for (label, resp) in &cases {
-            let h = set_headers(resp);
-            assert_eq!(
-                h.get("x-identity-contract").map(String::as_str),
-                Some("v1"),
-                "{label} path must stamp the contract version",
-            );
-            // Always authored -> must never appear in the strip list (order-independent).
             assert!(
-                !remove_headers(resp).contains(&"x-identity-contract".to_owned()),
-                "{label} path must not strip the authored contract stamp",
+                !set_headers(resp).contains_key("x-identity-contract"),
+                "{label}: no contract is authored without a signer",
+            );
+            assert!(
+                remove_headers(resp).contains(&"x-identity-contract".to_owned()),
+                "{label}: any client-supplied contract is stripped without a signer",
             );
         }
     }
@@ -1537,6 +1775,7 @@ mod tests {
             start: Instant::now(),
             fail_open: false,
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            signer: None,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

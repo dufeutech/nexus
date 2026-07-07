@@ -54,10 +54,28 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $otlp | quote }}
             {{- end }}
+            {{- if .Values.sidecar.signing.enabled }}
+            # identity-contract-signing: sign x-identity-contract (ES256) + publish the
+            # public keys on :9210. `aud` is derived from x-route-pool, not configured.
+            - { name: SIGNING_KEY_PATH, value: /etc/nexus/signing-key/key.pem }
+            - { name: SIGNING_KID, value: {{ required "sidecar.signing.kid is required when signing is enabled" .Values.sidecar.signing.kid | quote }} }
+            - { name: SIGNING_ISSUER, value: {{ .Values.sidecar.signing.issuer | quote }} }
+            - { name: CONTRACT_TOKEN_TTL_SECONDS, value: {{ .Values.sidecar.signing.tokenTtlSeconds | quote }} }
+            - { name: JWKS_FILE, value: /etc/nexus/signing-jwks/jwks.json }
+            - { name: JWKS_LISTEN, value: {{ .Values.sidecar.signing.jwksListen | quote }} }
+            {{- end }}
           ports:
             - { name: ext-proc, containerPort: 50051 }
             - { name: profile, containerPort: 9200 }
             - { name: metrics, containerPort: 9202 }
+            {{- if .Values.sidecar.signing.enabled }}
+            - { name: jwks, containerPort: 9210 }
+            {{- end }}
+          {{- if .Values.sidecar.signing.enabled }}
+          volumeMounts:
+            - { name: signing-key, mountPath: /etc/nexus/signing-key, readOnly: true }
+            - { name: signing-jwks, mountPath: /etc/nexus/signing-jwks, readOnly: true }
+          {{- end }}
           # /healthz returns 503 until the initial KV replay completes (RFC C6),
           # so readiness gates the pod out of rotation until the cache is warm.
           readinessProbe:
@@ -97,6 +115,15 @@ spec:
             name: {{ include "identity-plane.fullname" . }}-edge-envoy
         - name: tmp
           emptyDir: {}
+        {{- if .Values.sidecar.signing.enabled }}
+        # identity-contract-signing: private key (Secret) + public JWKS (ConfigMap).
+        - name: signing-key
+          secret:
+            secretName: {{ .Values.sidecar.signing.existingSecret | default (printf "%s-signing-key" (include "identity-plane.fullname" .)) }}
+        - name: signing-jwks
+          configMap:
+            name: {{ include "identity-plane.fullname" . }}-signing-jwks
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

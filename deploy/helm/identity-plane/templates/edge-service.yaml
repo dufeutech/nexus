@@ -17,6 +17,14 @@ spec:
       port: {{ .Values.edge.service.port }}
       targetPort: http
       protocol: TCP
+    {{- if .Values.sidecar.signing.enabled }}
+    # identity-contract-signing: the JWKS is PUBLIC by design (boxes fetch it to verify
+    # the signed x-identity-contract), so unlike the profile API it IS exposed here.
+    - name: jwks
+      port: 9210
+      targetPort: jwks
+      protocol: TCP
+    {{- end }}
 {{- if .Values.edge.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

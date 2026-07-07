@@ -1,0 +1,32 @@
+{{- /*
+identity-contract-signing: the ES256 signing material for the x-identity-contract
+token. The PRIVATE key is a Secret (mounted into the sidecar, never leaves the identity
+plane); the PUBLIC JWKS is a ConfigMap (served verbatim by the sidecar's :9210 listener
+for boxes to verify against). Rendered only when sidecar.signing.enabled — default off,
+so an existing release is unaffected until you opt in. See
+docs/runbook-contract-signing-keys.md for key generation + zero-downtime rotation.
+*/ -}}
+{{- if .Values.sidecar.signing.enabled }}
+{{- if not .Values.sidecar.signing.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-signing-key
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  key.pem: |
+    {{- required "sidecar.signing: set privateKeyPem or existingSecret when signing is enabled" .Values.sidecar.signing.privateKeyPem | nindent 4 }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-signing-jwks
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+data:
+  jwks.json: |
+    {{- required "sidecar.signing.jwks is required when signing is enabled" .Values.sidecar.signing.jwks | nindent 4 }}
+{{- end }}

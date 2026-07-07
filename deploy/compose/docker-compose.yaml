@@ -95,6 +95,23 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # identity-contract-signing: x-identity-contract is a SIGNED token (no plain-string
+      # form). Provide signing material to emit it — drop key.pem + jwks.json into
+      # ./signing/ and set SIGNING_KEY_PATH + SIGNING_KID + JWKS_FILE. Without it the
+      # sidecar emits no contract (a verifying box fails closed). See
+      # docs/runbook-contract-signing-keys.md.
+      SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-}
+      SIGNING_KID: ${SIGNING_KID:-}
+      SIGNING_ISSUER: ${SIGNING_ISSUER:-https://identity.nexus}
+      CONTRACT_TOKEN_TTL_SECONDS: ${CONTRACT_TOKEN_TTL_SECONDS:-60}
+      JWKS_FILE: ${JWKS_FILE:-}
+      JWKS_LISTEN: ${JWKS_LISTEN:-0.0.0.0:9210}
+    volumes:
+      # Operator-supplied signing material (empty until you opt in — see runbook).
+      - ./signing:/etc/nexus/signing:ro
+    ports:
+      # Public JWKS listener (only serves once JWKS_FILE is set); handy for local curl.
+      - "${JWKS_PORT:-9210}:9210"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9200/healthz"]
       interval: 10s

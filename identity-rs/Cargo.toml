@@ -47,6 +47,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# identity-contract-signing: mint/verify the signed x-identity-contract token
+# (ES256). Pure-Rust via `ring` (no OpenSSL DLL); the `jwk` module also parses the
+# published JWKS in tests. Confined to the sidecar's signer adapter — no jsonwebtoken
+# type crosses the identity_core `ContractSigner` port. See the change's design.md.
+# `rust_crypto` selects the pure-Rust ECDSA provider (RustCrypto) — jsonwebtoken 10
+# requires exactly one crypto backend; the pure-Rust one keeps OpenSSL/aws-lc C
+# toolchains out of the build. `use_pem` (default) enables from_ec_pem / from_jwk.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # ──────────────────────────────────────────────────────────────
 # Rustc lints — deny everything allowed-by-default that matters

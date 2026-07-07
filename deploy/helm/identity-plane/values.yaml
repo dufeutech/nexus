@@ -211,6 +211,29 @@ sidecar:
   readinessDelaySeconds: 0
   logFormat: "json"             # json | text
   rustLog: "info"
+  # identity-contract-signing: ES256 signing of the x-identity-contract token (the ONLY
+  # form of the contract — there is no plain-string fallback) + the public JWKS listener
+  # (:9210) boxes verify against. Any real deployment MUST provision this.
+  #   enabled: true  -> the sidecar signs; a missing/broken key makes it FAIL FAST at
+  #                     startup (never silently unsigned), so provide a valid key + JWKS.
+  #   enabled: false -> signing off (dev/eval). Anonymous traffic is served normally;
+  #                     authenticated requests carry no contract, so a verifying box fails
+  #                     closed. Defaults false only so the chart renders without key
+  #                     material in tests.
+  # See docs/runbook-contract-signing-keys.md.
+  signing:
+    enabled: false
+    issuer: "https://identity.nexus"   # the `iss` claim; boxes pin this exact string
+    kid: ""                            # MUST equal the JWKS entry's kid; required when enabled
+    tokenTtlSeconds: 60
+    jwksListen: "0.0.0.0:9210"
+    # PRIVATE key (ES256 PKCS#8 PEM). Production: create a Secret out-of-band and set
+    # `existingSecret` (key `key.pem`); leave `privateKeyPem` empty. Dev only: paste the
+    # PEM into `privateKeyPem` and the chart creates the Secret. NEVER commit a real key.
+    existingSecret: ""
+    privateKeyPem: ""
+    # PUBLIC JWKS document, served verbatim (not secret). Its `kid` MUST match `kid`.
+    jwks: ""
 
 # -------------------------------------------------------------------------- #
 # authz-admin — the nexus-native authorization authoring surface

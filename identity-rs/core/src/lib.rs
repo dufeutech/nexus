@@ -10,6 +10,7 @@
 //! provider (`nexus-native-authorization` spec).
 
 pub mod authz;
+pub mod contract;
 pub mod membership;
 pub mod profile;
 pub mod projection;
@@ -17,6 +18,7 @@ pub mod store;
 pub mod telemetry;
 
 pub use authz::{AuthzAuthoring, AuthzFacts, AuthzResolver};
+pub use contract::{ContractClaims, ContractSigner, SignError};
 pub use membership::{
     Membership, MemberType, MembershipResolver, ResolvedMembership, SourceMembershipReader,
 };

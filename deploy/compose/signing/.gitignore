@@ -1,0 +1,4 @@
+# Never commit signing material — only the README/.gitignore are tracked.
+*
+!README.md
+!.gitignore

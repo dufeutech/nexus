@@ -6,10 +6,11 @@
 # what reached the backend.
 #
 # What this covers (checkable WITHOUT a token, on the anonymous path):
-#   1. Contract stamp: an enriched request carries `x-identity-contract: v1`
-#      (authored by the identity sidecar on every enriched request, task 4.3).
-#   2. Unforgeable stamp: a CLIENT-supplied `x-identity-contract` is stripped at
-#      the edge (C3) — the backend never sees the forged version.
+#   1. No contract for the anonymous path: x-identity-contract is a SIGNED token
+#      minted only for a resolved member (identity-contract-signing), so an
+#      anonymous request carries none.
+#   2. Unforgeable contract: a CLIENT-supplied `x-identity-contract` is stripped at
+#      the edge (C3) — the backend never sees the forged value.
 #   3. Unforgeable acting scope: client-supplied `x-workspace-id`/`x-user-type`/
 #      `x-user-role` on a NON-member (anonymous) request are stripped — no forged
 #      authoritative scope reaches the backend.
@@ -63,19 +64,21 @@ cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}
   || cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
 settle
 
-echo "== 1. enriched anonymous request carries the contract stamp, forged copies stripped =="
+echo "== 1. enriched anonymous request carries NO contract, forged copies stripped =="
 BODY=$(echo_body \
   -H "x-identity-contract: vFORGED" \
   -H "x-workspace-id: ws_forged" \
   -H "x-user-type: staff" \
   -H "x-user-role: admin")
 
-# The sidecar stamps v1 on every enriched request...
+# identity-contract-signing: x-identity-contract is a SIGNED token minted ONLY for a
+# resolved member — there is no plain-string form. An anonymous request has no identity to
+# sign, so the sidecar authors NO contract and STRIPS any client copy. The member path
+# (a verifiable signed token) is scripts/contract-signing-e2e.sh.
 V=$(hdr_val "$BODY" "X-Identity-Contract")
-ok "$([ "$V" = "v1" ] && echo 1 || echo 0)" "contract stamp is v1 at the backend (got '${V:-<none>}')"
+ok "$([ -z "$V" ] && echo 1 || echo 0)" "anonymous path carries no contract (got '${V:-<none>}')"
 
-# ...and the client's forged stamp never survives (it is stripped, then re-authored
-# to v1 above — so the value is v1, never vFORGED).
+# In particular the client's forged stamp never survives (stripped, never re-authored).
 ok "$([ "$V" != "vFORGED" ] && echo 1 || echo 0)" "client-forged x-identity-contract is stripped"
 
 # A non-member (anonymous) may not assert an acting scope: the forged workspace/

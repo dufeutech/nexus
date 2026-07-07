@@ -16,10 +16,16 @@ the specs: `openspec/specs/identity-workspace-authz`, `edge-origin-trust`, `edge
 ## 0. The one prerequisite that makes everything else safe
 
 **Your box MUST be reachable only through the edge.** The trusted headers below are
-unforgeable *because of the network path* — not because of anything in the header values.
-There is no signature to check; the edge strips every client-supplied copy of these headers
-(§3) and re-injects its own, so the only way a header can carry a value is if the edge put it
-there. That guarantee holds **only** while the box's ingress is restricted to the edge.
+unforgeable *because of the network path* — the edge strips every client-supplied copy of
+these headers (§3) and re-injects its own, so the only way a header can carry a value is if
+the edge put it there. That guarantee holds **only** while the box's ingress is restricted to
+the edge.
+
+Since `identity-contract-signing`, the `x-identity-contract` header is *additionally* a
+**signed token** you can cryptographically verify (§1a-bis) — a defense-in-depth proof that
+the request was authored by nexus. **This does not replace the network control:** origin trust
+remains the primary boundary, and you MUST still restrict ingress to the edge. The signature is
+a second gate, not a substitute for the first.
 
 - In Kubernetes: a `NetworkPolicy` (enforced by your CNI) that allows box ingress only from
   the edge pods. The Helm charts ship this fail-closed — see
@@ -43,9 +49,13 @@ headers are authoritative over any earlier copy.
 Emitted on **every** enriched request, including the anonymous/no-credential path, so your box
 must **never infer state from a header's absence** — read the explicit flag instead.
 
+The other identity headers below (`x-user-*`, `x-auth-*`) are raw ASCII and are still emitted
+on **every** enriched request. `x-identity-contract` is the exception — it is now a signed
+token minted **only** for a resolved identity (§1a-bis).
+
 | Header | Meaning | Format | Box uses it for |
 | --- | --- | --- | --- |
-| `x-identity-contract` | **The stamp.** Version of the header-contract shape. Currently `v1`. | `vN` | **Require + validate** (§2). |
+| `x-identity-contract` | **The signed contract.** An ES256 JWS whose claims carry the acting identity; the contract-shape version rides inside as the `ctr` claim. Minted only for an authenticated member (§1a-bis). | compact JWS (`h.p.s`) | **Verify + require** (§1a-bis, §2). |
 | `x-workspace-id` | The **authorized acting workspace** (set only after a live membership check). | id string | Primary tenant scope. Prefer over legacy `x-tenant-id`. |
 | `x-user-id` | Verified subject (`sub`). | id string | Audit / ownership checks. |
 | `x-user-type` | Acting relationship in this workspace. | `staff` \| `customer` | Acting-scope decisions. |
@@ -56,6 +66,39 @@ must **never infer state from a header's absence** — read the explicit flag in
 | `x-user-enriched-by` | Provenance marker. | `identity-sidecar-rs` \| `identity-sidecar-rs:miss` | Diagnostics. |
 | `x-auth-anonymous` | Is the caller anonymous. | `true` \| `false` | Branch on identity. |
 | `x-auth-method` | Auth method used. | `bearer` \| `none` | Diagnostics / step-up. |
+
+### 1a-bis. Verifying the signed `x-identity-contract` (identity-contract-signing)
+
+`x-identity-contract` is a compact **ES256 JWS**. To verify it:
+
+1. **Fetch + cache the JWKS** from nexus at `<identity-plane>/.well-known/jwks.json` (served
+   on a dedicated public listener, port `9210`). Select the key by the token header's `kid`.
+   Cache it and refresh on an unknown `kid` (keys rotate with overlap).
+2. **Verify the signature** (ES256) against that key. Reject if it does not verify.
+3. **Check the registered claims:**
+   - `iss` — MUST equal the nexus issuer you were given (e.g. `https://identity.nexus`).
+   - `aud` — MUST equal **your box's name** (the value nexus routes to you as `x-route-pool`,
+     e.g. `evenout`). This scopes the token to you; a token minted for another box will not
+     match. Reject on mismatch.
+   - `exp` — MUST be in the future (allow a small clock-skew leeway, e.g. 60s). Tokens are
+     short-lived and minted per request.
+   - `ctr` — the contract version (replaces the old `vN` string). Reject a version you do not
+     understand — this is the drift tripwire for the whole `x-user-*`/`x-workspace-*` shape.
+4. **Read identity from the verified claims** if you wish: `sub`, `workspace_id`, `role`,
+   `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-role` / `x-user-roles`). The
+   `plan` claim is **reserved** and currently absent — treat absent plan as not-provisioned.
+
+**Minted only for a resolved identity.** nexus signs the token **only** when the request is
+authenticated *and* the caller is a member of the acting workspace. A non-member, an anonymous
+caller, or a caller nexus has no profile for carries **no** `x-identity-contract` at all (and
+any client-supplied copy is stripped). So on an identity-enriched route, an absent or
+unverifiable token means **reject** (fail closed) — nexus has already refused non-members
+upstream; they never reach you with a valid contract.
+
+**No legacy string form.** `x-identity-contract` is a signed JWS — there is no plain-string
+(`v1`) variant to fall back to. If it is present, verify it; if it is absent on an enriched
+route, reject (fail closed). The raw `x-user-*` headers are still emitted alongside it (you may
+read identity from either), and origin trust (§0) remains the underlying guarantee.
 
 ### 1b. Tenant / routing — authored by the tenant-router (`routing-rs/tenant-router`)
 
