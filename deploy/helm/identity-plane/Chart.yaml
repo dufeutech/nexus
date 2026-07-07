@@ -6,10 +6,12 @@ description: >-
   (PostgreSQL) is EXTERNAL — operated outside this chart. Topology-independent
   (../../../INFO.md §4/§7) production deployment.
 type: application
-# Chart version — bump on template changes.
+# Chart (package) version — bump on template changes; independent of appVersion.
 version: 0.1.0
-# The app this chart deploys has no single version; track the lab it mirrors.
-appVersion: "0.1.0"
+# The first-party image release this chart deploys. It is the DEFAULT image tag (an
+# operator can still override via images.tag / global.image.tag), so it MUST equal the
+# tag the images are published under — keep it in lockstep with the release.
+appVersion: "0.0.5"
 keywords:
   - identity
   - envoy
