@@ -51,7 +51,13 @@ jobs:
 
       - name: Install protoc
         if: ${{ matrix.protoc }}
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+        run: |
+          # Drop the azure-cli/microsoft apt repos that intermittently fail to fetch on
+          # GitHub runners (not needed here — protobuf comes from the ubuntu archive), and
+          # retry apt-get update so a transient mirror hiccup doesn't flake the build.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* || true
+          for i in 1 2 3; do sudo apt-get update && break || { echo "apt-get update retry $i"; sleep 5; }; done
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +87,13 @@ jobs:
 
       - name: Install protoc
         if: ${{ matrix.protoc }}
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+        run: |
+          # Drop the azure-cli/microsoft apt repos that intermittently fail to fetch on
+          # GitHub runners (not needed here — protobuf comes from the ubuntu archive), and
+          # retry apt-get update so a transient mirror hiccup doesn't flake the build.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* || true
+          for i in 1 2 3; do sudo apt-get update && break || { echo "apt-get update retry $i"; sleep 5; }; done
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
