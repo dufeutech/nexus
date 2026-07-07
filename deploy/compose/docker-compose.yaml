@@ -132,6 +132,31 @@ services:
     ports:
       - "127.0.0.1:9300:9300"   # bound to loopback: admin boundary only
 
+  # Membership projection worker (membership-projection-sync). LISTENs on the routing
+  # plane's `routing_membership_changes` NOTIFY channel and read-merge-writes the
+  # subject's memberships into the identity Profile; a periodic backstop heals a missed
+  # signal and backfills on first run. This is what makes the sidecar's acting-workspace
+  # scope (x-workspace-id/x-user-type/x-user-role) resolve — WITHOUT it, memberships
+  # never land in the Profile and the acting scope is never emitted. Holds a READ-ONLY
+  # routing connection (least privilege: SELECT routing.memberships + LISTEN), a
+  # SEPARATE database from PROFILE_PG in production.
+  membership-sync:
+    image: ${IDENTITY_REPO:-identity}/identity-membership-sync:${IMAGE_TAG:-0.1.0}
+    build: { context: ../../identity-rs, target: membership-sync }
+    restart: unless-stopped
+    environment:
+      PROFILE_PG_URL: ${PROFILE_PG_URL:?set PROFILE_PG_URL to your external Postgres (session connection, not a txn-mode pooler)}
+      # Read-only routing connection: LISTEN routing_membership_changes + SELECT
+      # routing.memberships. MUST be a direct/session URL — a transaction-mode pooler
+      # silently swallows LISTEN. Grant least privilege (SELECT + LISTEN, no write).
+      ROUTING_PG_RO_URL: ${ROUTING_PG_RO_URL:?set ROUTING_PG_RO_URL to a read-only routing DB connection (session, not a txn-mode pooler)}
+      MEMBERSHIP_BACKSTOP_INTERVAL: ${MEMBERSHIP_BACKSTOP_INTERVAL:-600}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
+      # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
   # --- Edge (data plane) ---------------------------------------------------- #
   # Envoy runs the tenant-first chain and forwards. The combined config lives in
   # ./envoy/envoy.yaml — edit its zitadel_jwks + pool_* upstreams for your infra.
