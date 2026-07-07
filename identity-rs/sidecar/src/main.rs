@@ -1161,6 +1161,8 @@ mod tests {
     /// Embedded test signing key (matches `testdata/test-jwks.json`), for the
     /// signed-contract tests.
     const TEST_PEM: &str = include_str!("testdata/test-ec-p256.pem");
+    /// The public JWKS matching `TEST_PEM`, for the end-to-end verify test.
+    const TEST_JWKS: &str = include_str!("testdata/test-jwks.json");
 
     /// A signer over the embedded test key (identity-contract-signing tests).
     fn test_signer() -> signer::Signer {
@@ -1474,6 +1476,74 @@ mod tests {
                 "{label}: any client-supplied contract is stripped without a signer",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn e2e_minted_token_verifies_against_the_served_jwks() {
+        // End-to-end within the process: load the key from a FILE (as in prod via a
+        // mounted secret), mint a token, publish it through the REAL JWKS HTTP handler,
+        // fetch the document over HTTP, and verify the token against the fetched keys —
+        // the full sign→publish→verify chain a box performs, minus the Envoy hop.
+        use std::env;
+        use std::fs;
+        use std::process;
+        use std::sync::Arc;
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request as HttpRequest;
+        use jsonwebtoken::jwk::JwkSet;
+        use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+
+        // Load the signing key from a real file (exercises Signer::from_pem_file).
+        let mut key_path = env::temp_dir();
+        key_path.push(format!("nexus-e2e-signer-{}.pem", process::id()));
+        fs::write(&key_path, TEST_PEM).expect("write temp key");
+        let signer = signer::Signer::from_pem_file(
+            key_path.to_str().expect("utf8 path"),
+            "test-key-1".to_owned(),
+            "https://identity.nexus".to_owned(),
+            "v1".to_owned(),
+            60,
+        )
+        .expect("load key from file");
+
+        // Mint a token for a member routed to the `evenout` box.
+        let token = signer
+            .mint(&signer::MintInput {
+                sub: "user-e2e",
+                aud: "evenout",
+                workspace_id: "ws-e2e",
+                member_type: "staff",
+                role: "admin",
+                roles: &["ops".to_owned()],
+                now: now_secs(),
+            })
+            .expect("mint");
+
+        // Publish the JWKS through the real handler and fetch the document over HTTP.
+        let app = jwks::router(Arc::new(TEST_JWKS.to_owned()));
+        let resp = app
+            .oneshot(HttpRequest::builder().uri(jwks::JWKS_PATH).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let jwks: JwkSet = serde_json::from_slice(body.as_ref()).expect("parse served JWKS");
+
+        // Verify the minted token against the FETCHED keys (what a box actually does).
+        let kid = decode_header(&token).unwrap().kid.expect("kid in header");
+        let jwk = jwks.find(&kid).expect("served JWKS must contain the signing kid");
+        let key = DecodingKey::from_jwk(jwk).expect("decoding key from jwk");
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&["evenout"]);
+        validation.set_issuer(&["https://identity.nexus"]);
+        let claims = decode::<identity_core::ContractClaims>(&token, &key, &validation)
+            .expect("token must verify against the served JWKS")
+            .claims;
+        assert_eq!(claims.sub, "user-e2e");
+        assert_eq!(claims.workspace_id, "ws-e2e");
+        assert_eq!(claims.aud, "evenout");
+        assert_eq!(claims.ctr, "v1");
+
+        let _ = fs::remove_file(&key_path);
     }
 
     #[test]
