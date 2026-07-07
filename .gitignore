@@ -108,6 +108,10 @@ GitHub.sublime-settings
 *.cert
 *.p12
 *.pfx
+# Exception: a throwaway P-256 test key fixture (NOT a secret — generated for unit/e2e
+# tests; the matching public JWKS is test-jwks.json). Needed at compile time by
+# include_str! and by the CI signing e2e. The `*.pem` guard still covers everything else.
+!identity-rs/sidecar/src/testdata/test-ec-p256.pem
 .pypirc
 
 # ============================================
