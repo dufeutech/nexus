@@ -63,6 +63,13 @@ spec:
               value: {{ .Values.router.rustLog | quote }}
             - name: LOG_FORMAT
               value: {{ .Values.router.logFormat | quote }}
+            {{- $otlp := include "routing-plane.otlpEndpoint" . }}
+            {{- if $otlp }}
+            # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
+            # collector (chart-local or umbrella global). Unset => export off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $otlp | quote }}
+            {{- end }}
           ports:
             - { name: ext-proc, containerPort: 50052 }
             - { name: debug, containerPort: 9300 }

@@ -19,6 +19,11 @@
 # here. There is no public image for the sidecar/authz-admin/membership-sync.
 # -------------------------------------------------------------------------- #
 images:
+  # ONE tag for all first-party images below (they build together from one workspace,
+  # so they share a release tag). Set this instead of overriding every per-image tag.
+  # A per-image `tag` still wins; empty here falls back to the umbrella
+  # `global.image.tag`, then the chart appVersion.
+  tag: ""
   # All three are built from the one ../../identity-rs workspace (shared `core`
   # crate), selected by Docker build target:
   #   docker build --target sidecar         -t REGISTRY/identity-sidecar-rs:0.1.0      ../../identity-rs
@@ -301,9 +306,24 @@ routingPg:
   url: ""                       # e.g. postgres://ro_user:pass@routing-host:5432/routingdb?sslmode=verify-full
 
 # -------------------------------------------------------------------------- #
-# Observability — emit a ServiceMonitor per component if you run the Prometheus
-# Operator. Native-histogram scraping for the sidecar still needs the operator's
-# Prometheus to enable that feature (see deploy/README.md).
+# Telemetry (first-party-telemetry) — the PRIMARY signal path. The Rust services
+# (sidecar, authz-admin, membership-sync) PUSH traces + metrics + logs via OTLP/gRPC
+# to your OTel Collector (the SINGLE telemetry egress; only the collector's config
+# knows the trace/metric/log stores). This is the Rust-plane twin of the edge's own
+# trace export — set it to light up metrics in your TSDB, logs in your log store, and
+# the metrics<->trace exemplar jump. UNSET (default "") = export OFF, stdout logs only
+# (fail-open opt-in). Running a real deployment WITHOUT this is an observability gap,
+# not a supported variant: a plane that can push telemetry, should.
+# -------------------------------------------------------------------------- #
+telemetry:
+  # OTLP/gRPC endpoint of your OTel Collector, e.g.
+  # http://otel-collector.monitoring.svc.cluster.local:4317. Empty => export off.
+  otlpEndpoint: ""
+
+# -------------------------------------------------------------------------- #
+# Observability — the ONLY remaining scrape target is Envoy's own admin stats via a
+# PodMonitor (the Rust services push OTLP above, they are not scraped). Requires the
+# Prometheus Operator.
 # -------------------------------------------------------------------------- #
 metrics:
   serviceMonitor:

@@ -139,7 +139,13 @@ helm install routing ./helm/routing-plane -n routing --create-namespace \
   --set edge.ingress.hosts='{*.example.com}'
 
 # Both planes, one combined edge (umbrella)
-helm dependency build ./helm/edge-platform
+# MANDATORY before every install/upgrade: re-vendor the subcharts. The subcharts are
+# LOCAL path dependencies, so edge-platform/charts/*.tgz are snapshots — `update`
+# regenerates Chart.lock AND repackages the CURRENT subchart source. Skipping it (or
+# using `dependency build`, which only restores a possibly-stale lock) renders the OLD
+# subchart templates — e.g. a removed template reappears or a new value is ignored.
+# The tarballs are gitignored (never committed), so a fresh checkout MUST run this.
+helm dependency update ./helm/edge-platform
 helm install edge ./helm/edge-platform -n edge --create-namespace -f my-values.yaml
 ```
 

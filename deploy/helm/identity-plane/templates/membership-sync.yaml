@@ -44,20 +44,28 @@ spec:
                   key: {{ include "identity-plane.routingPgSecretKey" . }}
             - name: MEMBERSHIP_BACKSTOP_INTERVAL
               value: {{ .Values.membershipSync.backstopIntervalSeconds | quote }}
-            - name: METRICS_PORT
-              value: "9000"
             - name: LOG_FORMAT
               value: {{ .Values.membershipSync.logFormat | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.membershipSync.logLevel | quote }}
+            {{- $otlp := include "identity-plane.otlpEndpoint" . }}
+            {{- if $otlp }}
+            # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
+            # collector (chart-local or umbrella global). Unset => export off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $otlp | quote }}
+            {{- end }}
           ports:
-            - { name: metrics, containerPort: 9000 }
+            # The worker's ONLY bound port: a /healthz surface for the kubelet. Metrics
+            # are PUSHED via OTLP (first-party-telemetry), not scraped, so this is not a
+            # metrics endpoint despite the historical :9000 number.
+            - { name: health, containerPort: 9000 }
           readinessProbe:
-            tcpSocket: { port: metrics }
+            httpGet: { path: /healthz, port: health }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket: { port: metrics }
+            httpGet: { path: /healthz, port: health }
             initialDelaySeconds: 15
             periodSeconds: 20
           resources: {{- toYaml .Values.membershipSync.resources | nindent 12 }}
@@ -88,5 +96,5 @@ spec:
   selector:
     {{- include "identity-plane.selectorLabels" (dict "ctx" . "component" "membership-sync") | nindent 4 }}
   ports:
-    - { name: metrics, port: 9000, targetPort: metrics, protocol: TCP }
+    - { name: health, port: 9000, targetPort: health, protocol: TCP }
 {{- end }}

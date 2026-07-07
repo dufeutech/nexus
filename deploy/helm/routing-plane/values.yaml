@@ -26,6 +26,10 @@
 #   docker build --target control-plane -t REGISTRY/control-plane:0.1.0  ../../routing-rs
 # -------------------------------------------------------------------------- #
 images:
+  # ONE tag for all first-party images below (they build together from one workspace).
+  # A per-image `tag` still wins; empty here falls back to the umbrella
+  # `global.image.tag`, then the chart appVersion.
+  tag: ""
   tenantRouter:
     repository: REGISTRY/tenant-router
     tag: ""            # defaults to .Chart.AppVersion when empty
@@ -257,6 +261,19 @@ redis:
   # Required when enabled. If it needs auth, embed credentials in the URL
   # (e.g. redis://:pass@host:6379) — it is a cache, not a source of truth.
   url: ""                       # e.g. redis://redis.cache.svc.cluster.local:6379
+
+# -------------------------------------------------------------------------- #
+# Telemetry (first-party-telemetry) — the PRIMARY signal path. The Rust services
+# (tenant-router, control-plane) PUSH traces + metrics + logs via OTLP/gRPC to your
+# OTel Collector (the SINGLE telemetry egress). Set it to light up metrics in your
+# TSDB, logs in your log store, and the metrics<->trace exemplar jump. UNSET
+# (default "") = export OFF, stdout logs only (fail-open opt-in). Running a real
+# deployment WITHOUT this is an observability gap, not a supported variant.
+# -------------------------------------------------------------------------- #
+telemetry:
+  # OTLP/gRPC endpoint of your OTel Collector, e.g.
+  # http://otel-collector.monitoring.svc.cluster.local:4317. Empty => export off.
+  otlpEndpoint: ""
 
 # -------------------------------------------------------------------------- #
 # Observability — emit a ServiceMonitor/PodMonitor per component if you run the

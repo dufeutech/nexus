@@ -62,6 +62,13 @@ spec:
             - name: CONTROL_AUTH_DISABLED
               value: "true"
             {{- end }}
+            {{- $otlp := include "routing-plane.otlpEndpoint" . }}
+            {{- if $otlp }}
+            # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
+            # collector (chart-local or umbrella global). Unset => export off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $otlp | quote }}
+            {{- end }}
           ports:
             # admin: the broker-only data API (RFC C16). ops: /metrics + /healthz,
             # on a SEPARATE port so the NetworkPolicy can open scraping/probes

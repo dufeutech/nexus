@@ -149,9 +149,11 @@ ZITADEL JWKS Host header (issuer authority) for the combined edge's jwt_authn.
 {{- end -}}
 
 {{/*
-Image ref helper: (dict "repo" R "tag" T "ctx" .) -> R:T (tag defaults to AppVersion).
+Image ref helper: (dict "repo" R "tag" T "ctx" .) -> R:T. Tag resolution order (first
+non-empty wins), so ONE value tags the whole combined edge: per-image `tag` -> the
+umbrella-wide `global.image.tag` -> the chart `appVersion`.
 */}}
 {{- define "edge-platform.image" -}}
-{{- $tag := .tag | default .ctx.Chart.AppVersion -}}
+{{- $tag := .tag | default (dig "image" "tag" "" (.ctx.Values.global | default dict)) | default .ctx.Chart.AppVersion -}}
 {{- printf "%s:%s" .repo $tag -}}
 {{- end -}}

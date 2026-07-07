@@ -31,9 +31,24 @@ app.kubernetes.io/component: {{ .component }}
 {{/*
 Image ref: ("repo" "tag" ctx) -> repo:tag, defaulting tag to AppVersion.
 */}}
+{{/*
+Image ref. Tag resolution order (first non-empty wins), so ONE value overrides ALL
+images: per-image `tag` -> chart-wide `images.tag` -> umbrella `global.image.tag` ->
+chart `appVersion`.
+*/}}
 {{- define "routing-plane.image" -}}
-{{- $tag := .tag | default .ctx.Chart.AppVersion -}}
+{{- $tag := .tag | default .ctx.Values.images.tag | default (dig "image" "tag" "" (.ctx.Values.global | default dict)) | default .ctx.Chart.AppVersion -}}
 {{- printf "%s:%s" .repo $tag -}}
+{{- end -}}
+
+{{/*
+OTLP telemetry endpoint (first-party-telemetry): the chart-local
+`telemetry.otlpEndpoint` if set, else the umbrella-wide `global.telemetry.otlpEndpoint`
+— so a combined (edge-platform) deploy sets ONE knob and both planes inherit it.
+Empty => the Rust planes export nothing (stdout logs only, fail-open).
+*/}}
+{{- define "routing-plane.otlpEndpoint" -}}
+{{- .Values.telemetry.otlpEndpoint | default (dig "telemetry" "otlpEndpoint" "" (.Values.global | default dict)) -}}
 {{- end -}}
 
 {{/*

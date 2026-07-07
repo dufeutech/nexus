@@ -62,6 +62,12 @@ spec:
               value: {{ $rv.router.rustLog | quote }}
             - name: LOG_FORMAT
               value: {{ $rv.router.logFormat | quote }}
+            {{- if and $.Values.global $.Values.global.telemetry $.Values.global.telemetry.otlpEndpoint }}
+            # first-party-telemetry: the combined edge's Rust containers push OTLP to
+            # the umbrella-wide collector (global.telemetry.otlpEndpoint). Unset => off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $.Values.global.telemetry.otlpEndpoint | quote }}
+            {{- end }}
           ports:
             - { name: rt-ext-proc, containerPort: 50052 }
             - { name: rt-debug, containerPort: 9300 }
@@ -95,6 +101,12 @@ spec:
               value: {{ $iv.sidecar.rustLog | quote }}
             - name: LOG_FORMAT
               value: {{ $iv.sidecar.logFormat | quote }}
+            {{- if and $.Values.global $.Values.global.telemetry $.Values.global.telemetry.otlpEndpoint }}
+            # first-party-telemetry: the combined edge's Rust containers push OTLP to
+            # the umbrella-wide collector (global.telemetry.otlpEndpoint). Unset => off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $.Values.global.telemetry.otlpEndpoint | quote }}
+            {{- end }}
           ports:
             - { name: id-ext-proc, containerPort: 50051 }
             - { name: id-profile, containerPort: 9200 }

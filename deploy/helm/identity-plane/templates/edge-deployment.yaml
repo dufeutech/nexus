@@ -47,6 +47,13 @@ spec:
               value: {{ .Values.sidecar.rustLog | quote }}
             - name: LOG_FORMAT
               value: {{ .Values.sidecar.logFormat | quote }}
+            {{- $otlp := include "identity-plane.otlpEndpoint" . }}
+            {{- if $otlp }}
+            # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
+            # collector (chart-local or umbrella global). Unset => export off.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ $otlp | quote }}
+            {{- end }}
           ports:
             - { name: ext-proc, containerPort: 50051 }
             - { name: profile, containerPort: 9200 }

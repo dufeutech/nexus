@@ -26,9 +26,13 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::Router;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge};
 use sqlx::postgres::PgListener;
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, info_span, warn};
@@ -53,6 +57,34 @@ fn env(key: &str, default: &str) -> String {
 }
 fn env_num<T: FromStr>(key: &str, default: T) -> T {
     var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// A minimal `/healthz` surface so the kubelet has a real liveness/readiness probe
+/// target. This worker's actual job is a Postgres `LISTEN` + a periodic backstop — it
+/// binds no request surface of its own, so a `tcpSocket` probe against a
+/// never-bound port would CrashLoop a functionally healthy worker. `/healthz`
+/// returning 200 means the process reached the serving stage and its async runtime is
+/// responsive (a hung runtime stops answering -> liveness fails -> restart). Metrics
+/// are PUSHED via OTLP (first-party-telemetry), never scraped here.
+async fn serve_health(port: u16, mut shutdown: watch::Receiver<bool>) {
+    let app = Router::new().route("/healthz", get(|| async { (StatusCode::OK, "ok") }));
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(error = %e, addr, "health surface bind failed");
+            return;
+        }
+    };
+    info!(addr, "health surface on /healthz");
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await
+    {
+        error!(error = %e, "health surface error");
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -136,6 +168,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // LISTEN). A SEPARATE database from the identity store in production.
     let routing_url = env("ROUTING_PG_RO_URL", "postgres://postgres:postgres@postgres:5432/routing");
     let backstop_interval = Duration::from_secs(env_num("MEMBERSHIP_BACKSTOP_INTERVAL", 600_u64));
+    // Health surface port — the kubelet's liveness/readiness probe target (default
+    // 9000, matching the chart's containerPort/Service). The worker has no request
+    // surface of its own, so this is purely a probe endpoint.
+    let health_port: u16 = env_num("HEALTH_PORT", 9000_u16);
 
     // Connect (with retry) to both planes. This worker is a profile writer, so it
     // owns idempotent identity-schema setup before the first backfill.
@@ -162,17 +198,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     info!(backstop_interval_s = backstop_interval.as_secs(), "started");
 
-    // Backfill/heal immediately on startup, before we depend on live signals.
-    if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
-        METRICS.errors.add(1, &[]);
-        error!(error = %e, "initial backstop pass failed");
-    }
-
     let (tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = tx.send(true);
     });
+
+    // Bring the health surface up as soon as both stores are connected — BEFORE the
+    // (potentially long) initial backstop — so the kubelet sees a healthy worker
+    // immediately instead of CrashLooping it while it converges.
+    tokio::spawn(serve_health(health_port, rx.clone()));
+
+    // Backfill/heal immediately on startup, before we depend on live signals.
+    if let Err(e) = run_backstop(reader.as_ref(), store.as_ref()).await {
+        METRICS.errors.add(1, &[]);
+        error!(error = %e, "initial backstop pass failed");
+    }
 
     // Periodic backstop.
     let backstop = {

@@ -9,6 +9,28 @@
 # sets edge-level concerns (replicas, resources, ingress, autoscaling).
 
 # -------------------------------------------------------------------------- #
+# Global values propagate to BOTH subcharts and the combined edge (first-party-
+# telemetry). Set global.telemetry.otlpEndpoint ONCE here and every Rust component
+# (combined edge's tenant-router + sidecar, plus authz-admin / membership-sync /
+# control-plane in the subcharts) pushes traces + metrics + logs via OTLP/gRPC to it —
+# lighting up metrics in your TSDB, logs in your log store, and the metrics<->trace
+# exemplar jump. A subchart's own telemetry.otlpEndpoint overrides this for that plane.
+# Empty (default) => export off (stdout logs only, fail-open). This is separate from
+# `edge.tracing` below, which wires ONLY Envoy's trace export.
+# -------------------------------------------------------------------------- #
+global:
+  # ONE image tag for the whole platform — the combined edge AND both subcharts'
+  # components. The first-party images are built together, so they share a release
+  # tag; set it here once instead of overriding every per-image tag. A per-image or
+  # per-subchart `images.tag` still overrides this. Empty => each chart's appVersion.
+  image:
+    tag: ""
+  telemetry:
+    # OTLP/gRPC endpoint of your OTel Collector, e.g.
+    # http://otel-collector.monitoring.svc.cluster.local:4317. Empty => export off.
+    otlpEndpoint: ""
+
+# -------------------------------------------------------------------------- #
 # Routing plane (subchart) — deploys the control plane only (its edge is disabled;
 # this umbrella runs the combined one). The routing store (Postgres) and optional
 # L2 (Redis) are EXTERNAL. Set images.*, postgres.* (external), redis.* (external,
