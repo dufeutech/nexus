@@ -110,7 +110,10 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
-      - "9300:9300"   # admin authoring API + /healthz
+      # Host 9303 → container 9300 (the app binds + healthchecks 9300 internally).
+      # The lab tenant-router already publishes host 9300 for its debug API, so the
+      # authoring API is mapped to a distinct host port to avoid the collision.
+      - "9303:9300"   # admin authoring API + /healthz (container :9300)
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9300/healthz"]
       interval: 5s
