@@ -331,6 +331,43 @@ metrics:
     # Extra labels so your Prometheus Operator's serviceMonitorSelector matches.
     labels: {}
     interval: "15s"
+  # Nexus-authored app-SLO alert rules shipped as a PrometheusRule CR (the natural twin
+  # of serviceMonitor above) — consumed by the Prometheus Operator OR the
+  # VictoriaMetrics operator/vmalert. nexus AUTHORS the rules (they need domain
+  # knowledge of the metrics); your engine EVALUATES them. Requires that operator's CRD.
+  prometheusRule:
+    enabled: false
+    # Extra labels so your operator's ruleSelector matches (e.g. release: kube-prom-stack).
+    labels: {}
+    # Alert thresholds — the "> X" in each rule; tune to your SLOs. The `result`/`op`
+    # rules additionally require your OTel collector to KEEP those metric attributes
+    # (nexus's lab collector does; a stripping collector makes them under-fire).
+    thresholds:
+      edge5xxRatio: 0.02              # edge 5xx / all responses over 5m (Envoy, scraped)
+      edgeP99Milliseconds: 500        # edge downstream request p99 (Envoy rq_time is ms)
+      enrichP99Seconds: 0.05          # sidecar ext_proc p99
+      forbiddenPerSecond: 5           # authz gate 403 policy-denials/s (needs `result`)
+      failClosedPerSecond: 0.1        # sidecar fail-closed 503/s — should be ~0 (needs `result`)
+      membershipErrorsPerSecond: 0.5  # membership-sync errors/s
+      unauthorizedPerSecond: 1        # authz-admin 401/s (needs `op`)
+
+# -------------------------------------------------------------------------- #
+# Dashboards — nexus-authored Grafana dashboards shipped as ConfigMaps (the twin of
+# the PrometheusRule above). The Grafana SIDECAR auto-discovers any ConfigMap carrying
+# the watched label and loads the JSON — so nexus ships the dashboard content as code
+# and your Grafana renders it. Requires the sidecar (kube-prometheus-stack / grafana
+# chart) watching for `label`. The dashboards use a `datasource` template variable, so
+# they bind to whatever Prometheus/VictoriaMetrics datasource you pick.
+# -------------------------------------------------------------------------- #
+dashboards:
+  enabled: false
+  # The label + value the Grafana sidecar watches (kube-prometheus-stack default).
+  label: grafana_dashboard
+  labelValue: "1"
+  # OPTIONAL: file the dashboards under a Grafana folder via this sidecar annotation
+  # (e.g. grafana_folder). Empty => no folder annotation (Grafana's default folder).
+  folderAnnotation: ""
+  folder: "Nexus"
 
 # Common pod hardening defaults, applied to every workload.
 podSecurityContext:

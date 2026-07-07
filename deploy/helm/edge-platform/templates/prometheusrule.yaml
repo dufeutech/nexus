@@ -1,0 +1,43 @@
+{{- if .Values.metrics.prometheusRule.enabled -}}
+{{- $t := .Values.metrics.prometheusRule.thresholds -}}
+# Nexus-authored SLO rules for the COMBINED edge this umbrella owns (Envoy — the
+# tenant-first data plane). The per-plane Rust-service rules (identity + routing) are
+# shipped by the subcharts; enable them with
+# identity-plane.metrics.prometheusRule.enabled / routing-plane.metrics.prometheusRule.enabled.
+# Consumed by the Prometheus Operator OR the VictoriaMetrics operator/vmalert; Envoy
+# admin stats are SCRAPED, so these are collector-independent.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-edge-slo
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: nexus-edge.slo
+      rules:
+        - alert: NexusEdge5xxHigh
+          expr: |
+            sum(rate(envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="edge"}[5m]))
+              / sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m]))
+              > {{ $t.edge5xxRatio }}
+          for: 5m
+          labels: { severity: critical, plane: edge }
+          annotations:
+            summary: "Edge 5xx ratio high"
+            description: >-
+              More than {{ $t.edge5xxRatio }} of combined-edge responses were 5xx over
+              5m — the edge or a backend pool is failing. Envoy admin stats (scraped).
+        - alert: NexusEdgeLatencyHigh
+          expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }}
+          for: 10m
+          labels: { severity: warning, plane: edge }
+          annotations:
+            summary: "Edge request p99 latency high"
+            description: >-
+              Combined-edge downstream request p99 has been above
+              {{ $t.edgeP99Milliseconds }}ms for 10m (Envoy `downstream_rq_time` is ms).
+{{- end }}

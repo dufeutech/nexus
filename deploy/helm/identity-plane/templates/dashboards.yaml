@@ -1,0 +1,24 @@
+{{- if .Values.dashboards.enabled }}
+# Nexus-authored Grafana dashboards shipped as ConfigMaps (first-party-telemetry). The
+# Grafana sidecar (kube-prometheus-stack / grafana chart) auto-discovers any ConfigMap
+# carrying the watched label and loads the JSON — so nexus ships its app dashboards as
+# code, the natural twin of the PrometheusRule + serviceMonitor. One ConfigMap per
+# dashboards/*.json in this chart.
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "identity-plane.fullname" $ }}-dash-{{ base $path | trimSuffix ".json" }}
+  labels:
+    {{ $.Values.dashboards.label }}: {{ $.Values.dashboards.labelValue | quote }}
+    {{- include "identity-plane.labels" $ | nindent 4 }}
+  {{- with $.Values.dashboards.folderAnnotation }}
+  annotations:
+    {{ . }}: {{ $.Values.dashboards.folder | quote }}
+  {{- end }}
+data:
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

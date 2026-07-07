@@ -285,6 +285,34 @@ metrics:
     enabled: false
     labels: {}
     interval: "15s"
+  # Nexus-authored app-SLO alert rules as a PrometheusRule CR (twin of serviceMonitor)
+  # — consumed by the Prometheus Operator OR the VictoriaMetrics operator/vmalert.
+  # nexus AUTHORS, your engine EVALUATES. Requires that operator's CRD.
+  prometheusRule:
+    enabled: false
+    # Extra labels so your operator's ruleSelector matches (e.g. release: kube-prom-stack).
+    labels: {}
+    # Alert thresholds — the "> Y" in each rule; tune to your SLOs. The `result`/`op`
+    # rules require your OTel collector to KEEP those metric attributes.
+    thresholds:
+      edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
+      edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
+      routingP99Seconds: 0.05       # tenant-router decision p99
+      rejectPerSecond: 10           # unknown-host rejects (404)/s (needs `result`)
+      unauthorizedPerSecond: 1      # control-plane 401/s (needs `op`)
+
+# -------------------------------------------------------------------------- #
+# Dashboards — nexus-authored Grafana dashboards shipped as ConfigMaps (twin of the
+# PrometheusRule above). The Grafana SIDECAR auto-discovers ConfigMaps carrying the
+# watched label and loads the JSON. Requires the sidecar (kube-prometheus-stack /
+# grafana chart). The dashboards use a `datasource` template variable.
+# -------------------------------------------------------------------------- #
+dashboards:
+  enabled: false
+  label: grafana_dashboard
+  labelValue: "1"
+  folderAnnotation: ""
+  folder: "Nexus"
 
 # Common pod hardening defaults, applied to the first-party workloads (router,
 # control-plane). All workloads here are stateless; the stores are external.

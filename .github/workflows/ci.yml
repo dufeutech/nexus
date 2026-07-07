@@ -147,8 +147,11 @@ jobs:
           ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing \
                 --set oidc.jwksTls.enabled=true \
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
+          # Also exercise the opt-in monitoring artifacts (PrometheusRule + dashboards).
+          MON="--set metrics.prometheusRule.enabled=true --set dashboards.enabled=true"
           helm lint identity-plane $ARGS
           helm template rel identity-plane $ARGS >/dev/null
+          helm template rel identity-plane $ARGS $MON >/dev/null
 
       - name: Lint & render routing-plane
         run: |
@@ -157,6 +160,8 @@ jobs:
           BASE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
           helm lint routing-plane $BASE
           helm template rel routing-plane $BASE >/dev/null
+          # Opt-in monitoring artifacts (PrometheusRule + dashboards).
+          helm template rel routing-plane $BASE --set metrics.prometheusRule.enabled=true --set dashboards.enabled=true >/dev/null
           helm template rel routing-plane $BASE --set postgres.readUrl=postgres://u:p@pgbouncer:6432/routing >/dev/null
           # Exercise the auth-disabled path and the broker-only NetworkPolicy helpers.
           helm template rel routing-plane --set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.enabled=false >/dev/null
@@ -174,6 +179,11 @@ jobs:
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint edge-platform $ARGS
           helm template rel edge-platform $ARGS >/dev/null
+          # Opt-in monitoring artifacts across the umbrella + both subcharts.
+          helm template rel edge-platform $ARGS \
+            --set metrics.prometheusRule.enabled=true \
+            --set identity-plane.metrics.prometheusRule.enabled=true --set identity-plane.dashboards.enabled=true \
+            --set routing-plane.metrics.prometheusRule.enabled=true --set routing-plane.dashboards.enabled=true >/dev/null
 
       # Fail-closed guard matrix (production-readiness-gate): asserts that a
       # topology missing an origin-enforcement or JWKS-integrity choice REFUSES

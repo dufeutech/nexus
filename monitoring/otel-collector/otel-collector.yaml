@@ -59,6 +59,12 @@ processors:
   # `cardinality_guardian` processor (see design decision).
   transform/cardinality:
     error_mode: ignore
+    # `result`, `op`, `tier` are the LOW-cardinality nexus RED dimensions the
+    # first-party dashboards + PrometheusRules key on (ext_proc outcome, admin
+    # mutation kind, cache tier — a handful of values each). They MUST stay on the
+    # allow-list or `sum by (result)` / an "authz gate 403 spike" rule collapses to a
+    # single label-less series. A production collector consuming nexus's shipped rules
+    # must keep these too.
     metric_statements:
       - context: datapoint
         statements:
@@ -69,7 +75,8 @@ processors:
               "deployment.environment", "deployment.environment.name",
               "http.request.method", "http.response.status_code",
               "http.route", "rpc.grpc.status_code", "rpc.method",
-              "rpc.service", "otel.scope.name", "error.type"
+              "rpc.service", "otel.scope.name", "error.type",
+              "result", "op", "tier"
             ])
 
   # Batch before export — standard back-pressure hygiene for the OTLP exporters.

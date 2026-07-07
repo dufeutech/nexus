@@ -236,6 +236,23 @@ must emit — is the "Box telemetry contract" section of
   or store never affects request handling; boxes buffer/drop telemetry and
   resume on their own when the collector returns. Producers deliberately do
   not `depends_on` the collector.
+- **Nexus ships its alert rules + dashboards as code (opt-in chart artifacts).**
+  The engine evaluates; nexus authors the content (it needs domain knowledge of the
+  metrics). Enable per chart:
+  - `metrics.prometheusRule.enabled=true` → a `PrometheusRule` CR of app-SLO alerts
+    (edge 5xx ratio, routing/enrich p99, authz-gate 403/fail-closed spike,
+    membership-sync/control-plane errors). Consumed by the Prometheus Operator **or**
+    the VictoriaMetrics operator/vmalert. Tune the `> X` values under
+    `metrics.prometheusRule.thresholds`. On the umbrella, enable it on each subchart
+    (`identity-plane.metrics.prometheusRule.enabled`, `routing-plane…`) plus the
+    edge-platform block for the combined edge.
+  - `dashboards.enabled=true` → Grafana dashboards as ConfigMaps labelled for the
+    Grafana sidecar's auto-discovery (kube-prometheus-stack / grafana chart).
+  - **Collector caveat:** the `result`/`op`/`tier` metric attributes several rules and
+    dashboard panels key on are LOW-cardinality nexus RED dimensions. Your OTel
+    collector MUST keep them (nexus's lab collector does — `monitoring/otel-collector`);
+    a `keep_keys` allow-list that drops them makes those rules silently under-fire and
+    `by (result)` panels collapse. The edge (Envoy) rules are scraped, so unaffected.
 
 ## Telemetry cost controls (the cost posture of the stack)
 

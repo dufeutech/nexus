@@ -1,0 +1,22 @@
+{{- if .Values.dashboards.enabled }}
+# Nexus-authored Grafana dashboards shipped as ConfigMaps (first-party-telemetry): the
+# Grafana sidecar auto-discovers any ConfigMap carrying the watched label and loads the
+# JSON. One ConfigMap per dashboards/*.json in this chart.
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "routing-plane.fullname" $ }}-dash-{{ base $path | trimSuffix ".json" }}
+  labels:
+    {{ $.Values.dashboards.label }}: {{ $.Values.dashboards.labelValue | quote }}
+    {{- include "routing-plane.labels" $ | nindent 4 }}
+  {{- with $.Values.dashboards.folderAnnotation }}
+  annotations:
+    {{ . }}: {{ $.Values.dashboards.folder | quote }}
+  {{- end }}
+data:
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}
