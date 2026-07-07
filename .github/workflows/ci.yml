@@ -217,6 +217,13 @@ jobs:
           # which start-from-init is not crash-idempotent (AlreadyExists on
           # every restart) and the stack can never come up.
           mkdir -p machinekey && chmod 777 machinekey
+          # identity-contract-signing: enable signing in the reference stack so the
+          # member path emits a real signed JWS (verified in the authenticated-member
+          # e2e). Reuse the committed throwaway test keypair + matching JWKS (kid
+          # test-key-1) as CI signing material, mounted at /etc/nexus/signing.
+          cp identity-rs/sidecar/src/testdata/test-ec-p256.pem deploy/compose/signing/key.pem
+          cp identity-rs/sidecar/src/testdata/test-jwks.json    deploy/compose/signing/jwks.json
+          export SIGNING_KEY_PATH=/etc/nexus/signing/key.pem SIGNING_KID=test-key-1 JWKS_FILE=/etc/nexus/signing/jwks.json
           # `|| true`: compose's dependency wait can flag a service whose FIRST
           # start attempt fails even though restart: unless-stopped self-heals it
           # (e.g. an IdP init racing its database). The readiness poll below is

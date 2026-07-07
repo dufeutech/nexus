@@ -333,9 +333,21 @@ services:
       READINESS_DELAY_SECONDS: ${SIDECAR_READINESS_DELAY:-0}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
+      # identity-contract-signing: signed x-identity-contract (no plain-string form).
+      # Off unless SIGNING_KEY_PATH is set (anonymous is unaffected); drop key.pem +
+      # jwks.json into ./deploy/compose/signing and set these to enable.
+      SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-}
+      SIGNING_KID: ${SIGNING_KID:-}
+      SIGNING_ISSUER: ${SIGNING_ISSUER:-https://identity.nexus}
+      CONTRACT_TOKEN_TTL_SECONDS: ${CONTRACT_TOKEN_TTL_SECONDS:-60}
+      JWKS_FILE: ${JWKS_FILE:-}
+      JWKS_LISTEN: ${JWKS_LISTEN:-0.0.0.0:9210}
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)
+      - "${JWKS_HOST_PORT:-9210}:9210"   # public JWKS (serves only when JWKS_FILE set)
+    volumes:
+      - ./deploy/compose/signing:/etc/nexus/signing:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9200/healthz"]
       interval: 5s

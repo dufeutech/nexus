@@ -114,14 +114,22 @@ done
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")
 ok "$([ "$CODE" = "200" ] && echo 1 || echo 0)" "authenticated member request -> 200 (got $CODE)"
 
-# identity-contract-signing: x-identity-contract is now a SIGNED token minted only when
-# signing is configured (no plain-string `v1`). The reference stack boots with signing
-# OFF (no key), so the member path carries no contract here — which also guards against the
-# legacy `v1` string sneaking back. The signed-member path (a verifiable JWS) is covered by
-# scripts/contract-signing-e2e.sh against a signing-enabled stack, plus the sidecar unit
-# tests. The membership-derived scope below is what this suite proves.
+# identity-contract-signing: x-identity-contract is a SIGNED token (no plain-string `v1`),
+# minted only for a resolved member when signing is configured. This suite runs with
+# signing ENABLED (CI mounts a test key), so the member carries a verifiable JWS; it stays
+# correct with signing off too (no contract at all — the legacy `v1` is gone).
+b64url_decode() { s=$1; case $(( ${#s} % 4 )) in 2) s="${s}==";; 3) s="${s}=";; esac; printf '%s' "$s" | tr '_-' '/+' | base64 -d 2>/dev/null; }
 V=$(hdr_val "$BODY" "X-Identity-Contract")
-ok "$([ -z "$V" ] && echo 1 || echo 0)" "no plain contract stamp with signing off (got '${V:-<none>}')"
+if [ -n "$V" ]; then
+  SEGS=$(printf '%s' "$V" | awk -F. '{print NF}')
+  ok "$([ "$SEGS" = 3 ] && echo 1 || echo 0)" "member x-identity-contract is a signed JWS (got $SEGS segments)"
+  PAYLOAD=$(b64url_decode "$(printf '%s' "$V" | cut -d. -f2)")
+  ok "$(printf '%s' "$PAYLOAD" | grep -q '"workspace_id":"acme"' && echo 1 || echo 0)" "signed contract carries workspace_id=acme"
+  JWKS=$(curl -s --max-time 5 http://localhost:9210/.well-known/jwks.json)
+  ok "$(printf '%s' "$JWKS" | grep -q '\"kty\"' && echo 1 || echo 0)" "JWKS endpoint publishes the verification keys"
+else
+  ok 1 "signing disabled -> no plain contract (legacy v1 removed)"
+fi
 
 ANON=$(hdr_val "$BODY" "X-Auth-Anonymous")
 ok "$([ "$ANON" = "false" ] && echo 1 || echo 0)" "x-auth-anonymous is false (got '${ANON:-<none>}')"
