@@ -53,6 +53,10 @@ spec:
             # collector (chart-local or umbrella global). Unset => export off.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $otlp | quote }}
+            # first-party-telemetry: deployment.environment.name is a REQUIRED invariant
+            # when export is on (per-environment SLOs); render fails closed if unset.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "identity-plane.otelResourceAttributes" . | quote }}
             {{- end }}
             {{- if .Values.sidecar.signing.enabled }}
             # identity-contract-signing: sign x-identity-contract (ES256) + publish the

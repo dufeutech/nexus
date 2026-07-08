@@ -117,6 +117,19 @@ Empty => the Rust planes export nothing (stdout logs only, fail-open).
 {{- end -}}
 
 {{/*
+OTLP resource attributes (first-party-telemetry). `deployment.environment.name` is a
+REQUIRED, verified invariant whenever telemetry export is ON: a per-environment SLO is
+undefined without it, so render FAILS CLOSED here when it is empty — mirroring the Rust
+services' startup guard. Only invoked inside the `if $otlp` block, so export-off deploys
+are unaffected. Inherits the umbrella global.telemetry.environment when the subchart's is unset.
+*/}}
+{{- define "identity-plane.otelResourceAttributes" -}}
+{{- $env := .Values.telemetry.environment | default (dig "telemetry" "environment" "" (.Values.global | default dict)) -}}
+{{- $env = required "telemetry.environment is REQUIRED when telemetry.otlpEndpoint is set: every first-party signal must carry deployment.environment.name for per-environment SLOs (first-party-telemetry). Set telemetry.environment (or global.telemetry.environment), e.g. \"production\"." $env -}}
+deployment.environment.name={{ $env }}
+{{- end -}}
+
+{{/*
 Issuer authority (host[:port]) — used as the JWKS Host header default.
 */}}
 {{- define "identity-plane.jwksHost" -}}

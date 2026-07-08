@@ -42,6 +42,11 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # first-party-telemetry: deployment.environment.name every first-party signal is
+      # stamped with. REQUIRED when the endpoint above is set (per-environment SLOs) —
+      # the service refuses to start otherwise. Defaults to "lab" so a clean checkout
+      # runs with telemetry on out of the box.
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9300/healthz"]
       interval: 10s
@@ -61,6 +66,11 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # first-party-telemetry: deployment.environment.name every first-party signal is
+      # stamped with. REQUIRED when the endpoint above is set (per-environment SLOs) —
+      # the service refuses to start otherwise. Defaults to "lab" so a clean checkout
+      # runs with telemetry on out of the box.
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Pool allow-list (RFC C15). Empty -> the control plane's built-in default
       # (application, api, checkout, assets), which matches the pool_* clusters in
@@ -95,6 +105,11 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # first-party-telemetry: deployment.environment.name every first-party signal is
+      # stamped with. REQUIRED when the endpoint above is set (per-environment SLOs) —
+      # the service refuses to start otherwise. Defaults to "lab" so a clean checkout
+      # runs with telemetry on out of the box.
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
       # identity-contract-signing: x-identity-contract is a SIGNED token (no plain-string
       # form). Provide signing material to emit it — drop key.pem + jwks.json into
       # ./signing/ and set SIGNING_KEY_PATH + SIGNING_KID + JWKS_FILE. Without it the
@@ -145,6 +160,11 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # first-party-telemetry: deployment.environment.name every first-party signal is
+      # stamped with. REQUIRED when the endpoint above is set (per-environment SLOs) —
+      # the service refuses to start otherwise. Defaults to "lab" so a clean checkout
+      # runs with telemetry on out of the box.
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "127.0.0.1:9300:9300"   # bound to loopback: admin boundary only
@@ -172,6 +192,11 @@ services:
       # first-party-telemetry: OTLP collector endpoint. Unset (the default) =>
       # telemetry export off, logs to stdout exactly as before (fail-open opt-in).
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # first-party-telemetry: deployment.environment.name every first-party signal is
+      # stamped with. REQUIRED when the endpoint above is set (per-environment SLOs) —
+      # the service refuses to start otherwise. Defaults to "lab" so a clean checkout
+      # runs with telemetry on out of the box.
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
       LOG_LEVEL: ${LOG_LEVEL:-info}
 
   # --- Edge (data plane) ---------------------------------------------------- #

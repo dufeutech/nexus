@@ -1,0 +1,131 @@
+# promtool unit tests for the generated tenant-router SLO burn-rate rules
+# (change: slo-burn-rate-policy). Deterministic — no live stack: promtool evaluates the
+# generated recording + alert rules against synthetic series. Run with:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w" prom/prometheus:v3.5.0 \
+#     test rules /w/monitoring/slo/tests/tenant-router.slo_test.yaml
+#
+# Verifies (design/spec: slo-burn-rate-policy, service-slo-policy):
+#  - the SLI recording rule computes a per-environment error ratio from the
+#    outcome-attributed metric (production burning vs staging healthy)  [env isolation]
+#  - a sustained fast burn raises the page AND ticket alerts for the burning env only
+rule_files:
+  - ../../prometheus/rules/tenant-router.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # production: every resolution is a fail-closed 503 (result="not_ready") ->
+      # error ratio = 1.0 (a total outage) for ~65m so every rate window has data.
+      - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
+        values: '0+10x65'
+      # staging: healthy — only successful hits, and a flat-zero not_ready counter ->
+      # error ratio = 0.0 (its budget must stay untouched while production burns).
+      - series: 'router_ext_proc_requests_total{result="hit", deployment_environment_name="staging"}'
+        values: '0+10x65'
+      - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="staging"}'
+        values: '0x65'
+
+    # --- SLI recording rule is per-environment and outcome-derived --------------
+    promql_expr_test:
+      - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="production"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate5m{deployment_environment_name="production", plane="routing", sloth_id="tenant-router-availability", sloth_service="tenant-router", sloth_slo="availability", sloth_window="5m"}'
+            value: 1
+      - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="staging"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate5m{deployment_environment_name="staging", plane="routing", sloth_id="tenant-router-availability", sloth_service="tenant-router", sloth_slo="availability", sloth_window="5m"}'
+            value: 0
+
+    # --- fast burn pages (and tickets) for production only ----------------------
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: TenantRouterAvailability
+        exp_alerts:
+          - exp_labels:
+              deployment_environment_name: production
+              plane: routing
+              severity: page
+              sloth_severity: page
+              sloth_id: tenant-router-availability
+              sloth_service: tenant-router
+              sloth_slo: availability
+            exp_annotations:
+              summary: Tenant-router availability error budget is burning
+              title: "(page) tenant-router availability SLO error budget burn rate is too fast."
+          - exp_labels:
+              deployment_environment_name: production
+              plane: routing
+              severity: ticket
+              sloth_severity: ticket
+              sloth_id: tenant-router-availability
+              sloth_service: tenant-router
+              sloth_slo: availability
+            exp_annotations:
+              summary: Tenant-router availability error budget is burning
+              title: "(ticket) tenant-router availability SLO error budget burn rate is too fast."
+
+  # ---------------------------------------------------------------------------
+  # 5.2 — a slow, sustained burn opens a TICKET but does NOT page.
+  # Constant 0.5% error ratio for ~25h: above the ticket burn factor (3x / 1x the
+  # error budget on the 2h/1d and 6h/3d windows) but well below the page factor
+  # (14.4x / 6x on 5m/1h and 30m/6h). Sampled at 5m so the long windows have data.
+  # ---------------------------------------------------------------------------
+  - interval: 5m
+    input_series:
+      # 5 not_ready + 995 hit per 5m => error ratio 5/1000 = 0.005 (0.5%), constant.
+      - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
+        values: '0+5x300'
+      - series: 'router_ext_proc_requests_total{result="hit", deployment_environment_name="production"}'
+        values: '0+995x300'
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: TenantRouterAvailability
+        exp_alerts:
+          - exp_labels:
+              deployment_environment_name: production
+              plane: routing
+              severity: ticket
+              sloth_severity: ticket
+              sloth_id: tenant-router-availability
+              sloth_service: tenant-router
+              sloth_slo: availability
+            exp_annotations:
+              summary: Tenant-router availability error budget is burning
+              title: "(ticket) tenant-router availability SLO error budget burn rate is too fast."
+
+  # ---------------------------------------------------------------------------
+  # 5.3 — a brief spike does NOT page: the short (5m) window is over the fast-burn
+  # threshold, but the long (1h) window does not corroborate, and the spike is too
+  # small to trip the 30m/6h clause or any ticket window. Multi-window corroboration
+  # is what suppresses the false page.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      # 6h of healthy traffic (200 hit/min), then a 5-minute burst of 20 not_ready.
+      - series: 'router_ext_proc_requests_total{result="hit", deployment_environment_name="production"}'
+        values: '0+200x360'
+      - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
+        values: '0x355 5 10 15 20 20'
+    promql_expr_test:
+      # sanity: the spike DID elevate the short 5m window past the page threshold
+      # (14.4 * 0.001 = 0.0144); `bool` yields 1 where the comparison holds.
+      - expr: 'max(slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="production"} > bool 0.0144)'
+        eval_time: 360m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      # ...but the 1h window did NOT (well under 0.0144), so corroboration fails.
+      - expr: 'max(slo:sli_error:ratio_rate1h{sloth_slo="availability", deployment_environment_name="production"} > bool 0.0144)'
+        eval_time: 360m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+    alert_rule_test:
+      # ...so NO alert fires — the brief spike is suppressed by multi-window corroboration.
+      - eval_time: 360m
+        alertname: TenantRouterAvailability
+        exp_alerts: []

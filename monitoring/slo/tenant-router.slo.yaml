@@ -1,0 +1,68 @@
+# Sloth SLO spec — tenant-router (change: slo-burn-rate-policy).
+#
+# Sloth compiles this into SLI recording rules + multi-window multi-burn-rate (MWMB)
+# alert rules: the error-prone burn-rate math is GENERATED, not hand-written (design
+# decision: Adopt Sloth). Regenerate with `monitoring/slo/generate.sh` after any edit
+# and commit the output; NEVER hand-edit the generated rules file.
+#
+# The objective targets, the 100ms latency threshold, and the good/bad classification
+# below are the SRE-tunable knobs (task 1.3): review with SRE before treating as final.
+# Per-environment scoping rides on the promoted `deployment_environment_name` label
+# (see monitoring/prometheus/prometheus.yml `promote_resource_attributes`), so every
+# generated recording rule and alert fires independently per deployment environment.
+version: "prometheus/v1"
+service: "tenant-router"
+labels:
+  plane: routing
+slos:
+  - name: "availability"
+    objective: 99.9
+    description: >-
+      Served fraction of tenant-router ext_proc resolutions, per deployment environment.
+      BAD = result="not_ready" (warming / routing-store-unreachable 503, fail-closed).
+      GOOD = hit (resolved) and reject (unknown host -> 404, a correct outcome, not a
+      service fault).
+    sli:
+      events:
+        error_query: sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[{{.window}}]))
+        total_query: sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[{{.window}}]))
+    alerting:
+      name: TenantRouterAvailability
+      labels:
+        plane: routing
+      annotations:
+        summary: "Tenant-router availability error budget is burning"
+      page_alert:
+        labels:
+          severity: page
+      ticket_alert:
+        labels:
+          severity: ticket
+  - name: "latency"
+    objective: 99.0
+    description: >-
+      Fraction of SUCCESSFUL (result="hit") tenant-router resolutions served under 100ms,
+      per deployment environment. Outcome-aware: slow error/warming paths do NOT count
+      against the latency objective — this is exactly what the `result` attribute added to
+      the duration histogram enables (previously latency fused success and error).
+    sli:
+      events:
+        error_query: |
+          (
+            sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[{{.window}}]))
+            -
+            sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_bucket{result="hit",le="0.1"}[{{.window}}]))
+          )
+        total_query: sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[{{.window}}]))
+    alerting:
+      name: TenantRouterLatency
+      labels:
+        plane: routing
+      annotations:
+        summary: "Tenant-router latency error budget is burning"
+      page_alert:
+        labels:
+          severity: page
+      ticket_alert:
+        labels:
+          severity: ticket

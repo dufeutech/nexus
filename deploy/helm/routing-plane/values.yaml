@@ -274,6 +274,12 @@ telemetry:
   # OTLP/gRPC endpoint of your OTel Collector, e.g.
   # http://otel-collector.monitoring.svc.cluster.local:4317. Empty => export off.
   otlpEndpoint: ""
+  # deployment.environment.name every first-party signal is stamped with (first-
+  # party-telemetry). REQUIRED once otlpEndpoint is set: per-environment SLOs are
+  # undefined without it, so a telemetry-on render FAILS CLOSED when this is empty
+  # (the Rust services enforce the same invariant at startup). Inherits the umbrella
+  # global.telemetry.environment when unset here. e.g. "production".
+  environment: ""
 
 # -------------------------------------------------------------------------- #
 # Observability — emit a ServiceMonitor/PodMonitor per component if you run the

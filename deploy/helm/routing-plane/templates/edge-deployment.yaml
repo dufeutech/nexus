@@ -69,6 +69,10 @@ spec:
             # collector (chart-local or umbrella global). Unset => export off.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $otlp | quote }}
+            # first-party-telemetry: deployment.environment.name is a REQUIRED invariant
+            # when export is on (per-environment SLOs); render fails closed if unset.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "routing-plane.otelResourceAttributes" . | quote }}
             {{- end }}
           ports:
             - { name: ext-proc, containerPort: 50052 }

@@ -1170,8 +1170,13 @@ impl Sidecar {
             warn!("not ready -> 503");
             (warming_503(), "not_ready")
         };
-        METRICS.ext_proc_duration.record(started.elapsed().as_secs_f64(), &[]);
-        METRICS.ext_proc_requests.add(1, &[KeyValue::new("result", result.to_owned())]);
+        // Outcome-aware RED: latency and the request counter share one `result`
+        // attribute so latency is sliceable by outcome (the availability/latency SLO
+        // depends on this) and both series stay label-consistent. `result` is a bounded
+        // low-card enum already in the collector allow-list.
+        let outcome = [KeyValue::new("result", result.to_owned())];
+        METRICS.ext_proc_duration.record(started.elapsed().as_secs_f64(), &outcome);
+        METRICS.ext_proc_requests.add(1, &outcome);
         Span::current().record("enrich.result", result);
         Some(resp)
     }

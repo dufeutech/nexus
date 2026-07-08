@@ -137,6 +137,19 @@ OPTIONAL external L2 — empty unless routing-plane.redis is enabled.
 {{- end -}}
 
 {{/*
+OTLP resource attributes for the combined edge's Rust containers (first-party-telemetry).
+`deployment.environment.name` is a REQUIRED, verified invariant whenever export is ON: a
+per-environment SLO is undefined without it, so render FAILS CLOSED when
+global.telemetry.environment is empty — mirroring the Rust services' startup guard. Only
+invoked inside the `if …otlpEndpoint` block, so export-off deploys are unaffected. Call with
+root context ($), since the container env lists reference $.Values.global directly.
+*/}}
+{{- define "edge-platform.otelResourceAttributes" -}}
+{{- $env := required "global.telemetry.environment is REQUIRED when global.telemetry.otlpEndpoint is set: every first-party signal must carry deployment.environment.name for per-environment SLOs (first-party-telemetry), e.g. \"production\"." (dig "telemetry" "environment" "" (.Values.global | default dict)) -}}
+deployment.environment.name={{ $env }}
+{{- end -}}
+
+{{/*
 ZITADEL JWKS Host header (issuer authority) for the combined edge's jwt_authn.
 */}}
 {{- define "edge-platform.jwksHost" -}}

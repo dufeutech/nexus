@@ -249,9 +249,12 @@ no Cockroach needed. Cockroach re-enters only for active-active writes / residen
 
 ## 6. Next steps
 
-1. **`/opsx:propose` for A** — SLO/burn-rate layer + the histogram-`result` fix + make
-   `deployment.environment.name` a deploy invariant. Shippable independent of the B/D fork; it's
-   the instrument for everything else. Lowest risk, highest immediate leverage.
+1. ~~**`/opsx:propose` for A**~~ — **DELIVERED** as change `slo-burn-rate-policy` (2026-07-08):
+   histogram-`result` defect fix (outcome-aware latency in both hot-path ext_proc planes),
+   `deployment.environment.name` as a deploy-time fail-closed invariant (Rust startup guard +
+   Helm render guard + charts now supply it), and the SLO/burn-rate layer (Adopt Sloth v0.16.0 →
+   generated MWMB rules, per-environment, promtool-verified). B and D below remain parked; the
+   recorded multi-region driver is failure-survival → CNPG.
 2. Resolve **Open Decision 1** (multi-region driver) → then propose either:
    - `B-floor` (signing coverage + allowlist strip + key rotation) as standalone hardening, and
      park D; **or**

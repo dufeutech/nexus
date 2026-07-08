@@ -2,6 +2,14 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# slo-burn-rate-policy: evaluate the Sloth-generated SLO recording + multi-window
+# burn-rate alert rules (design: Adopt Sloth). These files are GENERATED from the specs
+# in monitoring/slo/ via monitoring/slo/generate.sh — never hand-edit them. The same
+# rules ship to production through the Helm PrometheusRule scaffold; loading them here
+# makes a clean checkout evaluate the identical policy.
+rule_files:
+  - /etc/prometheus/rules/*.rules.yaml
+
 # Native OTLP ingestion (box-telemetry-contract): boxes PUSH metrics via the
 # OTel Collector to /api/v1/otlp — no per-box scrape coordination. Enabled by
 # the --web.enable-otlp-receiver flag in the compose service. The scrape jobs

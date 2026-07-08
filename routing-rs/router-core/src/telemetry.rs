@@ -25,7 +25,7 @@ use std::fmt;
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
+use opentelemetry::{Key, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 use opentelemetry_sdk::Resource;
@@ -42,6 +42,12 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 /// The standard OTLP collection endpoint variable (box-telemetry-contract). Unset
 /// ⇒ telemetry export is off and the service runs exactly as before this change.
 const ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// The one required resource attribute beyond the code-provided service identity:
+/// when export is active every first-party signal MUST be attributable to a deployment
+/// environment, or a per-environment SLO is undefined (spec: first-party-telemetry).
+/// Supplied via `OTEL_RESOURCE_ATTRIBUTES` and merged by the default resource detectors.
+const ENVIRONMENT_KEY: &str = "deployment.environment.name";
 
 /// The subscriber stack every layer is composed against: the `RUST_LOG` filter over
 /// the registry. Naming it lets the fmt/OTLP layers live in one `Vec` (shared `S`).
@@ -159,14 +165,34 @@ fn resource(service_name: &str) -> Resource {
         .build()
 }
 
+/// Deploy-time invariant enforcement for [`init`]: confirm the resolved resource
+/// carries a non-blank `deployment.environment.name`. Returns the value (for the
+/// startup log) or a human-readable reason it is missing/blank. Only consulted when
+/// OTLP export is active — with export off there are no signals to attribute and the
+/// service keeps its prior opt-in, log-to-stdout behavior.
+fn require_environment(res: &Resource) -> Result<String, String> {
+    match res.get_ref(&Key::from_static_str(ENVIRONMENT_KEY)) {
+        None => Err(format!(
+            "`{ENVIRONMENT_KEY}` is not set (supply it via OTEL_RESOURCE_ATTRIBUTES, \
+             e.g. OTEL_RESOURCE_ATTRIBUTES={ENVIRONMENT_KEY}=production)"
+        )),
+        Some(value) => {
+            let text = value.to_string();
+            if text.trim().is_empty() {
+                Err(format!("`{ENVIRONMENT_KEY}` is present but blank"))
+            } else {
+                Ok(text)
+            }
+        }
+    }
+}
+
 /// Build all three providers with OTLP/gRPC batch exporters. Fallible: a transport
 /// build error propagates so the caller can fall back to fmt-only (fail-open).
 /// # Errors
 /// Returns the OTLP transport build error if any exporter (span/log/metric) cannot
 /// be constructed; the caller downgrades to fmt-only logging (fail-open).
-fn build_providers(service_name: &str) -> Result<Providers, opentelemetry_otlp::ExporterBuildError> {
-    let res = resource(service_name);
-
+fn build_providers(res: Resource) -> Result<Providers, opentelemetry_otlp::ExporterBuildError> {
     let span_exporter = SpanExporter::builder().with_tonic().build()?;
     let tracer = SdkTracerProvider::builder()
         // ParentBased(AlwaysOn): on the request hot path the edge always supplies a
@@ -214,8 +240,26 @@ pub fn init(service_name: &str) -> TelemetryGuard {
     // global providers/propagator are installed here so `handle()` on the hot path
     // can extract the edge context and open spans against the global tracer.
     let mut build_error: Option<String> = None;
+    let mut environment: Option<String> = None;
     let providers = if endpoint_set {
-        match build_providers(service_name) {
+        // Deploy-time fail-closed invariant (spec: first-party-telemetry): when export
+        // is active every signal must be attributable to a deployment environment, or a
+        // per-environment SLO is undefined. A missing/blank `deployment.environment.name`
+        // is an operator misconfiguration caught HERE, at startup before serving — never
+        // on the request path, so the fail-open resolution guarantee is preserved.
+        let res = resource(service_name);
+        match require_environment(&res) {
+            Ok(value) => environment = Some(value),
+            Err(reason) => {
+                eprintln!(
+                    "FATAL: OTLP telemetry export is enabled but {reason}. Refusing to \
+                     start so no environment-less telemetry is emitted (deploy-time \
+                     fail-closed; see the first-party-telemetry spec)."
+                );
+                std::process::exit(1);
+            }
+        }
+        match build_providers(res) {
             Ok(providers) => {
                 global::set_text_map_propagator(TraceContextPropagator::new());
                 global::set_tracer_provider(providers.tracer.clone());
@@ -263,6 +307,7 @@ pub fn init(service_name: &str) -> TelemetryGuard {
     } else if providers.is_some() {
         tracing::info!(
             endpoint = %env::var(ENDPOINT_ENV).unwrap_or_default(),
+            environment = environment.as_deref().unwrap_or_default(),
             "telemetry: OTLP export enabled (traces, metrics, logs)"
         );
     }

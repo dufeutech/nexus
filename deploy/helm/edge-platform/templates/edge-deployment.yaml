@@ -67,6 +67,10 @@ spec:
             # the umbrella-wide collector (global.telemetry.otlpEndpoint). Unset => off.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $.Values.global.telemetry.otlpEndpoint | quote }}
+            # first-party-telemetry: deployment.environment.name is a REQUIRED invariant
+            # when export is on (per-environment SLOs); render fails closed if unset.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "edge-platform.otelResourceAttributes" $ | quote }}
             {{- end }}
           ports:
             - { name: rt-ext-proc, containerPort: 50052 }
@@ -106,6 +110,10 @@ spec:
             # the umbrella-wide collector (global.telemetry.otlpEndpoint). Unset => off.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $.Values.global.telemetry.otlpEndpoint | quote }}
+            # first-party-telemetry: deployment.environment.name is a REQUIRED invariant
+            # when export is on (per-environment SLOs); render fails closed if unset.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "edge-platform.otelResourceAttributes" $ | quote }}
             {{- end }}
           ports:
             - { name: id-ext-proc, containerPort: 50051 }

@@ -54,6 +54,10 @@ spec:
             # collector (chart-local or umbrella global). Unset => export off.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ $otlp | quote }}
+            # first-party-telemetry: deployment.environment.name is a REQUIRED invariant
+            # when export is on (per-environment SLOs); render fails closed if unset.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "identity-plane.otelResourceAttributes" . | quote }}
             {{- end }}
           ports:
             # The worker's ONLY bound port: a /healthz surface for the kubelet. Metrics

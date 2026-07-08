@@ -232,6 +232,23 @@ must emit — is the "Box telemetry contract" section of
   **names are unchanged** (OTel counters drop the `_total` suffix that Prometheus's
   OTLP receiver re-appends), so existing dashboard queries keep working. First-party
   spans also join the edge-rooted trace and their logs carry the trace id.
+- **Deployment environment is a REQUIRED, verified invariant when export is on
+  (Change A — `slo-burn-rate-policy`).** Every first-party signal must carry
+  `deployment.environment.name` so per-environment SLOs are well-defined. It is
+  **supplied by the charts, not by hand**: set `telemetry.environment` (or, on the
+  umbrella, `global.telemetry.environment`, e.g. `production`) and the chart injects it
+  via `OTEL_RESOURCE_ATTRIBUTES`. Enforcement is **fail-closed at deploy time, never at
+  request time**:
+  - *Chart render* fails closed — a telemetry-on render (`telemetry.otlpEndpoint` set)
+    with an empty `telemetry.environment` aborts with a `required` error naming the knob,
+    before anything rolls out. Export-off renders are unaffected.
+  - *Service startup* fails closed — the Rust services independently refuse to boot (a
+    clear stderr diagnostic, exit 1) if OTLP export is enabled but
+    `deployment.environment.name` is missing/blank, covering non-Helm and lab paths. A
+    request already in flight is never failed by this check.
+  - The **lab compose** defaults `OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=lab`,
+    so a clean checkout runs with telemetry on out of the box; override per service via
+    the `OTEL_RESOURCE_ATTRIBUTES` env.
 - **Bring-up order is flexible and everything is fail-open:** a down collector
   or store never affects request handling; boxes buffer/drop telemetry and
   resume on their own when the collector returns. Producers deliberately do
@@ -246,6 +263,14 @@ must emit — is the "Box telemetry contract" section of
     `metrics.prometheusRule.thresholds`. On the umbrella, enable it on each subchart
     (`identity-plane.metrics.prometheusRule.enabled`, `routing-plane…`) plus the
     edge-platform block for the combined edge.
+  - The same flag also ships a **`-slo-burn-rate` `PrometheusRule`** (change
+    `slo-burn-rate-policy`): multi-window error-budget burn-rate alerts (fast burn ⇒
+    `severity=page`, slow burn ⇒ `severity=ticket`), per deployment environment. These
+    rules are **Sloth-generated** from `monitoring/slo/*.slo.yaml` (regenerate with
+    `monitoring/slo/generate.sh`, which stages them into each plane chart's `files/slo/`)
+    — the chart only wraps them, so never hand-edit the embedded rules. Lab and prod
+    evaluate byte-identical rules. On the umbrella, run `helm dependency update` after a
+    regenerate so the repackaged subcharts pick up the refreshed rules.
   - `dashboards.enabled=true` → Grafana dashboards as ConfigMaps labelled for the
     Grafana sidecar's auto-discovery (kube-prometheus-stack / grafana chart).
   - **Collector caveat:** the `result`/`op`/`tier` metric attributes several rules and

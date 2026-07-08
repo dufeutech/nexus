@@ -1,0 +1,65 @@
+# Sloth SLO spec — identity-sidecar (change: slo-burn-rate-policy).
+#
+# Sloth compiles this into SLI recording rules + multi-window multi-burn-rate (MWMB)
+# alert rules (design decision: Adopt Sloth). Regenerate with `monitoring/slo/generate.sh`
+# and commit the output; NEVER hand-edit the generated rules file.
+#
+# Objectives, the 100ms latency threshold, and the good/bad classification are the
+# SRE-tunable knobs (task 1.3). Per-environment scoping rides on the promoted
+# `deployment_environment_name` label.
+version: "prometheus/v1"
+service: "identity-sidecar"
+labels:
+  plane: identity
+slos:
+  - name: "availability"
+    objective: 99.9
+    description: >-
+      Served fraction of identity-sidecar ext_proc enrichments, per deployment
+      environment. BAD = result="not_ready" (warming 503) OR result="unavailable_closed"
+      (routing store unavailable for an authenticated request -> fail-closed 503). GOOD =
+      enrichment success, forbidden (403), not_found (404), and unavailable_open (served
+      fail-open) — all correct, served outcomes.
+    sli:
+      events:
+        error_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[{{.window}}]))
+        total_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}]))
+    alerting:
+      name: IdentitySidecarAvailability
+      labels:
+        plane: identity
+      annotations:
+        summary: "Identity-sidecar availability error budget is burning"
+      page_alert:
+        labels:
+          severity: page
+      ticket_alert:
+        labels:
+          severity: ticket
+  - name: "latency"
+    objective: 99.0
+    description: >-
+      Fraction of SUCCESSFUL identity-sidecar enrichments (served, non-5xx outcomes)
+      completed under 100ms, per deployment environment. Uses the outcome-aware duration
+      histogram so warming/fail-closed 503 paths do not count against the latency budget.
+    sli:
+      events:
+        error_query: |
+          (
+            sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))
+            -
+            sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_bucket{result!~"not_ready|unavailable_closed",le="0.1"}[{{.window}}]))
+          )
+        total_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))
+    alerting:
+      name: IdentitySidecarLatency
+      labels:
+        plane: identity
+      annotations:
+        summary: "Identity-sidecar latency error budget is burning"
+      page_alert:
+        labels:
+          severity: page
+      ticket_alert:
+        labels:
+          severity: ticket
