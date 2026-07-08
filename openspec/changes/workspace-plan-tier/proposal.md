@@ -57,9 +57,10 @@ and the `plan` claim reserved by `sign-identity-contract-jwt` stays unpopulated
 3. **Relationship to entitlements** — RESOLVED: independent axis. Entitlements are
    subject-scoped on `Profile`; plan is workspace-scoped. No derivation; the box reads both.
 
-> Status: **decided — ready for specs + tasks.** Source-of-truth resolved by existing
-> architecture; build-vs-adopt gate passed — *Extend* the in-house LISTEN/NOTIFY projection
-> (clone `PgPlatformServiceReader`), recorded in `design.md`.
+> Status: **ready for `/opsx:apply`.** Explored + decided (build-vs-adopt: *Extend* the in-house
+> LISTEN/NOTIFY projection). Specs (`workspace-plan-tier` capability + `identity-contract-signing`
+> ADDED delta) and `tasks.md` drafted and `openspec validate`-clean. Blocked only on
+> `normalized-principal` landing first (ADR-10 sync order).
 
 > **Coordination:** this change shares `identity-contract-signing` and the sidecar enrich path with
 > `normalized-principal`, `identity-existence-hiding`, and `customer-api-keys`. It **owns only the
