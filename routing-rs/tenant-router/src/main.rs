@@ -1117,8 +1117,8 @@ mod tests {
 
     /// An in-memory `RoutingStore` answering only the three reads `resolve` makes:
     /// the exact/wildcard domain lookup, the workspace config, and the (pass-through)
-    /// auth policy. Every control-plane write is `unimplemented!()` — the parity
-    /// test never drives them.
+    /// auth policy. Every other control-plane method returns a loud `Err` — the
+    /// parity test never drives them, and a stray call should fail rather than lie.
     struct FakeStore {
         /// verified `(domain, is_wildcard)` → `workspace_id`.
         domains: HashMap<(String, bool), String>,
@@ -1153,9 +1153,11 @@ mod tests {
             Ok(AuthPolicy::default())
         }
 
-        // --- control-plane writes: never exercised by the parity test ---------- //
+        // --- control-plane surface: never exercised by the parity test ---------- //
         async fn upsert_workspace(&self, _cfg: &WorkspaceConfig) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn upsert_domain(
             &self,
@@ -1164,42 +1166,60 @@ mod tests {
             _wildcard: bool,
             _verified: bool,
         ) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn create_pending_domain(
             &self,
             _domain: &str,
             _workspace_id: &str,
         ) -> Result<bool, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn set_domain_verified(&self, _domain: &str, _verified: bool) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn delete_domain(&self, _domain: &str, _wildcard: bool) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn domains_for_workspace(
             &self,
             _workspace_id: &str,
         ) -> Result<Vec<String>, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn get_domain(
             &self,
             _domain: &str,
             _wildcard: bool,
         ) -> Result<Option<DomainRecord>, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn count_domains_for_workspace(&self, _workspace_id: &str) -> Result<u32, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn pending_domains(&self) -> Result<Vec<String>, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn expire_pending_domains(&self, _ttl_secs: i64) -> Result<Vec<String>, BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn upsert_auth_route(
             &self,
@@ -1207,14 +1227,18 @@ mod tests {
             _prefix: &str,
             _auth: &RouteAuth,
         ) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
         async fn delete_auth_route(
             &self,
             _workspace_id: &str,
             _prefix: &str,
         ) -> Result<(), BoxError> {
-            unimplemented!()
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
         }
     }
 

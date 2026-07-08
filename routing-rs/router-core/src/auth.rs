@@ -43,7 +43,11 @@ pub struct RouteAuth {
 
 /// serde `skip_serializing_if` for the account-scoped flag: the default (`false`,
 /// workspace-scoped) is the wire-absent state, mirroring the requirement signals.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if requires a fn taking &T, so the &bool \
+              signature is mandated by the API, not a missed by-value opportunity"
+)]
 const fn is_false(b: &bool) -> bool {
     !*b
 }
