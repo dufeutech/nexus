@@ -1,6 +1,14 @@
 # identity-existence-hiding
 
-## ADDED Requirements
+## Purpose
+
+The identity plane's existence-hiding contract: when a caller has no membership
+relationship with a workspace, the plane collapses "forbidden" and "does not exist"
+into a single indistinguishable `404` outcome, so non-members cannot probe which
+workspaces exist. Members who merely lack a specific privilege still receive an honest
+`403`.
+
+## Requirements
 
 ### Requirement: A non-member cannot distinguish "forbidden" from "does not exist"
 
@@ -44,9 +52,9 @@ the caller is not a member. The single 404 branch is therefore the same code pat
 
 ### Requirement: A member who lacks a specific privilege receives an honest 403
 
-When a caller **is** an authorized member of `W` but does not satisfy a specific route requirement
-(role, entitlement, or authentication assurance level), the identity plane SHALL return
-`403 Forbidden`, NOT `404`. Existence is already disclosed to a member, so hiding it serves no
+When a caller **is** an authorized member of `W`, the identity plane SHALL return `403 Forbidden`,
+NOT `404`, if that member does not satisfy a specific route requirement (role, entitlement, or
+authentication assurance level). Existence is already disclosed to a member, so hiding it serves no
 purpose and a `404` would wrongly imply the workspace is absent from a caller who is inside it.
 
 #### Scenario: Member lacking a required role is forbidden, not hidden
