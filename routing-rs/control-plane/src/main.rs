@@ -671,6 +671,12 @@ struct AuthRouteBody {
     requires_entitlement: Option<String>,
     #[serde(default)]
     min_aal: Option<u8>,
+    /// identity-existence-hiding: mark a protected route as account-scoped
+    /// (reachable without a workspace membership, e.g. `/me`). Default `false`
+    /// (workspace-scoped, membership-gated) — the fail-closed existence-hiding
+    /// posture. Only meaningful when `auth_required = true`.
+    #[serde(default)]
+    account_scoped: bool,
 }
 
 #[derive(Deserialize)]
@@ -725,6 +731,7 @@ async fn upsert_auth_route(
         requires_role: body.requires_role.clone(),
         requires_entitlement: body.requires_entitlement.clone(),
         min_aal: body.min_aal,
+        account_scoped: body.account_scoped,
     };
     if App::inconsistent_requirements(&auth) {
         return (
@@ -761,6 +768,7 @@ async fn upsert_auth_route(
             "requires_role": auth.requires_role,
             "requires_entitlement": auth.requires_entitlement,
             "min_aal": auth.min_aal,
+            "account_scoped": auth.account_scoped,
         })),
     )
         .into_response()
@@ -793,6 +801,7 @@ async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -
                         "requires_role": r.auth.requires_role,
                         "requires_entitlement": r.auth.requires_entitlement,
                         "min_aal": r.auth.min_aal,
+                        "account_scoped": r.auth.account_scoped,
                     })
                 })
                 .collect();

@@ -40,19 +40,24 @@ risk profile than signing.
 - **Contract/docs:** `docs/box-consumer-contract.md` (§ on who owns existence-hiding),
   `nexus-upstream-requirements.md`.
 
-## Open questions (resolve in `/opsx:explore` → `/opsx:decide` before implementing)
+## Resolved decisions (from `/opsx:explore` + `/opsx:decide`)
 
-1. **Where is the boundary drawn** — does nexus 404 for *any* non-member, or only when the
-   workspace genuinely doesn't exist vs. exists-but-not-a-member? (The latter is harder to
-   hide and may need a uniform 404 for both.)
-2. **Timing/side-channel** — is constant-time / uniform-latency treatment in scope, or is
-   status+body uniformity enough for v1? (Adopt vs build for any constant-time comparison.)
-3. **404 shape ownership** — sidecar `ImmediateResponse` vs the edge. Does the box see a
-   nexus-authored 404, or does the edge synthesize it?
+1. **Boundary (Q1) — implicit default-deny with explicit opt-out.** Any request carrying an
+   authoritative workspace context requires membership: a non-member SHALL receive a 404,
+   regardless of whether the route declares role/entitlement requirements. Public /
+   pre-membership routes (invite-accept, public read) must **explicitly** opt out of the
+   membership gate; a route that omits the opt-out is gated (fail-closed) — a forgotten marker
+   denies rather than leaks. Chosen because boxes no longer double-check membership, so the
+   guarantee must live at the sidecar, not in route-config discipline.
+2. **Timing (Q2) — structural equal-work convergence, no constant-time mechanism.** Outsider-403
+   and nonexistent-404 are the same branch doing the same work (`resolve_membership → None`), so
+   timing converges by construction; the decision compares no secret. Sub-millisecond network
+   timing is explicitly out of v1 scope (documented, not mitigated with weak measures).
+3. **404 shape ownership (Q3) — the sidecar authors both the 404 and the 403,** byte-identical
+   minimal envelope (mirroring `forbidden_403()`); outsiders never reach a box, so there is no
+   cross-envelope comparison to leak through.
 
-> Status: **proposal only.** Run `/opsx:explore identity-existence-hiding` (or
-> `/opsx:propose` to regenerate full artifacts) to take it forward — the design turns on the
-> open questions above.
+> Full rationale and the build-vs-adopt gate results are in `design.md`.
 
 > **Coordination:** this change edits the sidecar enrich path shared with `normalized-principal`,
 > `workspace-plan-tier`, and `customer-api-keys`. It **owns the unresolved/forbidden branch

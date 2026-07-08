@@ -470,6 +470,10 @@ const HDR_AUTH_REQUIRED: &str = "x-auth-required";
 const HDR_AUTH_REQUIRES_ROLE: &str = "x-auth-requires-role";
 const HDR_AUTH_REQUIRES_ENTITLEMENT: &str = "x-auth-requires-entitlement";
 const HDR_AUTH_MIN_AAL: &str = "x-auth-min-aal";
+/// identity-existence-hiding: marks a protected route as account-scoped (reachable
+/// without a workspace membership). Emitted ONLY when set — absence IS the
+/// fail-closed workspace-scoped state the sidecar gates on.
+const HDR_AUTH_ACCOUNT_SCOPED: &str = "x-auth-account-scoped";
 
 /// The auth-policy signals for one resolved route. The boolean gate is ALWAYS
 /// emitted (`true`|`false`) so the contract is explicit; the phase-2 requirement
@@ -489,16 +493,26 @@ fn auth_signals(auth: &RouteAuth) -> Vec<(&'static str, String)> {
     if let Some(aal) = auth.min_aal {
         signals.push((HDR_AUTH_MIN_AAL, aal.to_string()));
     }
+    // identity-existence-hiding: emit account-scoped ONLY when set, so its wire
+    // absence is the fail-closed (workspace-scoped, membership-gated) default.
+    if auth.account_scoped {
+        signals.push((HDR_AUTH_ACCOUNT_SCOPED, "true".to_owned()));
+    }
     signals
 }
 
 /// Reject at the edge before any backend is selected (RFC C18 / tenant isolation).
+/// identity-existence-hiding: the body is the SAME minimal `"not found"` the identity
+/// sidecar's non-member `not_found_404()` emits, so an authenticated prober cannot
+/// distinguish "tenant does not exist" (this path) from "tenant exists, not a member"
+/// (the sidecar path) by response body. Operational detail (which host, why) stays in
+/// logs/metrics, never the client-facing body.
 fn reject_unknown_host() -> ProcessingResponse {
     ProcessingResponse {
         response: Some(processing_response::Response::ImmediateResponse(
             ImmediateResponse {
                 status: Some(HttpStatus { code: 404 }),
-                body: b"unknown tenant for host".to_vec(),
+                body: b"not found".to_vec(),
                 ..Default::default()
             },
         )),
@@ -986,6 +1000,7 @@ mod tests {
             requires_role: Some("admin".into()),
             requires_entitlement: None,
             min_aal: Some(2),
+            ..RouteAuth::PASS_THROUGH
         };
         let signals = auth_signals(&auth);
         assert_eq!(
@@ -995,6 +1010,27 @@ mod tests {
                 ("x-auth-requires-role", "admin".to_owned()),
                 ("x-auth-min-aal", "2".to_owned()),
             ],
+        );
+    }
+
+    /// identity-existence-hiding: an account-scoped rule emits the extra signal so
+    /// the sidecar skips the membership gate; a workspace-scoped rule (the default)
+    /// emits nothing extra, so its wire absence is the fail-closed gated state.
+    #[test]
+    fn account_scoped_rule_emits_its_signal_only_when_set() {
+        let account =
+            RouteAuth { required: true, account_scoped: true, ..RouteAuth::PASS_THROUGH };
+        assert_eq!(
+            auth_signals(&account),
+            vec![
+                ("x-auth-required", "true".to_owned()),
+                ("x-auth-account-scoped", "true".to_owned()),
+            ],
+        );
+        let workspace_scoped = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };
+        assert_eq!(
+            auth_signals(&workspace_scoped),
+            vec![("x-auth-required", "true".to_owned())],
         );
     }
 

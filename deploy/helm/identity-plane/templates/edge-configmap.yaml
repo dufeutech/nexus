@@ -156,6 +156,10 @@ data:
                               # here is a separate trust-boundary design (see the
                               # combined-edge-per-route-auth-gate change, design.md).
                               - remove: "x-auth-required"
+                              # identity-existence-hiding: account-scoped route marker
+                              # — C3 hygiene strip only (this plane has no tenant-router
+                              # emitting it and runs no membership-404 gate).
+                              - remove: "x-auth-account-scoped"
                               # Versioned identity-contract stamp: authored by THIS
                               # plane's identity sidecar as a DRIFT/version signal for
                               # the x-workspace-*/x-user-* header shape — NOT proof of

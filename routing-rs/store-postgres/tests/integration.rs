@@ -264,17 +264,25 @@ async fn auth_route_requirement_fields_round_trip() {
         requires_role: Some("admin".to_owned()),
         requires_entitlement: Some("pro".to_owned()),
         min_aal: Some(2),
+        ..RouteAuth::PASS_THROUGH
     };
+    // identity-existence-hiding: an account-scoped protected rule (e.g. /me).
+    let account = RouteAuth { required: true, account_scoped: true, ..RouteAuth::PASS_THROUGH };
     store.upsert_auth_route("ws_auth", "/", &plain).await.unwrap();
     store.upsert_auth_route("ws_auth", "/admin", &gated).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/me", &account).await.unwrap();
 
     let policy = store.get_auth_policy("ws_auth").await.unwrap();
     let hit = policy.resolve("/admin/users");
     assert_eq!(hit.requires_role.as_deref(), Some("admin"));
     assert_eq!(hit.requires_entitlement.as_deref(), Some("pro"));
     assert_eq!(hit.min_aal, Some(2));
+    assert!(!hit.account_scoped, "a gated workspace rule is not account-scoped");
     let miss = policy.resolve("/pricing");
     assert!(miss.required && !miss.has_requirements(), "phase-1 rule carries no requirements");
+    // account_scoped survives the round-trip through the store.
+    assert!(policy.resolve("/me").account_scoped, "account-scoped rule persisted");
+    assert!(!policy.resolve("/pricing").account_scoped, "default is workspace-scoped");
 
     // Upserting the gated rule back to plain clears the requirement columns.
     store.upsert_auth_route("ws_auth", "/admin", &plain).await.unwrap();

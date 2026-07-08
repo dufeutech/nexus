@@ -267,6 +267,16 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
+        // identity-existence-hiding: mark a protected route as account-scoped
+        // (reachable without a workspace membership). Additive + defaulted false, so
+        // existing rows and phase-1/2 binaries are unaffected — a protected route is
+        // workspace-scoped (membership-gated) unless a rule explicitly opts out.
+        sqlx::query(
+            "ALTER TABLE routing.auth_routes \
+                 ADD COLUMN IF NOT EXISTS account_scoped boolean NOT NULL DEFAULT false",
+        )
+        .execute(&self.pool)
+        .await?;
         // Memberships — the live authz source of record (nexus-owned-workspace-
         // tenancy): who acts in a workspace, as which type (staff|customer) and
         // role. The identity plane resolves it fail-closed on the hot path (behind
@@ -551,7 +561,7 @@ impl RoutingStore for PgRoutingStore {
         // through) falls out of an empty `AuthPolicy`, so a workspace with no policy
         // is public.
         let rows = sqlx::query(
-            "SELECT path_prefix, auth_required, requires_role, requires_entitlement, min_aal \
+            "SELECT path_prefix, auth_required, requires_role, requires_entitlement, min_aal, account_scoped \
              FROM routing.auth_routes WHERE workspace_id = $1",
         )
         .bind(workspace_id)
@@ -568,6 +578,7 @@ impl RoutingStore for PgRoutingStore {
                     min_aal: r
                         .get::<Option<i16>, _>("min_aal")
                         .and_then(|v| u8::try_from(v).ok()),
+                    account_scoped: r.get::<bool, _>("account_scoped"),
                 },
             })
             .collect();
@@ -582,13 +593,14 @@ impl RoutingStore for PgRoutingStore {
     ) -> Result<(), BoxError> {
         sqlx::query(
             "INSERT INTO routing.auth_routes \
-                 (workspace_id, path_prefix, auth_required, requires_role, requires_entitlement, min_aal, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, now()) \
+                 (workspace_id, path_prefix, auth_required, requires_role, requires_entitlement, min_aal, account_scoped, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now()) \
              ON CONFLICT (workspace_id, path_prefix) DO UPDATE SET \
                  auth_required = EXCLUDED.auth_required, \
                  requires_role = EXCLUDED.requires_role, \
                  requires_entitlement = EXCLUDED.requires_entitlement, \
                  min_aal = EXCLUDED.min_aal, \
+                 account_scoped = EXCLUDED.account_scoped, \
                  updated_at = now()",
         )
         .bind(workspace_id)
@@ -597,6 +609,7 @@ impl RoutingStore for PgRoutingStore {
         .bind(auth.requires_role.as_deref())
         .bind(auth.requires_entitlement.as_deref())
         .bind(auth.min_aal.map(i16::from))
+        .bind(auth.account_scoped)
         .execute(&self.pool)
         .await?;
         Ok(())

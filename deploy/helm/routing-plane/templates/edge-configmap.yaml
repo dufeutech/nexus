@@ -159,6 +159,10 @@ data:
                               - remove: "x-auth-anonymous"
                               - remove: "x-auth-method"
                               - remove: "x-auth-required"
+                              # identity-existence-hiding: account-scoped route marker
+                              # — C3 hygiene strip of any client copy (absence =
+                              # workspace-scoped / fail-closed at the sidecar gate).
+                              - remove: "x-auth-account-scoped"
                               # Versioned identity-contract stamp (authored by the
                               # identity sidecar in the full stack) — a drift/version
                               # signal, NOT proof of edge origin (edge-origin-trust

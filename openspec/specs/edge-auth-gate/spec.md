@@ -59,9 +59,9 @@ access.
 
 ### Requirement: Per-route authorization requirements are resolved with the auth policy
 
-A tenant's per-route auth policy rule MAY additionally carry a required role, a
-required entitlement, and a minimum authentication assurance level (any subset,
-all optional). The tenant-routing stage SHALL resolve these with the same
+The tenant-routing stage SHALL resolve a per-route auth policy rule's optional
+authorization requirements — a required role, a required entitlement, and a minimum
+authentication assurance level (any subset, all optional) — with the same
 longest-prefix match, cache, and invalidation as `auth_required`, and SHALL emit
 each one as a trusted policy signal (`x-auth-requires-role`,
 `x-auth-requires-entitlement`, `x-auth-min-aal`) only when the resolved rule sets
@@ -87,8 +87,8 @@ gained requirements.
 
 ### Requirement: The edge rejects requests whose enrichment does not satisfy the resolved requirements
 
-An edge authorization step, positioned after credential verification and identity
-enrichment, SHALL compare each emitted requirement signal against the injected
+An edge authorization step SHALL, positioned after credential verification and
+identity enrichment, compare each emitted requirement signal against the injected
 enrichment and reject the request with **403** unless ALL resolved requirements
 are satisfied:
 
