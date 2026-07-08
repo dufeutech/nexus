@@ -240,6 +240,12 @@ static_resources:
                           - remove: "x-auth-requires-role"
                           - remove: "x-auth-requires-entitlement"
                           - remove: "x-auth-min-aal"
+                          # identity-existence-hiding: the tenant-router marks a
+                          # protected route account-scoped; the identity sidecar reads
+                          # it to skip the membership-404 gate. Strip client copies so
+                          # a client can't self-exempt from the gate (C3, same rule as
+                          # x-auth-required). Absence = workspace-scoped (fail-closed).
+                          - remove: "x-auth-account-scoped"
                           # Versioned edge->backend identity-contract stamp: authored
                           # by the identity sidecar as a DRIFT/version signal for the
                           # x-workspace-*/x-user-* header shape — NOT proof of edge

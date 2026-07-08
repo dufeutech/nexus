@@ -78,6 +78,20 @@ sidecar (enforcer) before tenant-router (emitter) — pinned in `deploy/README.m
 production checklist. Backends keep only resource-ownership checks;
 role/plan route gates are the edge's job now, both phases.
 
+**Phase 3** (workspace-membership existence-hiding — change `identity-existence-hiding`): a
+protected route is **workspace-scoped by default** — a caller with no live membership of the
+routed workspace is refused with a **`404`** indistinguishable from a nonexistent workspace, at the
+identity sidecar, *before* the phase-2 403. A member who lacks a required role still gets the honest
+**403**. A rule may set `account_scoped: true` (same `routing.auth_routes` table + CRUD field) to
+mark an authenticated-but-not-workspace-bound route (`/me`, list-my-workspaces) that is reachable
+without a membership; the tenant-router emits `x-auth-account-scoped` **only when set**, so its wire
+absence is the fail-closed (workspace-scoped, gated) default. `x-auth-account-scoped` is in the C3
+strip list. The sidecar treats a **missing** signal as gated, so a dropped header or an un-upgraded
+emitter fails **closed** (over-restrictive), never open. Rollout: set the `account_scoped` policies
+for account routes (and roll the emitting tenant-router) **before** the sidecar gate activates — so
+those routes are already exempt when gating begins; the pre-gate window simply continues today's
+behavior (the leak this change closes), introducing no *new* exposure.
+
 Default = pass-through: **no rows for a workspace means `auth: none`** (the `/` row is an
 operator-set default, not auto-seeded), so any customer site works with zero URL
 constraints; gating is opt-in.

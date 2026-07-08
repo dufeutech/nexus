@@ -29,6 +29,23 @@ pub struct RouteAuth {
     pub requires_entitlement: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_aal: Option<u8>,
+    /// Whether a *protected* route is scoped to the routed workspace and so gated on
+    /// the caller's membership of it (identity-existence-hiding). Default `false`
+    /// means **workspace-scoped**: a protected route requires membership and a
+    /// non-member is hidden behind a 404. Set `true` to mark an **account-scoped**
+    /// route — authenticated but not tied to one workspace (e.g. `/me`,
+    /// list-my-workspaces) — which is reachable without a workspace membership.
+    /// Only meaningful when `required = true`; the wire signal is emitted only when
+    /// `true`, so its absence is the fail-closed (workspace-scoped, gated) state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub account_scoped: bool,
+}
+
+/// serde `skip_serializing_if` for the account-scoped flag: the default (`false`,
+/// workspace-scoped) is the wire-absent state, mirroring the requirement signals.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl RouteAuth {
@@ -38,6 +55,7 @@ impl RouteAuth {
         requires_role: None,
         requires_entitlement: None,
         min_aal: None,
+        account_scoped: false,
     };
 
     /// True when the rule carries any phase-2 requirement.
@@ -233,6 +251,7 @@ mod tests {
                 requires_role: Some("admin".into()),
                 requires_entitlement: Some("pro".into()),
                 min_aal: Some(2),
+                ..RouteAuth::PASS_THROUGH
             },
         };
         let p = AuthPolicy::new(vec![rule("/", true), gated]);
@@ -269,6 +288,35 @@ mod tests {
         // the new fields default to None (no requirement).
         let auth: RouteAuth = serde_json::from_str(r#"{"required":true}"#)?;
         assert!(auth.required && !auth.has_requirements());
+        Ok(())
+    }
+
+    #[test]
+    fn account_scoped_defaults_to_false_and_rides_the_rule() -> Result<(), serde_json::Error> {
+        // A protected rule with no account_scoped field is workspace-scoped
+        // (gated) — the fail-closed default for existence-hiding.
+        let gated: RouteAuth = serde_json::from_str(r#"{"required":true}"#)?;
+        assert!(!gated.account_scoped);
+        // An explicit account-scoped rule (e.g. /me) rides the resolved rule.
+        let account = PathRule {
+            prefix: "/me".into(),
+            auth: RouteAuth { required: true, account_scoped: true, ..RouteAuth::PASS_THROUGH },
+        };
+        let p = AuthPolicy::new(vec![rule("/", true), account]);
+        assert!(p.resolve("/me").account_scoped); // account-scoped: not gated
+        assert!(!p.resolve("/app").account_scoped); // default: workspace-scoped, gated
+        Ok(())
+    }
+
+    #[test]
+    fn account_scoped_is_wire_absent_when_false() -> Result<(), serde_json::Error> {
+        // The default (workspace-scoped) must not appear on the wire, mirroring the
+        // requirement signals — absence IS the fail-closed gated state.
+        let workspace_scoped = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };
+        let json = serde_json::to_string(&workspace_scoped)?;
+        assert!(!json.contains("account_scoped"));
+        let account = RouteAuth { required: true, account_scoped: true, ..RouteAuth::PASS_THROUGH };
+        assert!(serde_json::to_string(&account)?.contains("account_scoped"));
         Ok(())
     }
 

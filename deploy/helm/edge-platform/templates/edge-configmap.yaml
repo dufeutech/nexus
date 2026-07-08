@@ -211,6 +211,11 @@ data:
                               # jwt_authn branches on it — a client copy must never
                               # survive to forge the gate (C3).
                               - remove: "x-auth-required"
+                              # identity-existence-hiding: account-scoped route marker
+                              # (tenant-router → identity sidecar's membership-404
+                              # gate). Strip client copies so a client can't self-exempt
+                              # (C3); absence = workspace-scoped (fail-closed).
+                              - remove: "x-auth-account-scoped"
                               # Versioned identity-contract stamp: the identity sidecar
                               # authors it as a DRIFT/version signal for the
                               # x-workspace-*/x-user-* header shape — NOT proof of edge

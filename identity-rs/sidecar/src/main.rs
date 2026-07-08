@@ -146,6 +146,15 @@ const IDENTITY_CONTRACT_VERSION: &str = "v1";
 const HDR_REQUIRES_ROLE: &str = "x-auth-requires-role";
 const HDR_REQUIRES_ENTITLEMENT: &str = "x-auth-requires-entitlement";
 const HDR_MIN_AAL: &str = "x-auth-min-aal";
+/// identity-existence-hiding: the per-route gate signals the sidecar reads to
+/// decide the membership-404. `x-auth-required` (always emitted by the
+/// tenant-router) marks an *enriched* (private) route; `x-auth-account-scoped`
+/// (emitted only when set) marks a protected route as account-scoped — reachable
+/// without a workspace membership. Both are trusted-emitted and C3-stripped from
+/// client input, so a client can neither forge nor suppress them; absence of the
+/// account-scoped signal is the fail-closed (workspace-scoped, gated) state.
+const HDR_AUTH_REQUIRED: &str = "x-auth-required";
+const HDR_ACCOUNT_SCOPED: &str = "x-auth-account-scoped";
 
 /// Method→assurance-level ordering (N4 phase 2): the single owner of "how strong
 /// is this authentication method". Data-driven via `SIDECAR_AAL_LEVELS`
@@ -468,6 +477,20 @@ fn extract_route_pool(req: &ProcessingRequest) -> Option<String> {
         return None;
     };
     find_header(map, "x-route-pool")
+}
+
+/// True when a trusted boolean route-policy signal is present and equals `"true"`.
+/// Absence is `false` — the fail-closed reading for `x-auth-account-scoped`
+/// (absent ⇒ workspace-scoped ⇒ gated) and the not-enriched reading for
+/// `x-auth-required`. These headers are C3-stripped from client input, so a
+/// present value is authoritative (a client can neither forge nor suppress it).
+fn trusted_flag(req: &ProcessingRequest, name: &str) -> bool {
+    let Some(processing_request::Request::RequestHeaders(HttpHeaders { headers: Some(map), .. })) =
+        &req.request
+    else {
+        return false;
+    };
+    find_header(map, name).as_deref() == Some("true")
 }
 
 /// The per-route requirements resolved by the tenant-router for THIS request,
@@ -840,6 +863,45 @@ fn forbidden_403() -> ProcessingResponse {
     }
 }
 
+/// identity-existence-hiding decision (pure, unit-tested like `must_fail_closed`):
+/// hide the workspace behind a 404 when the route is **enriched** (`auth_required`)
+/// AND **workspace-scoped** (`!account_scoped`) AND a workspace was resolved
+/// (`has_workspace`) AND **no acting authority resolved** (`!acting_resolved` — the
+/// caller holds no live membership of that workspace, uniform across every
+/// principal kind). A member (`acting_resolved`) is never hidden: they fall through
+/// to the honest 403 for a missing role. Public (`!auth_required`) and
+/// account-scoped routes are never gated. `account_scoped` defaults false on the
+/// wire, so its absence is the fail-closed (gated) reading.
+const fn hide_nonmember_as_404(
+    auth_required: bool,
+    account_scoped: bool,
+    has_workspace: bool,
+    acting_resolved: bool,
+) -> bool {
+    auth_required && !account_scoped && has_workspace && !acting_resolved
+}
+
+/// identity-existence-hiding: refuse a non-member of the routed workspace with a
+/// 404 that is byte-identical to the not-found a nonexistent workspace yields — so
+/// a caller with no membership cannot distinguish "forbidden" from "does not
+/// exist". The body is a fixed minimal literal and NO header is set (uniform
+/// envelope): the response leaks nothing through status, body, or headers, and the
+/// two producing branches (non-member vs nonexistent) are one code path, so they
+/// also converge in timing. Mirrors `forbidden_403()`; the honest 403 is reserved
+/// for a *member* who merely lacks a required role/entitlement.
+fn not_found_404() -> ProcessingResponse {
+    ProcessingResponse {
+        response: Some(processing_response::Response::ImmediateResponse(
+            ImmediateResponse {
+                status: Some(HttpStatus { code: 404 }),
+                body: b"not found".to_vec(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // ext_proc service.
 // --------------------------------------------------------------------------- //
@@ -906,6 +968,13 @@ impl Sidecar {
                 let route_pool = extract_route_pool(&req);
                 // The per-route requirements the tenant-router resolved (N4 phase 2).
                 let requirements = extract_requirements(&req);
+                // identity-existence-hiding: the per-route gate signals. A route is
+                // *enriched* (private) when `x-auth-required` is true, and
+                // *workspace-scoped* unless explicitly marked account-scoped. Both are
+                // trusted-emitted; account-scoped absence is the fail-closed (gated)
+                // state. Only an enriched, workspace-scoped route hides existence.
+                let auth_required = trusted_flag(&req, HDR_AUTH_REQUIRED);
+                let account_scoped = trusted_flag(&req, HDR_ACCOUNT_SCOPED);
                 // RESOLUTION BRANCHES ON KIND (task 4.2): a user resolves via live
                 // membership (existing path); a service resolves via the live platform
                 // registry. Both fail closed to no `acting` when no authority resolves.
@@ -1040,6 +1109,25 @@ impl Sidecar {
                         "anonymous",
                     )
                 };
+                // identity-existence-hiding: hide the workspace from a NON-MEMBER
+                // before the 403 requirements gate can reveal it. On an enriched,
+                // workspace-scoped route acting on a resolved workspace, an unresolved
+                // acting authority (no live membership of that workspace, across every
+                // principal kind) is refused with a 404 that is indistinguishable from
+                // a nonexistent workspace — so a caller with no relationship cannot
+                // tell "forbidden" from "does not exist". A MEMBER who merely lacks a
+                // required role/entitlement is NOT hidden: they fall through to the
+                // honest 403 below (their membership already discloses existence).
+                // Account-scoped routes (e.g. /me) and public routes are never gated.
+                if hide_nonmember_as_404(
+                    auth_required,
+                    account_scoped,
+                    ws.is_some(),
+                    enriched.acting.is_some(),
+                ) {
+                    info!("non-member on a private workspace route -> 404 (existence-hiding)");
+                    break 'decide (not_found_404(), "not_found");
+                }
                 // N4 phase-2 gate: every resolved requirement must be satisfied by
                 // the enrichment computed above, else 403 before the backend.
                 // jwt_authn upstream owns the anonymous-on-protected-route 401; an
@@ -2798,6 +2886,71 @@ mod tests {
         )
         .then_some(())
         .expect("expected an immediate 403");
+    }
+
+    // ---- identity-existence-hiding ------------------------------------------ //
+
+    /// The existence-hiding 404 helper: an immediate 404 with a fixed minimal body
+    /// and NO header mutation — a uniform envelope that leaks nothing through
+    /// status, body, or headers. Because it is a single helper, the non-member and
+    /// the nonexistent-workspace responses are byte-identical by construction.
+    #[test]
+    fn not_found_404_is_a_uniform_immediate_404() {
+        let Some(processing_response::Response::ImmediateResponse(r)) = &not_found_404().response
+        else {
+            panic!("expected an immediate response");
+        };
+        assert_eq!(r.status.as_ref().map(|s| s.code), Some(404));
+        assert_eq!(r.body, b"not found");
+        // No header mutation on the envelope (nothing to distinguish existence).
+        assert!(r.headers.is_none(), "the 404 envelope must set no headers");
+        // Two emissions are byte-identical (non-member ≡ nonexistent workspace).
+        assert_eq!(not_found_404(), not_found_404());
+    }
+
+    /// The 404 (hidden non-member) and the 403 (honest under-privileged member) are
+    /// distinct outcomes: a member is never hidden, and a non-member is never told
+    /// "forbidden". The two envelopes therefore differ by design.
+    #[test]
+    fn hidden_404_and_honest_403_are_distinct() {
+        assert_ne!(not_found_404(), forbidden_403());
+    }
+
+    /// The gate decision truth table (maps to the spec scenarios). A non-member on a
+    /// private, workspace-scoped route is hidden (404); everyone else is not.
+    #[test]
+    fn existence_hiding_gate_truth_table() {
+        // (auth_required, account_scoped, has_workspace, acting_resolved) -> hidden?
+        // 5.1/5.2/5.4 non-member on a private workspace route (no acting) -> 404.
+        assert!(hide_nonmember_as_404(true, false, true, false));
+        // 5.3 member (acting resolved) -> not hidden; falls through to the 403 path.
+        assert!(!hide_nonmember_as_404(true, false, true, true));
+        // 5.5 public route (auth not required) -> never gated, even for a non-member.
+        assert!(!hide_nonmember_as_404(false, false, true, false));
+        // 5.6 account-scoped route (e.g. /me) -> never gated on membership.
+        assert!(!hide_nonmember_as_404(true, true, true, false));
+        // 5.7 fail-closed: account_scoped absent reads false -> a non-member is gated.
+        //     (absence is decoded to `false` by `trusted_flag`, exercised below.)
+        assert!(hide_nonmember_as_404(true, false, true, false));
+        // No resolved workspace -> nothing to hide; not gated.
+        assert!(!hide_nonmember_as_404(true, false, false, false));
+    }
+
+    /// 5.8: the trusted flags are read only from the exact value "true"; anything
+    /// else — a client-set "false", a bogus value, or an absent header — reads
+    /// false. Combined with the edge C3 strip, a client can neither forge nor
+    /// suppress the gate: absence of account-scoped is the fail-closed gated state.
+    #[test]
+    fn trusted_flag_reads_only_literal_true() {
+        let yes = req_with_headers(&[(HDR_AUTH_REQUIRED, "true")]);
+        assert!(trusted_flag(&yes, HDR_AUTH_REQUIRED));
+        let no = req_with_headers(&[(HDR_AUTH_REQUIRED, "false")]);
+        assert!(!trusted_flag(&no, HDR_AUTH_REQUIRED));
+        let bogus = req_with_headers(&[(HDR_ACCOUNT_SCOPED, "1")]);
+        assert!(!trusted_flag(&bogus, HDR_ACCOUNT_SCOPED));
+        // Absent -> false (account-scoped absence = workspace-scoped = fail-closed).
+        let absent = req_with_headers(&[("x-other", "true")]);
+        assert!(!trusted_flag(&absent, HDR_ACCOUNT_SCOPED));
     }
 
     // ---- http-request-resilience -------------------------------------------- //

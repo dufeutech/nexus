@@ -149,6 +149,27 @@ read identity from either), and origin trust (§0) remains the underlying guaran
 `x-workspace-id` is also authored here first, then **re-asserted or stripped** by the sidecar
 after the membership check — treat the sidecar's value as authoritative.
 
+### 1b′. Existence-hiding — nexus owns the 404-vs-403 decision (identity-existence-hiding)
+
+Because boxes no longer double-check workspace membership, **nexus owns hiding a workspace's
+existence from a non-member.** On a private (`x-auth-required: true`), workspace-scoped route, the
+identity sidecar refuses a caller with no live membership of the routed workspace with a **`404`
+that is byte-identical to the not-found a nonexistent workspace yields** — so a caller with no
+relationship cannot distinguish "forbidden" from "does not exist" (RFC 9110 §15.5.4). A **member who
+merely lacks a required role/entitlement** still receives an honest **`403`** (their membership
+already discloses existence). Account-scoped routes (e.g. `/me`, marked `x-auth-account-scoped:
+true`) and public routes are never membership-gated.
+
+**Box responsibilities:**
+- **Do NOT re-derive workspace existence** or re-run a membership check to choose 404-vs-403 — a
+  non-member never reaches you (the sidecar short-circuits with the 404 before the box is called).
+- **Keep the body-`workspace_id`-vs-`x-workspace-id` backstop**, but make it **not leak**: if a
+  request body names a `workspace_id` disagreeing with the authoritative `x-workspace-id`, reject it
+  **without** revealing whether the body's workspace exists (mirror your own not-found shape; never a
+  distinguishable 403).
+- A workspace-level existence `404` you emit for a *member* (e.g. a sub-resource that does not exist
+  within a workspace they can access) is fine — existence is already disclosed to a member.
+
 ### 1c. Geo context — `x-geo-*` (only when Cloudflare fronted the request)
 
 Present only if the request arrived via Cloudflare (mapped from `cf-*`). Absent otherwise —
