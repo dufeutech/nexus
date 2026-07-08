@@ -107,6 +107,10 @@ services:
       # Empty => no bootstrap seed; author the first grants via the admin API.
       AUTHZ_ADMIN_ROLE: ${AUTHZ_ADMIN_ROLE:-admin}
       AUTHZ_BOOTSTRAP_ADMIN_SUB: ${AUTHZ_BOOTSTRAP_ADMIN_SUB:-}
+      # customer-api-keys: enables the /apikeys issue/rotate/revoke endpoints. The pepper
+      # keys the stored HMAC of every secret and MUST match the sidecar's value (a lab dev
+      # default; override beyond loopback). Unset => key management disabled (503).
+      APIKEY_HMAC_PEPPER: ${APIKEY_HMAC_PEPPER:-zitadel-lab-dev-apikey-pepper}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
@@ -329,6 +333,16 @@ services:
     restart: unless-stopped
     environment:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
+      # normalized-principal: the platform-service registry (SELECT-only). Set enables
+      # service-principal auth (a core service resolves its platform permissions live);
+      # unset turns it off (human path only). Lives alongside the identity store in the
+      # lab. Seeded by postgres-init/20-platform-services.sql.
+      PLATFORM_PG_RO_URL: ${PLATFORM_PG_RO_URL:-postgres://postgres:postgres@postgres:5432/identitydb}
+      # customer-api-keys: the SELECT-only api-key store (alongside the identity store in
+      # the lab). Set enables api-key (PAT) auth; the pepper MUST match authz-admin's so a
+      # presented secret hashes to the stored value. Unset => api-key auth off.
+      APIKEY_PG_RO_URL: ${APIKEY_PG_RO_URL:-postgres://postgres:postgres@postgres:5432/identitydb}
+      APIKEY_HMAC_PEPPER: ${APIKEY_HMAC_PEPPER:-zitadel-lab-dev-apikey-pepper}
       CACHE_TTL_SECONDS: ${SIDECAR_CACHE_TTL:-43200}
       READINESS_DELAY_SECONDS: ${SIDECAR_READINESS_DELAY:-0}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}

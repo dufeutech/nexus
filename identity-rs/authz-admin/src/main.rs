@@ -22,7 +22,7 @@ use std::error::Error;
 use std::future::pending;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
@@ -41,9 +41,10 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::{error, info, warn};
 
 use identity_core::authz::{AuthzAuthoring, AuthzResolver};
-use identity_core::store::BoxError;
+use identity_core::store::{BoxError, ProfileStore};
 use identity_core::telemetry;
-use store_postgres::PgProfileStore;
+use identity_core::SecretHasher;
+use store_postgres::{HmacSecretHasher, PgApiKeyStore, PgProfileStore};
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): every authoring mutation + rejected request is
@@ -79,6 +80,12 @@ struct App {
     /// future engine adapter swaps in without touching this surface.
     authoring: Arc<dyn AuthzAuthoring>,
     resolver: Arc<dyn AuthzResolver>,
+    /// Read the creator's live memberships for the "a key may not exceed its creator"
+    /// issuance check (`customer-api-keys` task 6.3).
+    profiles: Arc<dyn ProfileStore>,
+    /// The api-key store (issue/rotate/revoke). `None` when key management is not
+    /// configured (`APIKEY_HMAC_PEPPER` unset) — the `/apikeys` endpoints then 503.
+    api_keys: Option<Arc<PgApiKeyStore>>,
     /// Shared admin bearer token required on every authoring endpoint. `None` ONLY
     /// when auth is explicitly disabled at startup; the server otherwise refuses to
     /// start without a token, so it is never silently open.
@@ -222,6 +229,149 @@ async fn get_facts(State(s): State<App>, Path(sub): Path<String>) -> Response {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// customer-api-keys: the key-management surface (issue / rotate / revoke).
+// --------------------------------------------------------------------------- //
+
+/// Wall-clock seconds since the Unix epoch — the basis for a key's absolute `expires_at`.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// 400 for an invalid issuance request (the message names the problem — no secrets).
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
+/// 503 when key management is not configured (no `APIKEY_HMAC_PEPPER`).
+fn key_mgmt_unconfigured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "api key management not configured" })),
+    )
+        .into_response()
+}
+
+/// The "a key may not exceed its creator" gate (task 6.3), isolated for unit tests:
+/// every requested scope MUST be a workspace the creator is a live member of, and at
+/// least one scope is required (an unscoped key resolves to no authority). Returns the
+/// offending scope on rejection.
+fn scopes_within_creator(requested: &[String], member_workspaces: &[String]) -> Result<(), String> {
+    if requested.is_empty() {
+        return Err("at least one scope (workspace id) is required".to_owned());
+    }
+    for ws in requested {
+        if !member_workspaces.iter().any(|m| m == ws) {
+            return Err(format!("scope '{ws}' exceeds the creator's memberships"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct IssueKeyBody {
+    /// The creating user's subject — the human the key acts on behalf of.
+    creator_sub: String,
+    /// The workspace ids the key may act in (must be a subset of the creator's live
+    /// memberships).
+    #[serde(default)]
+    scopes: Vec<String>,
+    /// Optional lifetime; absent = a non-expiring key.
+    #[serde(default)]
+    expires_in_seconds: Option<i64>,
+}
+
+/// Issue a new PAT for a creating user (task 6.1). Human-only issuance is enforced at the
+/// deployment boundary (this surface is admin-token gated / reached only after human
+/// auth); "may not exceed the creator" is enforced HERE against the creator's live
+/// memberships AND again at resolve time in the sidecar (the real guarantee). The secret
+/// is returned exactly once and never persisted in plaintext.
+async fn issue_api_key(State(s): State<App>, Json(body): Json<IssueKeyBody>) -> Response {
+    let Some(store) = s.api_keys.as_ref() else {
+        return key_mgmt_unconfigured();
+    };
+    if body.creator_sub.trim().is_empty() {
+        return bad_request("creator_sub is required");
+    }
+    // The creator's live membership workspaces bound the key's scopes.
+    let member_workspaces = match s.profiles.get(&body.creator_sub).await {
+        Ok(Some(p)) => p.memberships.iter().map(|m| m.workspace_id.clone()).collect::<Vec<_>>(),
+        Ok(None) => Vec::new(),
+        Err(e) => return internal(e),
+    };
+    if let Err(msg) = scopes_within_creator(&body.scopes, &member_workspaces) {
+        return bad_request(&msg);
+    }
+    match store.issue(&body.creator_sub, &body.scopes, body.expires_in_seconds, now_epoch()).await {
+        Ok(issued) => {
+            METRICS.mutations.add(1, &[KeyValue::new("op", "issue_api_key")]);
+            // Audit (task 7.1): the key id is not PII; the secret is NEVER logged.
+            info!(op = "issue_api_key", key_id = %issued.key_id, "authoring");
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "key_id": issued.key_id,
+                    "secret": issued.secret,
+                    "expires_at": issued.expires_at,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// Rotate a key (task 6.2): mint a new secret under a preserved lineage with the SAME
+/// scopes (no widening) and revoke the old one. Returns the new secret once, or 404 if
+/// the key id is not an active key.
+async fn rotate_api_key(State(s): State<App>, Path(key_id): Path<String>) -> Response {
+    let Some(store) = s.api_keys.as_ref() else {
+        return key_mgmt_unconfigured();
+    };
+    match store.rotate(&key_id).await {
+        Ok(Some(issued)) => {
+            METRICS.mutations.add(1, &[KeyValue::new("op", "rotate_api_key")]);
+            info!(op = "rotate_api_key", key_id = %issued.key_id, "authoring");
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "key_id": issued.key_id,
+                    "secret": issued.secret,
+                    "expires_at": issued.expires_at,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no active key with that id" })),
+        )
+            .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// Revoke a key (task 6.2): flip it to `revoked` so the sidecar rejects it on the next
+/// request. Idempotent — revoking an already-revoked/unknown key is a 200 with
+/// `revoked: false`.
+async fn revoke_api_key(State(s): State<App>, Path(key_id): Path<String>) -> Response {
+    let Some(store) = s.api_keys.as_ref() else {
+        return key_mgmt_unconfigured();
+    };
+    match store.revoke(&key_id).await {
+        Ok(revoked) => {
+            METRICS.mutations.add(1, &[KeyValue::new("op", "revoke_api_key")]);
+            info!(op = "revoke_api_key", %key_id, revoked, "authoring");
+            (StatusCode::OK, Json(json!({ "result": "ok", "revoked": revoked }))).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -310,16 +460,45 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         sleep(Duration::from_secs(2)).await;
     };
-    // Depend on the PORTS (spec R5): the same store object satisfies both.
+    // Depend on the PORTS (spec R5): the same store object satisfies all three.
     let authoring: Arc<dyn AuthzAuthoring> = store.clone();
+    let profiles: Arc<dyn ProfileStore> = store.clone();
     let resolver: Arc<dyn AuthzResolver> = store;
+
+    // customer-api-keys: key management is ENABLED when APIKEY_HMAC_PEPPER is set (the
+    // same pepper the sidecar verifies with). The api-key store shares the identity DB
+    // (PROFILE_PG_URL) and owns its idempotent schema setup here. Without a pepper the
+    // /apikeys endpoints answer 503 (fail closed — never mint a key we can't hash).
+    let api_keys = if let Some(pepper) = var("APIKEY_HMAC_PEPPER").ok().filter(|p| !p.trim().is_empty())
+    {
+        let hasher: Arc<dyn SecretHasher> = Arc::new(HmacSecretHasher::new(pepper.into_bytes()));
+        match PgApiKeyStore::connect(&pg_url, hasher).await {
+            Ok(ks) => match ks.init_schema().await {
+                Ok(()) => {
+                    info!("customer-api-key management ENABLED (/apikeys)");
+                    Some(Arc::new(ks))
+                }
+                Err(e) => {
+                    error!(error = %e, "api_keys schema init failed -> key management OFF");
+                    None
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "api-key store connect failed -> key management OFF");
+                None
+            }
+        }
+    } else {
+        info!("APIKEY_HMAC_PEPPER unset -> customer-api-key management OFF");
+        None
+    };
 
     // Bootstrap the first administrator before serving (spec R4). A failure here is
     // fatal — an unreachable authoring surface is worse than a crash-loop the operator
     // can see and fix.
     bootstrap_admin(authoring.as_ref(), &admin_role, bootstrap_sub.as_deref()).await?;
 
-    let app = App { authoring, resolver, auth_token };
+    let app = App { authoring, resolver, profiles, api_keys, auth_token };
 
     // Authoring + read endpoints behind the admin-token gate (route_layer so an
     // unknown path 404s without first demanding a token).
@@ -334,6 +513,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .route("/authz/{sub}/suspend", post(suspend))
         .route("/authz/{sub}/reactivate", post(reactivate))
+        // customer-api-keys: issue / rotate / revoke Personal Access Tokens.
+        .route("/apikeys", post(issue_api_key))
+        .route("/apikeys/{key_id}/rotate", post(rotate_api_key))
+        .route("/apikeys/{key_id}/revoke", post(revoke_api_key))
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     let router = data
@@ -383,6 +566,24 @@ mod tests {
         h.insert(AUTHORIZATION, "Bearer   ".parse().unwrap());
         assert!(bearer_token(&h).is_none());
         assert!(bearer_token(&HeaderMap::new()).is_none());
+    }
+
+    // ---- customer-api-keys: "a key may not exceed its creator" (task 6.3) --- //
+
+    #[test]
+    fn scopes_must_be_a_subset_of_the_creators_memberships() {
+        let member = vec!["ws-1".to_owned(), "ws-2".to_owned()];
+        // A subset of the creator's memberships is accepted.
+        assert!(scopes_within_creator(&["ws-1".to_owned()], &member).is_ok());
+        assert!(scopes_within_creator(&["ws-1".to_owned(), "ws-2".to_owned()], &member).is_ok());
+        // A scope the creator is not a member of is rejected (may not exceed the creator).
+        let err = scopes_within_creator(&["ws-1".to_owned(), "ws-3".to_owned()], &member)
+            .expect_err("ws-3 exceeds the creator");
+        assert!(err.contains("ws-3"), "the rejection names the offending scope");
+        // An unscoped key (no scopes) is rejected — it would resolve to no authority.
+        assert!(scopes_within_creator(&[], &member).is_err());
+        // A creator with no memberships can scope a key to nothing.
+        assert!(scopes_within_creator(&["ws-1".to_owned()], &[]).is_err());
     }
 
     // ---- Bootstrap gate (spec R4) ------------------------------------------- //

@@ -288,6 +288,16 @@ static_resources:
                           # silent-but-fatal (every authenticated request 401s);
                           # scripts/helm-guards-test.sh asserts the two stay equal.
                           issuer: "http://localhost:8080"
+                          # AUDIENCE PINNING — intentionally NOT enabled (normalized-principal
+                          # ADR-5a). An `aud` check only matters when one issuer mints tokens
+                          # for MULTIPLE audiences (to stop a token for relying party A being
+                          # replayed at B). Here the edge is ZITADEL's SOLE relying party —
+                          # boxes verify the nexus `x-identity-contract`, not the raw ZITADEL
+                          # token — so the `iss` pin already fully scopes tokens and this check
+                          # is redundant. Enable ONLY if a second first-party audience appears
+                          # (a box/service that verifies its own ZITADEL token): define a stable
+                          # edge audience, configure ZITADEL to mint it, then uncomment. See ADR-5a.
+                          # audiences: ["<edge-audience>"]
                           remote_jwks:
                             # uri authority -> Host header (must match ZITADEL's
                             # external domain, which validates Host); cluster ->
@@ -307,6 +317,32 @@ static_resources:
                               timeout: 5s
                             cache_duration: { seconds: 600 }
                           payload_in_metadata: verified
+                          forward: true
+                        # SECOND provider (normalized-principal task 3.1): infra-trust
+                        # identity for a CORE PLATFORM SERVICE — NOT the human IdP
+                        # (ADR-5/6). In PRODUCTION this verifies a K8s projected
+                        # ServiceAccount token: point `remote_jwks` at the cluster's
+                        # OIDC discovery JWKS (the API server publishes one) and set
+                        # `issuer` to the cluster issuer — verification then reuses this
+                        # exact `jwt_authn` path with ZERO new code. In COMPOSE-DEV there
+                        # is no cluster, so this is a STUB (task 3.3): a `local_jwks` +
+                        # a dev issuer. ONLY the issuer/JWKS source differs from prod —
+                        # the verification mechanism is identical.
+                        service_account:
+                          issuer: "https://sa.nexus.local"
+                          # The dev SA token's bound audience. In prod, set this to the
+                          # audience the projected SA token is minted for.
+                          audiences: ["nexus-edge"]
+                          # DEV STUB verification key (matches the dev SA signing key
+                          # used by scripts/service-identity-e2e.sh). Prod replaces this
+                          # whole block with `remote_jwks` → the cluster OIDC JWKS.
+                          local_jwks:
+                            inline_string: |
+                              {"keys":[{"kty":"EC","crv":"P-256","alg":"ES256","use":"sig","kid":"test-key-1","x":"lxP_9XLIHt9Tn9gt7cFBkRpc5jBny782LcAej_ImMyY","y":"EKTNsYnArpXYqLRQt2lkgJ1j-zEoKVA9wEXjHwVHPBo"}]}
+                          # The verified service identity lands in its OWN metadata key
+                          # so the sidecar authenticator chain tells it apart from the
+                          # human `verified` payload (SVC_PAYLOAD_KEY in main.rs).
+                          payload_in_metadata: verified_service
                           forward: true
                       # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
                       # tenant-router ext_proc (RFC C17 tenant-first), so it can
@@ -334,7 +370,18 @@ static_resources:
                               ]
                           requires: { allow_missing: {} }
                         - match: { prefix: "/" }
-                          requires: { provider_name: oidc }
+                          # A verified credential from EITHER trust boundary satisfies
+                          # the gate (normalized-principal task 3.1): a human OIDC token
+                          # OR a core-service infra-trust token. Envoy selects the
+                          # provider whose issuer matches the token's `iss`, so the two
+                          # never collide; each writes its own `payload_in_metadata`. The
+                          # sidecar then resolves authority per principal kind and still
+                          # fails closed for a verified-but-unauthorized caller.
+                          requires:
+                            requires_any:
+                              requirements:
+                                - { provider_name: oidc }
+                                - { provider_name: service_account }
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor

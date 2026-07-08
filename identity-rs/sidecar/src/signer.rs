@@ -19,18 +19,29 @@ use identity_core::{ContractClaims, ContractSigner, SignError};
 /// The everything-needed-to-mint bundle, so [`Signer::mint`] stays a single call from
 /// the hot path (avoids a wide positional argument list).
 pub(crate) struct MintInput<'a> {
-    /// Verified subject.
+    /// Verified subject (a user `sub` or a service id).
     pub sub: &'a str,
     /// Destination box audience (from `x-route-pool`).
     pub aud: &'a str,
-    /// Authoritative acting workspace.
+    /// The principal kind (`user`/`apikey`/`service`) — nexus-authored (normalized-principal).
+    pub principal_kind: &'a str,
+    /// The subject an `apikey` principal acts on behalf of (the creating user); `None`
+    /// for a `user`/`service` (`customer-api-keys`). Authored into the `on_behalf_of`
+    /// claim, omitted while `None`.
+    pub on_behalf_of: Option<&'a str>,
+    /// Authoritative acting workspace (membership workspace for a user/api-key; the
+    /// acting `x-workspace-id` for a service).
     pub workspace_id: &'a str,
-    /// Acting relationship type (`staff`/`customer`/…).
-    pub member_type: &'a str,
-    /// Acting, workspace-scoped role.
-    pub role: &'a str,
-    /// Coarse nexus-authored global roles.
+    /// Acting relationship type (`staff`/`customer`/…). `None` for a service (a
+    /// `Platform` authority has no member type).
+    pub member_type: Option<&'a str>,
+    /// Acting, workspace-scoped role. `None` for a service.
+    pub role: Option<&'a str>,
+    /// Coarse nexus-authored global roles. Empty for a service.
     pub roles: &'a [String],
+    /// The service's platform permission set (least-privilege). Empty for a
+    /// user/api-key.
+    pub permissions: &'a [String],
     /// Current time, seconds since the Unix epoch (injected for testability).
     pub now: u64,
 }
@@ -107,9 +118,12 @@ impl Signer {
             jti: format!("{}-{seq}", input.now),
             ctr: self.contract_version.clone(),
             workspace_id: input.workspace_id.to_owned(),
-            member_type: input.member_type.to_owned(),
-            role: input.role.to_owned(),
+            principal_kind: input.principal_kind.to_owned(),
+            on_behalf_of: input.on_behalf_of.map(str::to_owned),
+            member_type: input.member_type.map(str::to_owned),
+            role: input.role.map(str::to_owned),
             roles: input.roles.to_vec(),
+            permissions: input.permissions.to_vec(),
             plan: None,
         };
         self.sign(&claims)
@@ -166,10 +180,13 @@ mod tests {
             .mint(&MintInput {
                 sub: "user-1",
                 aud,
+                principal_kind: "user",
+                on_behalf_of: None,
                 workspace_id: "ws-1",
-                member_type: "staff",
-                role: "admin",
+                member_type: Some("staff"),
+                role: Some("admin"),
                 roles: &["ops".to_owned()],
+                permissions: &[],
                 now,
             })
             .unwrap()
@@ -203,11 +220,84 @@ mod tests {
         assert_eq!(claims.aud, AUD);
         assert_eq!(claims.sub, "user-1");
         assert_eq!(claims.workspace_id, "ws-1");
-        assert_eq!(claims.member_type, "staff");
-        assert_eq!(claims.role, "admin");
+        assert_eq!(claims.principal_kind, "user");
+        assert_eq!(claims.member_type.as_deref(), Some("staff"));
+        assert_eq!(claims.role.as_deref(), Some("admin"));
         assert_eq!(claims.ctr, "v1");
         assert_eq!(claims.roles, vec!["ops".to_owned()]);
+        assert!(claims.permissions.is_empty(), "a user carries no platform permissions");
         assert!(claims.plan.is_none(), "plan is reserved, not populated");
+    }
+
+    #[test]
+    fn service_contract_conveys_platform_authority_not_a_member_role() {
+        // Task 5.2: for a Platform authority the token carries principal_kind=service,
+        // the acting workspace, and the permission set — and OMITS member_type/role
+        // (a service has no membership). The omitted claims deserialize to None.
+        let signer = test_signer();
+        let token = signer
+            .mint(&MintInput {
+                sub: "system:serviceaccount:nexus:events-writer",
+                aud: AUD,
+                principal_kind: "service",
+                on_behalf_of: None,
+                workspace_id: "ws-acting",
+                member_type: None,
+                role: None,
+                roles: &[],
+                permissions: &["events:write".to_owned()],
+                now: now_secs(),
+            })
+            .unwrap();
+        let claims = verify_with(TEST_JWKS, &token).expect("service token must verify");
+        assert_eq!(claims.principal_kind, "service");
+        assert_eq!(claims.workspace_id, "ws-acting");
+        assert_eq!(claims.permissions, vec!["events:write".to_owned()]);
+        assert!(claims.member_type.is_none(), "a service must not claim a member_type");
+        assert!(claims.role.is_none(), "a service must not claim a workspace role");
+        assert!(claims.roles.is_empty());
+        assert!(claims.on_behalf_of.is_none(), "a service acts as itself, not on behalf of");
+        // The omitted claims must not appear on the wire: re-serializing the claims
+        // exercises the same `skip_serializing_if` the mint used to build the payload.
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(!json.contains("\"member_type\""), "member_type omitted on the wire");
+        assert!(!json.contains("\"role\""), "role omitted on the wire");
+        assert!(!json.contains("\"on_behalf_of\""), "on_behalf_of omitted for a non-key");
+        assert!(json.contains("\"principal_kind\""));
+        assert!(json.contains("\"permissions\""));
+    }
+
+    #[test]
+    fn api_key_contract_names_the_key_and_the_creator() {
+        // Task 5.1 / 5.2 (identity-contract-signing ADDED delta): an apikey principal's
+        // contract carries principal_kind=apikey, the key id as `sub`, and the creating
+        // user as `on_behalf_of` — alongside the acting workspace membership the key
+        // resolved to. A non-key principal omits `on_behalf_of` (asserted above).
+        let signer = test_signer();
+        let token = signer
+            .mint(&MintInput {
+                sub: "pak_deadbeef",
+                aud: AUD,
+                principal_kind: "apikey",
+                on_behalf_of: Some("u-creator"),
+                workspace_id: "ws-1",
+                member_type: Some("staff"),
+                role: Some("admin"),
+                // Least-privilege: an api key carries no coarse global roles of its own.
+                roles: &[],
+                permissions: &[],
+                now: now_secs(),
+            })
+            .unwrap();
+        let claims = verify_with(TEST_JWKS, &token).expect("apikey token must verify");
+        assert_eq!(claims.principal_kind, "apikey");
+        assert_eq!(claims.sub, "pak_deadbeef");
+        assert_eq!(claims.on_behalf_of.as_deref(), Some("u-creator"));
+        assert_eq!(claims.workspace_id, "ws-1");
+        assert_eq!(claims.member_type.as_deref(), Some("staff"));
+        assert_eq!(claims.role.as_deref(), Some("admin"));
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"on_behalf_of\""), "an apikey contract carries on_behalf_of");
     }
 
     #[test]

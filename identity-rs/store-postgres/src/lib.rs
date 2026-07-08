@@ -44,8 +44,14 @@ use identity_core::store::{
 };
 use identity_core::Profile;
 
+mod api_keys;
 mod authz;
+mod hasher;
+mod platform_services;
 mod source_memberships;
+pub use api_keys::{IssuedKey, PgApiKeyReader, PgApiKeyStore, API_KEY_CHANGE_CHANNEL};
+pub use hasher::HmacSecretHasher;
+pub use platform_services::{PgPlatformServiceReader, PlatformFeed, PLATFORM_CHANGE_CHANNEL};
 pub use source_memberships::PgSourceMembershipReader;
 
 /// The NOTIFY channel every profile mutation publishes a wakeup on.

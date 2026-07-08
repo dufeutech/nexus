@@ -232,6 +232,14 @@ static_resources:
                         oidc:
                           # Must equal the `iss` your OIDC provider mints (RFC §6.6).
                           issuer: "https://auth.example.com"
+                          # AUDIENCE PINNING — intentionally NOT enabled (normalized-principal
+                          # ADR-5a). An `aud` check only matters when one issuer serves MULTIPLE
+                          # audiences; here the edge is ZITADEL's sole relying party (boxes verify
+                          # the nexus contract, not the raw token), so the `iss` pin already fully
+                          # scopes tokens and this is redundant. Enable only if a second first-party
+                          # audience appears — define an edge audience + configure ZITADEL to mint
+                          # it, then uncomment. See ADR-5a.
+                          # audiences: ["<edge-audience>"]
                           remote_jwks:
                             http_uri:
                               # The Host header sent on the JWKS fetch must equal
@@ -257,6 +265,23 @@ static_resources:
                             cache_duration: { seconds: 600 }
                           payload_in_metadata: verified
                           forward: true
+                        # SECOND provider (normalized-principal task 3.1): infra-trust
+                        # identity for a CORE PLATFORM SERVICE — NOT the human IdP
+                        # (ADR-5/6). In PRODUCTION point `remote_jwks` at the cluster's
+                        # OIDC discovery JWKS (a K8s projected ServiceAccount token) and
+                        # set `issuer` to the cluster issuer — verification reuses this
+                        # exact path with ZERO new code. In COMPOSE-DEV this is a STUB
+                        # (task 3.3): a `local_jwks` + a dev issuer. ONLY the issuer/JWKS
+                        # source differs from prod; the verification mechanism is
+                        # identical. (Kept in sync with edge/envoy.yaml.)
+                        service_account:
+                          issuer: "https://sa.nexus.local"
+                          audiences: ["nexus-edge"]
+                          local_jwks:
+                            inline_string: |
+                              {"keys":[{"kty":"EC","crv":"P-256","alg":"ES256","use":"sig","kid":"test-key-1","x":"lxP_9XLIHt9Tn9gt7cFBkRpc5jBny782LcAej_ImMyY","y":"EKTNsYnArpXYqLRQt2lkgJ1j-zEoKVA9wEXjHwVHPBo"}]}
+                          payload_in_metadata: verified_service
+                          forward: true
                       # Per-route auth gate (RFC N4). jwt_authn runs AFTER the
                       # tenant-router ext_proc (C17 tenant-first), so it branches on
                       # the x-auth-required the router set from the (domain, path)
@@ -276,7 +301,14 @@ static_resources:
                             headers: [{ name: x-auth-required, string_match: { exact: "false" } }]
                           requires: { allow_missing: {} }
                         - match: { prefix: "/" }
-                          requires: { provider_name: oidc }
+                          # EITHER trust boundary satisfies the gate (task 3.1): a human
+                          # OIDC token OR a core-service infra-trust token. Envoy picks
+                          # the provider whose issuer matches the token's `iss`.
+                          requires:
+                            requires_any:
+                              requirements:
+                                - { provider_name: oidc }
+                                - { provider_name: service_account }
                   # Enrich from the verified subject (C2).
                   - name: envoy.filters.http.ext_proc
                     typed_config:

@@ -57,9 +57,10 @@ token minted **only** for a resolved identity (§1a-bis).
 | --- | --- | --- | --- |
 | `x-identity-contract` | **The signed contract.** An ES256 JWS whose claims carry the acting identity; the contract-shape version rides inside as the `ctr` claim. Minted only for an authenticated member (§1a-bis). | compact JWS (`h.p.s`) | **Verify + require** (§1a-bis, §2). |
 | `x-workspace-id` | The **authorized acting workspace** (set only after a live membership check). | id string | Primary tenant scope. Prefer over legacy `x-tenant-id`. |
-| `x-user-id` | Verified subject (`sub`). | id string | Audit / ownership checks. |
-| `x-user-type` | Acting relationship in this workspace. | `staff` \| `customer` | Acting-scope decisions. |
-| `x-user-role` | Workspace-scoped role (not global). | role string | Acting-scope decisions. |
+| `x-user-id` | Verified subject (`sub` for a user; the **service id** for a service; the **key id** for an api-key principal). | id string | Audit / ownership checks. |
+| `x-user-on-behalf-of` | **Only for an `apikey` principal:** the **creating user** the key acts for (customer-api-keys). Authored alongside the acting scope; **absent** for a human/service. | id string | Audit / attribution to the human behind the automation. |
+| `x-user-type` | Acting **principal kind / relationship**. `staff`/`customer` for a human (and for an **api-key**, the creator's relationship in the acting workspace); **`service`** for a core platform service (normalized-principal). | `staff` \| `customer` \| `service` | Acting-scope decisions; branch the write door on `service`. |
+| `x-user-role` | Workspace-scoped role (not global). **Absent for a `service`** (a service has no workspace role). | role string | Acting-scope decisions. |
 | `x-user-roles` | Coarse global roles, **nexus-authored** (from the live Profile via the resolver — never the token or the OIDC provider; `nexus-native-authorization`). | comma-joined | Enrichment. |
 | `x-user-entitlements` | Entitlements, nexus-authored (live Profile). | comma-joined | Feature checks. |
 | `x-user-suspended` | Suspension flag, nexus-authored (always from live Profile — revocation-sensitive, effective within seconds). | `true` \| `false` | Hard block. |
@@ -84,16 +85,46 @@ token minted **only** for a resolved identity (§1a-bis).
      short-lived and minted per request.
    - `ctr` — the contract version (replaces the old `vN` string). Reject a version you do not
      understand — this is the drift tripwire for the whole `x-user-*`/`x-workspace-*` shape.
-4. **Read identity from the verified claims** if you wish: `sub`, `workspace_id`, `role`,
-   `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-role` / `x-user-roles`). The
-   `plan` claim is **reserved** and currently absent — treat absent plan as not-provisioned.
+4. **Read identity from the verified claims** if you wish: `sub`, `workspace_id`, `principal_kind`,
+   `role`, `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-type` / `x-user-role` /
+   `x-user-roles`). For an **`apikey`** principal the claims additionally carry **`on_behalf_of`** (the
+   creating user) — present only for `apikey`, mirroring `x-user-on-behalf-of`. The `plan` claim is
+   **reserved** and currently absent — treat absent plan as not-provisioned.
 
 **Minted only for a resolved identity.** nexus signs the token **only** when the request is
-authenticated *and* the caller is a member of the acting workspace. A non-member, an anonymous
+authenticated *and* the caller resolved to an **authority** — a workspace membership (user) or a
+platform permission set (service). A non-member, an unregistered/inactive service, an anonymous
 caller, or a caller nexus has no profile for carries **no** `x-identity-contract` at all (and
 any client-supplied copy is stripped). So on an identity-enriched route, an absent or
-unverifiable token means **reject** (fail closed) — nexus has already refused non-members
-upstream; they never reach you with a valid contract.
+unverifiable token means **reject** (fail closed) — nexus has already refused unauthorized
+callers upstream; they never reach you with a valid contract.
+
+### 1a-ter. The `principal_kind` claim — authorizing a service vs a human (normalized-principal)
+
+The signed contract carries a nexus-authored **`principal_kind`** — one of `user`, `apikey`, or
+`service` — so your box can authorize on **what authenticated**, not only on role. It is
+authoritative and **never** client-assertable (it comes from the verified credential + nexus's own
+resolution; a forged `x-user-type` header is stripped).
+
+| `principal_kind` | What it is | Contract claim shape | How a box typically authorizes it |
+| --- | --- | --- | --- |
+| `user` | A human end-user (OIDC). | `member_type` + `role` + `roles`; no `permissions`. | Gate by role/entitlement as today. |
+| `service` | A **core platform service** authenticated by infrastructure trust (e.g. a K8s ServiceAccount token) — the legitimate **event writer**. | `workspace_id` (the acting workspace) + **`permissions`** (a least-privilege named set, e.g. `["events:write"]`); **no** `member_type`/`role`. | Admit as a **writer** iff `permissions` contains the operation you require. |
+| `apikey` | Customer automation — a **Personal Access Token** issued by a human, acting **on behalf of** them (customer-api-keys). | `sub` is the **key id**; `member_type` + `role` are the creator's, in the acting workspace, **bounded by the key's scopes** (the key's authority = the creator's LIVE membership ∩ the key's scopes, so it never exceeds the creator and follows their revocation); **`on_behalf_of`** names the creating user; no coarse `roles`, no `permissions`. | Treat like the user it acts for, already bounded by scope. Attribute the action to **both** the key (`sub`) and the human (`on_behalf_of`). |
+
+**An `apikey` contract** conveys the api-key kind, the key id as `sub`, the intersected acting
+`workspace_id` + `member_type`/`role`, and `on_behalf_of` (the creating user). Revocation is live and
+fail-closed: revoking or expiring a key — or revoking the **creator's** membership — denies the key's
+next request within seconds (it resolves to no authority → no contract). The raw `x-api-key` credential
+the client presents is **stripped at the sidecar** and never reaches your box.
+
+A **service** contract conveys the service kind, the acting `workspace_id`, and the platform
+`permissions` — and deliberately claims **no** workspace `member_type` or `role`. Authorize it by
+its permissions (least-privilege): perform an operation only if the required permission is present,
+even for an otherwise-authenticated, registered service. A service acts on **one** workspace per
+request (the `workspace_id` claim), taken from nexus's trusted routing context — never
+service-supplied. Revocation is live: revoking or de-registering a service denies its next request
+within seconds.
 
 **No legacy string form.** `x-identity-contract` is a signed JWS — there is no plain-string
 (`v1`) variant to fall back to. If it is present, verify it; if it is absent on an enriched

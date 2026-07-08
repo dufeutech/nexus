@@ -21,6 +21,14 @@ async-trait.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# customer-api-keys: the adopted secret hasher (keyed HMAC-SHA256) + credential
+# generation live here (a shared adapter both the sidecar and authz-admin depend on;
+# core stays crypto-free). See src/hasher.rs.
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 # Integration tests (tests/integration.rs) drive the adapter against a real

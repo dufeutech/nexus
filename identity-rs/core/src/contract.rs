@@ -6,10 +6,13 @@
 //! this port in the sidecar's `signer` adapter — no crypto-library type appears
 //! here, so a signer swap never touches core.
 //!
-//! Invariant (design.md): a token is minted ONLY for an authenticated request whose
-//! acting-workspace membership was resolved. The claims below therefore always carry
-//! the authoritative acting scope (`workspace_id` + `member_type` + `role`); an
-//! unresolved request has no claims to sign and carries no token.
+//! Invariant (design.md): a token is minted ONLY for an authenticated request that
+//! resolved to an AUTHORITY — either an acting-workspace membership (user/api-key) or a
+//! platform permission set (service). The claims therefore always carry the
+//! authoritative acting `workspace_id` and the `principal_kind`; a user/api-key
+//! principal additionally carries `member_type` + `role`, while a service carries its
+//! platform `permissions` and OMITS `member_type`/`role` (a service has no membership).
+//! An unresolved request has no claims to sign and carries no token (normalized-principal).
 
 use std::fmt;
 
@@ -41,14 +44,38 @@ pub struct ContractClaims {
     /// carry). The single coordination gate for the `x-workspace-*`/`x-user-*`
     /// header family's shape.
     pub ctr: String,
-    /// The authoritative acting workspace (a live membership was resolved).
+    /// The authoritative acting workspace. For a user/api-key a live membership of it
+    /// was resolved; for a service it is the workspace the service acts on this request
+    /// (from the trusted `x-workspace-id`), authorized by its platform permissions.
     pub workspace_id: String,
+    /// The principal kind this assertion conveys (`user`/`apikey`/`service`) —
+    /// nexus-authored, never caller-asserted (normalized-principal). A box authorizes
+    /// on it (e.g. admit a service as a writer while gating a human by role).
+    pub principal_kind: String,
+    /// The subject this principal acts **on behalf of** — the creating user for an
+    /// `apikey` principal, so a box (and audit) can attribute the action to the human
+    /// behind the automation (`customer-api-keys`). ABSENT for a `user`/`service`
+    /// principal (they act only as themselves) — omitted from the token while `None`, so
+    /// adding it is a value change, not a contract bump. nexus-authored, never
+    /// key-asserted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub on_behalf_of: Option<String>,
     /// The acting relationship type in that workspace (e.g. `staff`/`customer`).
-    pub member_type: String,
-    /// The acting, workspace-scoped role.
-    pub role: String,
-    /// Coarse nexus-authored global roles (mirrors `x-user-roles`).
+    /// ABSENT for a service principal (a `Platform` authority has no member type) —
+    /// omitted from the token while `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub member_type: Option<String>,
+    /// The acting, workspace-scoped role. ABSENT for a service principal (no role) —
+    /// omitted while `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
+    /// Coarse nexus-authored global roles (mirrors `x-user-roles`). Empty for a service.
     pub roles: Vec<String>,
+    /// The service's platform permission set (a `Platform` authority only) — the
+    /// least-privilege named permissions a box maps its write door onto. Empty/omitted
+    /// for a user/api-key principal.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub permissions: Vec<String>,
     /// RESERVED — the workspace plan tier. Populated by a later change (no plan-tier
     /// model exists yet); omitted from the token while `None` so adding it later is a
     /// value change, not a contract bump.

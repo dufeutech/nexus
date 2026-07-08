@@ -112,3 +112,49 @@ authorization.
   answers the same authorization questions
 - **THEN** the enforcement and enrichment behavior SHALL be unchanged, and the
   consuming points SHALL require no modification
+
+### Requirement: Authorization resolution branches on principal kind
+
+The system SHALL select how it resolves a principal's authority by the principal's **kind**:
+workspace-scoped principals (human users, api keys) resolve to a **workspace authority** from live
+membership, while core platform services resolve to a **platform authority** from their live platform
+permissions. Both paths SHALL remain live and revocation-consistent (taking effect within seconds), and
+both SHALL be deny-by-default when no authority resolves.
+
+#### Scenario: A user resolves via membership
+
+- **WHEN** a human-user principal is resolved
+- **THEN** its authority SHALL come from its live workspace membership, unchanged from the existing
+  behavior
+
+#### Scenario: A service resolves via platform permissions
+
+- **WHEN** a service principal is resolved
+- **THEN** its authority SHALL come from its live platform permissions, not from any workspace membership
+
+#### Scenario: Neither path resolving is deny-by-default
+
+- **WHEN** a principal matches neither a live membership nor a live platform registration
+- **THEN** it SHALL be treated as holding no authority and refused, consistent with deny-by-default
+
+### Requirement: API-key principal resolves to intersected workspace authority
+The system SHALL resolve an API-key principal's authority as the creating user's **live** workspace
+memberships **intersected** with the key's scopes, so a key can never exceed its creator and follows the
+creator's revocation.
+
+#### Scenario: Key inherits a subset of the creator's memberships
+- **WHEN** an API-key principal acts on a workspace
+- **THEN** it is authorized only if the creating user is a live member of that workspace AND the key's
+  scopes admit that workspace and action
+
+#### Scenario: Creator's revocation cascades to the key
+- **WHEN** the creating user's membership for a workspace is revoked
+- **THEN** the key's authority for that workspace is withdrawn within seconds, without touching the key
+
+#### Scenario: Scope narrows but never widens
+- **WHEN** a key's scopes are narrower than the creator's memberships
+- **THEN** the resolved authority is the intersection — never broader than either input
+
+#### Scenario: No intersection fails closed
+- **WHEN** an API-key principal acts on a workspace outside the intersection
+- **THEN** it resolves to no authority and is rejected, never admitted open

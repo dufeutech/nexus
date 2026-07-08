@@ -67,17 +67,22 @@ The identity plane SHALL publish its current public verification key(s) at a sta
 
 ### Requirement: Only authenticated, membership-resolved requests are signed
 
-The identity plane SHALL mint a signed assertion only for a request whose subject was authenticated AND whose acting-workspace membership was resolved. It SHALL NOT mint a token for an anonymous or unauthenticated request. Whether a backend permits anonymous access on a given route is the backend's decision; nexus contributes no signed attestation in the absence of a resolved identity.
+The identity plane SHALL mint a signed assertion only for a request whose subject was authenticated AND whose **authority was resolved** — either an acting-workspace membership (for a user or api-key principal) or a platform permission set (for a service principal). It SHALL NOT mint a token for an anonymous or unauthenticated request, nor for a principal that resolves to no authority. Whether a backend permits anonymous access on a given route is the backend's decision; nexus contributes no signed attestation in the absence of a resolved authority.
 
 #### Scenario: An anonymous request carries no signed assertion
 
-- **WHEN** a request has no authenticated subject or no resolved workspace membership
+- **WHEN** a request has no authenticated subject or resolves to no authority
 - **THEN** the identity plane SHALL NOT mint an `x-identity-contract` assertion for it
 
-#### Scenario: An enriched request carries a signed assertion
+#### Scenario: An enriched user request carries a signed assertion
 
 - **WHEN** a request's subject is authenticated and its acting-workspace membership is resolved on an identity-enriched route
 - **THEN** the identity plane SHALL mint and stamp a signed `x-identity-contract` assertion conveying that resolved identity
+
+#### Scenario: An authorized service request carries a signed assertion
+
+- **WHEN** a service principal is authenticated and resolves to a platform permission set on an identity-enriched route
+- **THEN** the identity plane SHALL mint and stamp a signed `x-identity-contract` assertion for it, even though it holds no workspace membership
 
 ### Requirement: The signing key is a runtime secret held only by the identity plane
 
@@ -87,3 +92,35 @@ The private signing key SHALL be delivered to the identity plane at runtime as a
 
 - **WHEN** a deployment is assembled
 - **THEN** backends SHALL receive only the public verification material, and the private signing key SHALL be present only within the identity plane as a runtime-injected secret
+
+### Requirement: The signed assertion identifies the principal kind
+
+The signed assertion SHALL carry the **principal kind** it conveys, so a backend can authorize on kind (for example admitting a service as a writer while gating a human by role). For a service principal the assertion SHALL carry the acting workspace and the service's platform permissions in place of a workspace member type and role. The kind and its accompanying authority SHALL be nexus-authored and SHALL NOT be assertable by the caller.
+
+#### Scenario: A backend reads the principal kind from the assertion
+
+- **WHEN** a backend receives an enriched request whose assertion verifies
+- **THEN** it SHALL be able to read the principal kind from the token's claims and authorize on it
+
+#### Scenario: A service assertion conveys platform authority, not a member role
+
+- **WHEN** the identity plane mints an assertion for a service principal
+- **THEN** the token SHALL convey the service kind, the acting workspace, and the platform permissions, and SHALL NOT claim a workspace member type or role for the service
+
+### Requirement: Contract carries the api-key kind and on-behalf-of principal
+The signed identity contract SHALL, for an API-key principal, carry a `principal_kind` of `apikey` and an
+`on_behalf_of` claim naming the creating user, alongside the acting workspace, so a box can attribute the
+action to both the key and the human behind it.
+
+#### Scenario: Api-key contract names both principals
+- **WHEN** the system mints a contract for an API-key principal
+- **THEN** the contract's `principal_kind` is `apikey`, its subject is the key ID, and its `on_behalf_of`
+  claim is the creating user's subject
+
+#### Scenario: On-behalf-of is absent for non-key principals
+- **WHEN** the system mints a contract for a human or platform-service principal
+- **THEN** the `on_behalf_of` claim is omitted
+
+#### Scenario: Api-key claims are nexus-authored, never key-asserted
+- **WHEN** a presented key attempts to assert its own kind, subject, or on-behalf-of
+- **THEN** those values are ignored and the contract carries only nexus-resolved values

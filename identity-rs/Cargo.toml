@@ -47,6 +47,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# customer-api-keys: constant-time hash comparison (subtle) + CSPRNG for minting
+# high-entropy PAT secrets (getrandom). Both already in-tree transitively; pinned here
+# as first-party deps of the secret hasher / credential generator.
+subtle = "2"
+getrandom = "0.2"
 # identity-contract-signing: mint/verify the signed x-identity-contract token
 # (ES256). Pure-Rust via `ring` (no OpenSSL DLL); the `jwk` module also parses the
 # published JWKS in tests. Confined to the sidecar's signer adapter — no jsonwebtoken

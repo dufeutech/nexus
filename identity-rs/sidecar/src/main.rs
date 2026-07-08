@@ -58,8 +58,11 @@ use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 // the core `ProfileStore` port, implemented by the Postgres adapter.
 use identity_core::telemetry;
 use identity_core::store::{BoxError, Change, ProfileStore, WatchToken};
-use identity_core::Profile;
-use store_postgres::PgProfileStore;
+use identity_core::{
+    ApiKeyCandidate, ApiKeyReader, Authority, PlatformScope, PrincipalKind, Profile,
+    ResolvedMembership, ScopeIntersectionResolver, SecretHasher,
+};
+use store_postgres::{HmacSecretHasher, PgApiKeyReader, PgPlatformServiceReader, PgProfileStore};
 
 // identity-contract-signing: the ES256 signer adapter (mints the signed
 // x-identity-contract token) and the dedicated JWKS listener that publishes the
@@ -112,6 +115,13 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
 
 const JWT_NS: &str = "envoy.filters.http.jwt_authn";
 const PAYLOAD_KEY: &str = "verified";
+/// The metadata key the SECOND `jwt_authn` provider (the core-service infra-trust
+/// token) writes its verified payload under, within the same `jwt_authn` namespace
+/// (`payload_in_metadata: verified_service` in `edge/envoy.yaml`). Its presence — and a
+/// `sub` inside it — is what the authenticator chain reads to produce a `Service`
+/// principal (normalized-principal). Kept distinct from the human `verified` key so the
+/// two providers never collide.
+const SVC_PAYLOAD_KEY: &str = "verified_service";
 
 /// Version of the edge→backend identity-header contract this sidecar emits. Since
 /// `identity-contract-signing`, `x-identity-contract` is a *signed token* and this
@@ -187,6 +197,42 @@ struct AppState {
     /// `None` when signing is not configured (`SIGNING_KEY_PATH` unset) — then no token
     /// is minted and any client copy is stripped, so a verifying box fails closed.
     signer: Option<Arc<signer::Signer>>,
+    /// The RESIDENT active platform-service registry (`service_id` → its least-privilege
+    /// [`PlatformScope`]), refreshed LIVE off the `platform.services` change feed
+    /// (normalized-principal ADR-7). `None` when platform-service auth is not configured
+    /// (`PLATFORM_PG_RO_URL` unset) — then no service ever resolves (human path only). A
+    /// present-but-empty map means the registry is loaded with no active services (or is
+    /// cold-starting): every service then resolves to no authority and fails closed.
+    platform: Option<watch::Receiver<Arc<HashMap<String, PlatformScope>>>>,
+    /// API-key authentication (`customer-api-keys`): the live key reader + secret hasher.
+    /// `None` when not configured (`APIKEY_PG_RO_URL`/`APIKEY_HMAC_PEPPER` unset) — then
+    /// no `x-api-key` ever resolves (human/service paths only, fail closed).
+    api_keys: Option<ApiKeyAuth>,
+}
+
+/// The api-key authenticator's dependencies (`customer-api-keys`): the live store reader
+/// and the keyed hasher. Verifying a presented secret is: hash it, then resolve the hash
+/// to a live (`active`, unexpired) key — a single indexed lookup, fail-closed on miss.
+#[derive(Clone)]
+struct ApiKeyAuth {
+    reader: Arc<dyn ApiKeyReader>,
+    hasher: Arc<dyn SecretHasher>,
+}
+
+impl ApiKeyAuth {
+    /// Resolve a presented `x-api-key` secret to its live key candidate, or `None` (fail
+    /// closed) when it hashes to no active, unexpired key — or when the lookup itself
+    /// fails (a store blip is "cannot decide", never an admit).
+    async fn resolve(&self, presented_secret: &str) -> Option<ApiKeyCandidate> {
+        let hash = self.hasher.hash(presented_secret);
+        match self.reader.lookup(&hash).await {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                warn!(error = %e, "api-key lookup failed -> fail closed");
+                None
+            }
+        }
+    }
 }
 
 /// The outcome of resolving a subject's profile — distinguishes "no row" (a
@@ -232,6 +278,18 @@ impl AppState {
             }
         }
     }
+
+    /// Resolve a core service's platform authority from the resident registry (task
+    /// 2.4). `Some(scope)` iff the service is present in the current ACTIVE set;
+    /// `None` for an absent/inactive service OR when platform-service auth is not
+    /// configured — either way the caller fails closed (no authority → no contract →
+    /// the box rejects). Revocation propagates within seconds because the registry map
+    /// is refreshed off the `platform.services` change feed.
+    fn resolve_platform_scope(&self, service_id: &str) -> Option<PlatformScope> {
+        self.platform
+            .as_ref()
+            .and_then(|rx| rx.borrow().get(service_id).cloned())
+    }
 }
 
 /// The fail-closed rule, isolated so it is unit-testable without a store: an
@@ -271,6 +329,45 @@ fn extract_identity(req: &ProcessingRequest) -> (String, bool) {
         Some(Kind::StringValue(s)) if !s.is_empty() => (s.clone(), true),
         _ => ("anonymous".to_owned(), false),
     }
+}
+
+/// The SECOND authenticator in the chain (normalized-principal task 4.1): read the
+/// verified service identity the core-service `jwt_authn` provider wrote under
+/// [`SVC_PAYLOAD_KEY`]. The verified `sub` (`system:serviceaccount:ns:name` for a K8s
+/// SA token) is the opaque service id — nexus-authored, never client-asserted, since it
+/// comes from Envoy's verified-JWT metadata, not a request header. `None` when the
+/// service provider did not verify a token on this request. Consulted only AFTER the
+/// human branch declines, so a human token always wins.
+fn extract_service(req: &ProcessingRequest) -> Option<String> {
+    use envoy_types::pb::google::protobuf::value::Kind;
+    let ns = req
+        .metadata_context
+        .as_ref()
+        .and_then(|md| md.filter_metadata.get(JWT_NS))?;
+    let fields = match ns.fields.get(SVC_PAYLOAD_KEY).and_then(|v| v.kind.as_ref()) {
+        Some(Kind::StructValue(s)) => &s.fields,
+        _ => return None,
+    };
+    match fields.get("sub").and_then(|v| v.kind.as_ref()) {
+        Some(Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The THIRD authenticator in the chain (`customer-api-keys` task 4.1): read the opaque
+/// Personal Access Token secret a client presents in the dedicated `x-api-key` request
+/// header. A PAT is not a ZITADEL JWT, so it never appears in `jwt_authn` metadata — it
+/// arrives as this header, verified in the sidecar (design.md `/opsx:decide`). Consulted
+/// only AFTER the human branch declines (a human token always wins), and its raw value is
+/// STRIPPED before the backend (defense-in-depth) so the secret never reaches a box.
+/// `None` when the request carries no `x-api-key`.
+fn extract_api_key(req: &ProcessingRequest) -> Option<String> {
+    let Some(processing_request::Request::RequestHeaders(HttpHeaders { headers: Some(map), .. })) =
+        &req.request
+    else {
+        return None;
+    };
+    find_header(map, "x-api-key")
 }
 
 // --------------------------------------------------------------------------- //
@@ -433,6 +530,46 @@ fn enforce_route_requirements(
     authorize_route(reqs, roles, entitlements, aal_levels.get(method).copied())
 }
 
+/// The resolved acting authority the enrich path authors (normalized-principal task
+/// 4.x). Computed by the caller from the principal kind + resolution, and consumed
+/// uniformly by [`enrich_response`]: a `Some` authors the acting scope + mints a
+/// contract; `None` (unresolved) STRIPS the acting scope and mints nothing (fail-closed).
+enum Acting {
+    /// Workspace authority (user / api-key): the matched live membership. Authors
+    /// `x-user-type` = staff|customer + `x-user-role`.
+    Workspace(ResolvedMembership),
+    /// Platform authority (core service): the acting workspace (from the trusted
+    /// `x-workspace-id`) + the least-privilege permission set. Authors
+    /// `x-user-type` = `service` and NO workspace role.
+    Platform {
+        workspace_id: String,
+        permissions: Vec<String>,
+    },
+}
+
+/// The resolved principal the enrich path authors from — bundled so `enrich_response`
+/// stays within the argument budget (the same discipline as [`SignContext`]). Produced
+/// by the kind-branched resolution; `acting = None` means no authority resolved
+/// (fail-closed: acting scope stripped, no contract minted).
+struct Enriched<'a> {
+    /// The subject to author as `x-user-id` — a user `sub`, a service id, or an api-key id.
+    sub: &'a str,
+    /// The principal-kind label (`user`/`service`/`apikey`); `None` when anonymous.
+    kind: Option<&'static str>,
+    /// The subject this principal acts **on behalf of** — the creating user for an
+    /// api-key principal (`customer-api-keys`); `None` for user/service. Authored as the
+    /// `on_behalf_of` contract claim + `x-user-on-behalf-of` header alongside the acting
+    /// scope.
+    on_behalf_of: Option<&'a str>,
+    /// The live Profile backing the user authz headers; `None` for a service, a
+    /// profile miss, or an anonymous request.
+    profile: Option<Arc<Profile>>,
+    /// Whether the caller is authenticated (a user OR a service).
+    authenticated: bool,
+    /// The resolved acting authority to author + mint; `None` = fail-closed.
+    acting: Option<Acting>,
+}
+
 /// The inputs for minting the signed identity contract, bundled so `enrich_response`
 /// stays within the argument budget: the configured signer (absent = signing off),
 /// the destination box (`aud`, from `x-route-pool`), and the current epoch seconds.
@@ -442,13 +579,15 @@ struct SignContext<'a> {
     now: u64,
 }
 
-fn enrich_response(
-    sub: &str,
-    profile: Option<Arc<Profile>>,
-    authenticated: bool,
-    acting_workspace: Option<&str>,
-    sign_ctx: &SignContext<'_>,
-) -> ProcessingResponse {
+fn enrich_response(who: &Enriched<'_>, sign_ctx: &SignContext<'_>) -> ProcessingResponse {
+    // Rebind the resolved-principal bundle to the names the authoring body reads. The
+    // `Arc` clone is cheap; the body only ever borrows the profile (never moves it).
+    let sub = who.sub;
+    let principal_kind = who.kind;
+    let on_behalf_of = who.on_behalf_of;
+    let profile = who.profile.clone();
+    let authenticated = who.authenticated;
+    let acting = who.acting.as_ref();
     // Trusted auth-state, emitted on EVERY request (incl. the no-credential path)
     // so a backend never has to infer it from the absence of a header. Standards:
     // RFC 6750 bearer presence drives is-anonymous; richer assurance (NIST
@@ -497,18 +636,36 @@ fn enrich_response(
     // reject-vs-anonymous-vs-signup policy for a non-member is the backend's, per
     // the surface). `x-user-type`/`x-user-role` are the matched relationship's, not
     // a global role; the plural `x-user-roles` above stays the coarse token/profile
-    // roles.
-    let acting = acting_workspace
-        .zip(profile.as_ref())
-        .and_then(|(ws, p)| p.resolve_membership(ws));
-    if let Some(m) = &acting {
-        set.push(header("x-workspace-id", &m.workspace_id));
-        set.push(header("x-user-type", m.member_type.as_str()));
-        set.push(header("x-user-role", &m.role));
-    } else {
-        remove.push("x-workspace-id".to_owned());
-        remove.push("x-user-type".to_owned());
-        remove.push("x-user-role".to_owned());
+    // roles. For a SERVICE (Platform authority, normalized-principal task 4.4) the
+    // acting `x-user-type` is `service` — the principal kind the box branches its write
+    // door on — and there is NO workspace role, so `x-user-role` is stripped.
+    match acting {
+        Some(Acting::Workspace(m)) => {
+            set.push(header("x-workspace-id", &m.workspace_id));
+            set.push(header("x-user-type", m.member_type.as_str()));
+            set.push(header("x-user-role", &m.role));
+        }
+        Some(Acting::Platform { workspace_id, .. }) => {
+            set.push(header("x-workspace-id", workspace_id));
+            set.push(header("x-user-type", PrincipalKind::Service.as_str()));
+            remove.push("x-user-role".to_owned());
+        }
+        None => {
+            remove.push("x-workspace-id".to_owned());
+            remove.push("x-user-type".to_owned());
+            remove.push("x-user-role".to_owned());
+        }
+    }
+    // The on-behalf-of subject (customer-api-keys): authored ONLY alongside a resolved
+    // acting authority (an api-key principal), so audit/attribution rides with the
+    // contract. On every other path — user, service, or an unresolved key — it is absent
+    // and any client copy is STRIPPED (a caller can never self-assert who it acts for).
+    // The raw `x-api-key` credential is ALWAYS stripped before the backend so the secret
+    // never reaches a box (defense-in-depth; the edge should also strip it).
+    remove.push("x-api-key".to_owned());
+    match (on_behalf_of, acting.is_some()) {
+        (Some(obo), true) => set.push(header("x-user-on-behalf-of", obo)),
+        _ => remove.push("x-user-on-behalf-of".to_owned()),
     }
     // The signed identity contract (identity-contract-signing). `x-identity-contract` is
     // ALWAYS a signed token — there is no plain-string form. It is minted ONLY for a
@@ -517,19 +674,42 @@ fn enrich_response(
     // every other path — anonymous, profile-miss, non-member, a signing failure, or no
     // signer configured — nothing is authored and any client copy is STRIPPED, so a
     // verifying box fails closed.
-    let minted = match (sign_ctx.signer, acting.as_ref(), sign_ctx.route_pool) {
-        (Some(active_signer), Some(m), Some(aud)) if authenticated => {
-            let role_list: &[String] = profile.as_ref().map_or(&[], |p| p.roles.as_slice());
-            active_signer
-                .mint(&signer::MintInput {
+    // The mint guard is GENERALIZED (normalized-principal task 4.3) from "has a
+    // membership" to "has a RESOLVED AUTHORITY" — a Workspace membership (user/api-key)
+    // OR a Platform permission set (service). A service mints despite having no
+    // membership, using the acting `x-workspace-id`; the claims omit member_type/role
+    // and carry the platform `permissions` + `principal_kind: service`.
+    let kind = principal_kind.unwrap_or(PrincipalKind::User.as_str());
+    let minted = match (sign_ctx.signer, acting, sign_ctx.route_pool) {
+        (Some(active_signer), Some(a), Some(aud)) if authenticated => {
+            let input = match a {
+                Acting::Workspace(m) => signer::MintInput {
                     sub,
                     aud,
+                    principal_kind: kind,
+                    on_behalf_of,
                     workspace_id: &m.workspace_id,
-                    member_type: m.member_type.as_str(),
-                    role: &m.role,
-                    roles: role_list,
+                    member_type: Some(m.member_type.as_str()),
+                    role: Some(m.role.as_str()),
+                    roles: profile.as_ref().map_or(&[], |p| p.roles.as_slice()),
+                    permissions: &[],
                     now: sign_ctx.now,
-                })
+                },
+                Acting::Platform { workspace_id, permissions } => signer::MintInput {
+                    sub,
+                    aud,
+                    principal_kind: PrincipalKind::Service.as_str(),
+                    on_behalf_of: None,
+                    workspace_id,
+                    member_type: None,
+                    role: None,
+                    roles: &[],
+                    permissions,
+                    now: sign_ctx.now,
+                },
+            };
+            active_signer
+                .mint(&input)
                 .map_err(|e| {
                     warn!(error = %e, "contract signing failed -> no token stamped (fail-closed)");
                 })
@@ -652,7 +832,30 @@ impl Sidecar {
         let started = Instant::now();
         let (resp, result) = if self.state.ready.load(Ordering::Relaxed) {
             'decide: {
-                let (sub, authenticated) = extract_identity(&req);
+                // AUTHENTICATOR CHAIN (normalized-principal task 4.1): the human JWT
+                // branch first; if it does not authenticate a user, consult the
+                // service-token branch (the 2nd `jwt_authn` provider's metadata). A
+                // human token always wins. Each branch produces the SAME normalized
+                // outcome the resolution below is blind to.
+                let (human_sub, human_auth) = extract_identity(&req);
+                // API-KEY branch (customer-api-keys task 4.1): consulted only when no
+                // human authenticated (a human JWT always wins). Resolve the presented
+                // `x-api-key` to a live candidate up front so its owned key-id/creator
+                // outlive the `Enriched` below; a presented-but-unresolved key (revoked/
+                // expired/unknown) yields `None` and falls through to the anonymous
+                // fail-closed path (task 4.3). The service branch is consulted only when
+                // neither a human nor an api key is present.
+                let presented_key = if human_auth { None } else { extract_api_key(&req) };
+                let api_key_candidate = match (presented_key.as_deref(), self.state.api_keys.as_ref())
+                {
+                    (Some(secret), Some(auth)) => auth.resolve(secret).await,
+                    _ => None,
+                };
+                let service_id = if human_auth || presented_key.is_some() {
+                    None
+                } else {
+                    extract_service(&req)
+                };
                 // The workspace this request acts in, from the trusted routing header.
                 // Threaded into enrich so the membership check authorizes the SAME
                 // workspace the router resolved (not a client-chosen one).
@@ -662,19 +865,21 @@ impl Sidecar {
                 let route_pool = extract_route_pool(&req);
                 // The per-route requirements the tenant-router resolved (N4 phase 2).
                 let requirements = extract_requirements(&req);
-                // `sub` is a user identifier (PII): keep it out of per-request info
-                // logs (enable debug for the subject when diagnosing a specific user).
-                debug!(sub = %sub, "enrich subject");
-                let (profile, result) = if authenticated {
-                    match self.state.resolve(&sub).await {
+                // RESOLUTION BRANCHES ON KIND (task 4.2): a user resolves via live
+                // membership (existing path); a service resolves via the live platform
+                // registry. Both fail closed to no `acting` when no authority resolves.
+                // `sub` is a user identifier (PII): keep it out of per-request info logs.
+                let (enriched, result): (Enriched<'_>, &'static str) = if human_auth {
+                    debug!(sub = %human_sub, "enrich subject");
+                    let (profile, result) = match self.state.resolve(&human_sub).await {
                         Resolved::Found(p) => {
-                            info!(anonymous = false, hit = true, "enrich");
+                            info!(kind = "user", hit = true, "enrich");
                             (Some(p), "hit")
                         }
                         // Authenticated but no profile row yet — a legitimate state
                         // (deny-by-default, spec R2); enrich without authz fields.
                         Resolved::Absent => {
-                            info!(anonymous = false, hit = false, "enrich");
+                            info!(kind = "user", hit = false, "enrich");
                             (None, "miss")
                         }
                         // Store unreadable → suspension state is UNKNOWN. Fail closed
@@ -688,14 +893,111 @@ impl Sidecar {
                             warn!("store unavailable for authenticated request -> enrich without profile (fail-open)");
                             (None, "unavailable_open")
                         }
-                    }
+                    };
+                    // Workspace authority: a live membership of the acting workspace.
+                    let acting = ws
+                        .zip(profile.as_ref())
+                        .and_then(|(w, p)| p.resolve_membership(w))
+                        .map(Acting::Workspace);
+                    (
+                        Enriched {
+                            sub: human_sub.as_str(),
+                            kind: Some(PrincipalKind::User.as_str()),
+                            on_behalf_of: None,
+                            profile,
+                            authenticated: true,
+                            acting,
+                        },
+                        result,
+                    )
+                } else if let Some(candidate) = api_key_candidate.as_ref() {
+                    // API-KEY principal (task 4.2): effective authority = the CREATING
+                    // user's LIVE membership of the acting workspace ∩ the key's scopes.
+                    // Resolve the creator's Profile (the same cache path the human uses)
+                    // and run the pure-core intersection; empty ⇒ no acting ⇒ fail closed
+                    // (task 4.3), matching the human unresolved path. `on_behalf_of` is
+                    // the creator; the api-key carries no coarse global roles of its own
+                    // (least-privilege — `profile: None`).
+                    let creator_profile = match self.state.resolve(&candidate.creator_sub).await {
+                        Resolved::Found(p) => Some(p),
+                        // No creator profile / store unreadable ⇒ no live membership to
+                        // intersect ⇒ the key resolves to no authority (rejected).
+                        Resolved::Absent | Resolved::Unavailable => None,
+                    };
+                    let acting = ws
+                        .and_then(|w| {
+                            let creator_membership =
+                                creator_profile.as_ref().and_then(|p| p.resolve_membership(w));
+                            ScopeIntersectionResolver::resolve(candidate, w, creator_membership)
+                        })
+                        .and_then(|p| match p.authority {
+                            Authority::Workspace(m) => Some(Acting::Workspace(m)),
+                            Authority::Platform(_) => None,
+                        });
+                    // Audit (task 7.1): every key-authenticated request records BOTH the
+                    // key id and the creating user, so an action is attributable to the
+                    // human behind the automation. The presented secret is NEVER logged.
+                    info!(
+                        kind = "apikey",
+                        key_id = %candidate.key_id,
+                        on_behalf_of = %candidate.creator_sub,
+                        resolved = acting.is_some(),
+                        "enrich",
+                    );
+                    let result = if acting.is_some() { "apikey_hit" } else { "apikey_unresolved" };
+                    (
+                        Enriched {
+                            sub: candidate.key_id.as_str(),
+                            kind: Some(PrincipalKind::ApiKey.as_str()),
+                            on_behalf_of: Some(candidate.creator_sub.as_str()),
+                            profile: None,
+                            authenticated: true,
+                            acting,
+                        },
+                        result,
+                    )
+                } else if let Some(sid) = service_id.as_deref() {
+                    // SERVICE principal (task 4.2): platform authority from the live
+                    // registry. Absent/inactive/unconfigured → no authority (fail
+                    // closed): no acting scope authored, no contract minted. A service
+                    // always acts on ONE workspace per request, taken from the trusted
+                    // `x-workspace-id` (never service-supplied); with no acting
+                    // workspace there is nothing to act on, so it also fails closed.
+                    let acting = self.state.resolve_platform_scope(sid).and_then(|scope| {
+                        ws.map(|w| Acting::Platform {
+                            workspace_id: w.to_owned(),
+                            permissions: scope.permissions,
+                        })
+                    });
+                    let result = if acting.is_some() { "svc_hit" } else { "svc_unresolved" };
+                    info!(kind = "service", resolved = acting.is_some(), "enrich");
+                    (
+                        Enriched {
+                            sub: sid,
+                            kind: Some(PrincipalKind::Service.as_str()),
+                            on_behalf_of: None,
+                            profile: None,
+                            authenticated: true,
+                            acting,
+                        },
+                        result,
+                    )
                 } else {
-                    // Don't touch the store for unauthenticated requests: the subject
-                    // is "anonymous" (no credential), which is never a stored profile —
-                    // so a lookup is a guaranteed miss that needlessly loads the pool on
-                    // high-volume anonymous traffic (and is not negatively cached).
+                    // Truly anonymous (no human, no service credential). Don't touch the
+                    // store — the subject is never a stored profile, so a lookup is a
+                    // guaranteed miss that needlessly loads the pool on anonymous traffic.
                     info!(anonymous = true, "enrich");
-                    (None, "anonymous")
+                    (
+                        Enriched {
+                            sub: human_sub.as_str(),
+                            kind: None,
+                            on_behalf_of: None,
+                            profile: None,
+                            authenticated: human_auth,
+                            acting: None,
+                        },
+                        "anonymous",
+                    )
                 };
                 // N4 phase-2 gate: every resolved requirement must be satisfied by
                 // the enrichment computed above, else 403 before the backend.
@@ -704,8 +1006,8 @@ impl Sidecar {
                 // upstream is misconfigured, and it denies here (fail-closed).
                 if let Err(reason) = enforce_route_requirements(
                     &requirements,
-                    profile.as_ref(),
-                    authenticated,
+                    enriched.profile.as_ref(),
+                    enriched.authenticated,
                     &self.state.aal_levels,
                 ) {
                     info!(reason, "route requirements unsatisfied -> 403");
@@ -713,10 +1015,7 @@ impl Sidecar {
                 }
                 (
                     enrich_response(
-                        &sub,
-                        profile,
-                        authenticated,
-                        ws,
+                        &enriched,
                         &SignContext {
                             signer: self.state.signer.as_deref(),
                             route_pool: route_pool.as_deref(),
@@ -828,6 +1127,58 @@ async fn run_watch(state: &AppState, resume: &mut Option<WatchToken>) -> Result<
         state.last_apply_ms.store(now_ms(), Ordering::Relaxed);
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// Platform-service registry watcher (normalized-principal ADR-7, task 2.3): keep the
+// RESIDENT active-service map fresh off the `platform.services` change feed, so a
+// register/permission-change/revoke lands within seconds — the same liveness the human
+// membership path gets. The registry is small (a handful of core services), so each
+// signal reloads the WHOLE active set rather than a per-key miss-load.
+// --------------------------------------------------------------------------- //
+async fn watch_platform_services(
+    url: String,
+    poll: Duration,
+    tx: watch::Sender<Arc<HashMap<String, PlatformScope>>>,
+) {
+    loop {
+        // Connect (retrying) — a SELECT-only pool for reloads + its own LISTEN
+        // connection. The feed re-primes the snapshot on every (re)open, so a blip
+        // does not clear the last-known map (a service stays resolvable during a short
+        // outage, mirroring the profile cache); only a cold start with the store
+        // unreachable leaves the map empty → every service fails closed.
+        let reader = match PgPlatformServiceReader::connect(&url).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "platform registry connect failed; retrying");
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        match reader.watch_active(&url, poll).await {
+            Ok(mut feed) => {
+                info!("watching platform-service registry");
+                while let Some(item) = feed.next().await {
+                    match item {
+                        Ok(services) => {
+                            let map: HashMap<String, PlatformScope> = services
+                                .into_iter()
+                                .map(|s| (s.service_id, s.scope))
+                                .collect();
+                            info!(active = map.len(), "platform registry refreshed");
+                            let _ = tx.send(Arc::new(map));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "platform registry feed error; reconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "platform registry watch failed; retrying"),
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -947,6 +1298,35 @@ fn build_signer() -> Result<Option<Arc<signer::Signer>>, Box<dyn Error>> {
     Ok(Some(Arc::new(built)))
 }
 
+/// Construct the api-key authenticator from the environment (`customer-api-keys`).
+///
+/// `None` (api-key auth OFF) when `APIKEY_PG_RO_URL` is unset — a deliberate
+/// human/service-only deployment. When the URL is set but the setup is incomplete or
+/// broken (`APIKEY_HMAC_PEPPER` unset ⇒ cannot verify secrets; or the store connect
+/// fails), api-key auth is DISABLED with a warning rather than run half-configured — fail
+/// closed: an `x-api-key` then simply never resolves, and the human/service paths are
+/// unaffected.
+async fn build_api_key_auth() -> Option<ApiKeyAuth> {
+    let url = env::var("APIKEY_PG_RO_URL").ok().filter(|u| !u.is_empty())?;
+    let Some(pepper) = env::var("APIKEY_HMAC_PEPPER").ok().filter(|p| !p.is_empty()) else {
+        warn!("APIKEY_PG_RO_URL set but APIKEY_HMAC_PEPPER unset -> api-key auth OFF (cannot verify secrets)");
+        return None;
+    };
+    match PgApiKeyReader::connect(&url).await {
+        Ok(reader) => {
+            info!("customer-api-key authentication ENABLED (live per-request resolve)");
+            Some(ApiKeyAuth {
+                reader: Arc::new(reader),
+                hasher: Arc::new(HmacSecretHasher::new(pepper.into_bytes())),
+            })
+        }
+        Err(e) => {
+            error!(error = %e, "APIKEY_PG_RO_URL set but api-key store connect failed -> api-key auth OFF");
+            None
+        }
+    }
+}
+
 /// Load the operator-supplied JWKS document to publish verbatim
 /// (identity-contract-signing). `None` (endpoint not started) when `JWKS_FILE` is
 /// unset or unreadable.
@@ -1025,6 +1405,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    // Platform-service registry (normalized-principal): when `PLATFORM_PG_RO_URL` is
+    // set, spawn the resident-snapshot watcher and hand its live receiver to the state.
+    // Unset ⇒ platform-service authentication is OFF (only the human path resolves).
+    // The watcher connects+retries on its own (non-blocking), so a slow/absent platform
+    // DB never blocks the human path at startup; the map starts EMPTY (fail closed)
+    // until the first load lands. `platform.services` lives alongside the identity store
+    // in the lab, so the URL defaults to the identity DB.
+    let platform = env::var("PLATFORM_PG_RO_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .map(|url| {
+            let poll = Duration::from_secs(
+                env::var("PLATFORM_POLL_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30),
+            );
+            let (tx, rx) = watch::channel(Arc::new(HashMap::new()));
+            tokio::spawn(watch_platform_services(url, poll, tx));
+            info!("platform-service authentication ENABLED (resident registry)");
+            rx
+        });
+    if platform.is_none() {
+        info!("PLATFORM_PG_RO_URL unset -> platform-service authentication OFF (human path only)");
+    }
+
+    // customer-api-keys: api-key authentication is ON only when BOTH the read-only key
+    // store URL and the HMAC pepper are configured. The store defaults to identitydb (the
+    // api_keys table lives alongside identity.profiles), which the profile store already
+    // gated on being up — so a single connect attempt here normally succeeds. A missing
+    // pepper (can't verify secrets) or a failed connect disables the path (fail closed to
+    // the human/service paths), never runs it half-configured.
+    let api_keys = build_api_key_auth().await;
+    if api_keys.is_none() {
+        info!("customer-api-key authentication OFF (APIKEY_PG_RO_URL/APIKEY_HMAC_PEPPER unset)");
+    }
+
     let state = AppState {
         // max_capacity is the WORKING-SET bound (RFC §6.3 revised), not the
         // population; cold subjects load on demand and evict normally.
@@ -1042,6 +1459,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Fail-fast if a signing key is configured but unloadable (misconfiguration);
         // `None` when signing is deliberately off (anonymous still served).
         signer: build_signer()?,
+        platform,
+        api_keys,
     };
 
     // Periodically publish the gauge-style snapshots (the exporter's own listener
@@ -1155,6 +1574,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     #![allow(clippy::panic, reason = "test helpers legitimately panic on the impossible branch")]
     use super::*;
+    use identity_core::store::ChangeFeed;
     use identity_core::{MemberType, Membership};
     use std::collections::HashMap;
 
@@ -1176,22 +1596,95 @@ mod tests {
         .expect("valid test key")
     }
 
-    /// Test wrapper preserving the pre-signing 4-arg call shape: no signer, no route
-    /// pool → no token minted (`x-identity-contract` stripped). Shadows the 7-arg
-    /// `super::enrich_response` for the many tests that do not exercise signing.
+    /// Test wrapper preserving the pre-normalized-principal user call shape: given a
+    /// profile + acting workspace, it resolves the WORKSPACE authority exactly as the
+    /// enrich path does, with no signer/route-pool (no token minted →
+    /// `x-identity-contract` stripped). Shadows the wider `super::enrich_response` for
+    /// the many user-path tests that do not exercise signing or the service kind.
     fn enrich_response(
         sub: &str,
         profile: Option<Arc<Profile>>,
         authenticated: bool,
         acting_workspace: Option<&str>,
     ) -> ProcessingResponse {
+        let acting = acting_workspace
+            .zip(profile.as_ref())
+            .and_then(|(w, p)| p.resolve_membership(w))
+            .map(Acting::Workspace);
         super::enrich_response(
-            sub,
-            profile,
-            authenticated,
-            acting_workspace,
+            &Enriched {
+                sub,
+                kind: authenticated.then_some(PrincipalKind::User.as_str()),
+                on_behalf_of: None,
+                profile,
+                authenticated,
+                acting,
+            },
             &SignContext { signer: None, route_pool: None, now: 0 },
         )
+    }
+
+    /// The signing counterpart of the user-path wrapper: resolves the workspace
+    /// authority from `profile` + `acting_workspace` and mints through `sign_ctx`.
+    fn enrich_signed(
+        sub: &str,
+        profile: Option<Arc<Profile>>,
+        authenticated: bool,
+        acting_workspace: Option<&str>,
+        sign_ctx: &SignContext<'_>,
+    ) -> ProcessingResponse {
+        let acting = acting_workspace
+            .zip(profile.as_ref())
+            .and_then(|(w, p)| p.resolve_membership(w))
+            .map(Acting::Workspace);
+        super::enrich_response(
+            &Enriched {
+                sub,
+                kind: authenticated.then_some(PrincipalKind::User.as_str()),
+                on_behalf_of: None,
+                profile,
+                authenticated,
+                acting,
+            },
+            sign_ctx,
+        )
+    }
+
+    /// Build an `Enriched` for a resolved SERVICE principal (Platform authority),
+    /// keeping the service-path tests terse.
+    fn service_enriched(sub: &str, acting: Option<Acting>) -> Enriched<'_> {
+        Enriched {
+            sub,
+            kind: Some(PrincipalKind::Service.as_str()),
+            on_behalf_of: None,
+            profile: None,
+            authenticated: true,
+            acting,
+        }
+    }
+
+    /// Build a service `Acting::Platform` for the service-path tests.
+    fn service_acting(workspace: &str, permissions: &[&str]) -> Acting {
+        Acting::Platform {
+            workspace_id: workspace.to_owned(),
+            permissions: permissions.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// Build an `Enriched` for a resolved API-KEY principal (customer-api-keys): the key
+    /// id is the subject, the creating user is `on_behalf_of`, and the acting authority is
+    /// the intersected membership. `acting: None` models an unresolved key (revoked/
+    /// expired/out-of-scope) — the fail-closed path.
+    fn api_key_enriched<'a>(key_id: &'a str, creator: &'a str, acting: Option<Acting>) -> Enriched<'a> {
+        Enriched {
+            sub: key_id,
+            kind: Some(PrincipalKind::ApiKey.as_str()),
+            on_behalf_of: Some(creator),
+            // Least-privilege: an api key carries none of the creator's coarse global roles.
+            profile: None,
+            authenticated: true,
+            acting,
+        }
     }
 
     /// Build a `SignContext` wired to the embedded test signer, aud `evenout`.
@@ -1397,6 +1890,302 @@ mod tests {
         }
     }
 
+    // ---- normalized-principal: the service (Platform authority) path -------- //
+
+    /// A profile store stub for the few tests that must build a real `AppState`
+    /// (the enrich unit tests call `enrich_response` directly and need none).
+    struct EmptyStore;
+    #[tonic::async_trait]
+    impl ProfileStore for EmptyStore {
+        async fn get(&self, _sub: &str) -> Result<Option<Profile>, BoxError> { Ok(None) }
+        async fn put(&self, _p: &Profile) -> Result<(), BoxError> { Ok(()) }
+        async fn delete(&self, _sub: &str) -> Result<(), BoxError> { Ok(()) }
+        async fn scan_all(&self) -> Result<Vec<Profile>, BoxError> { Ok(vec![]) }
+        async fn watch(
+            &self,
+            _after: Option<WatchToken>,
+        ) -> Result<ChangeFeed, BoxError> {
+            use futures::stream::pending;
+            Ok(Box::pin(pending()))
+        }
+    }
+
+    /// Build an `AppState` wired to an empty store, optionally carrying a resident
+    /// platform registry — for the registry-lookup tests.
+    fn state_with_platform(
+        platform: Option<watch::Receiver<Arc<HashMap<String, PlatformScope>>>>,
+    ) -> AppState {
+        AppState {
+            cache: Cache::new(16),
+            store: Arc::new(EmptyStore),
+            ready: Arc::new(AtomicBool::new(true)),
+            last_apply_ms: Arc::new(AtomicU64::new(0)),
+            warm_ms: Arc::new(AtomicU64::new(0)),
+            start: Instant::now(),
+            fail_open: false,
+            aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            signer: None,
+            platform,
+            api_keys: None,
+        }
+    }
+
+    #[test]
+    fn resolve_platform_scope_reads_the_resident_registry() {
+        // Task 2.4: a service present in the ACTIVE set resolves to its scope; an
+        // absent one resolves to None (fail closed); with NO registry configured,
+        // nothing resolves (the human-only deployment).
+        let mut map = HashMap::new();
+        map.insert(
+            "svc-1".to_owned(),
+            PlatformScope::new(vec!["events:write".to_owned()]),
+        );
+        let (_tx, rx) = watch::channel(Arc::new(map));
+        let state = state_with_platform(Some(rx));
+        assert!(state.resolve_platform_scope("svc-1").expect("active").allows("events:write"));
+        assert!(state.resolve_platform_scope("svc-absent").is_none(), "unregistered = no authority");
+        assert!(
+            state_with_platform(None).resolve_platform_scope("svc-1").is_none(),
+            "no registry configured -> no service resolves",
+        );
+    }
+
+    #[test]
+    fn service_authors_service_type_and_no_workspace_role() {
+        // Task 4.4: a resolved service authors x-user-type=service + the acting
+        // workspace, and has NO workspace role (x-user-role stripped). With no profile
+        // it asserts no suspension/entitlements either (stripped).
+        let acting = service_acting("ws-acting", &["events:write"]);
+        let resp = super::enrich_response(
+            &service_enriched("system:serviceaccount:nexus:events-writer", Some(acting)),
+            &SignContext { signer: None, route_pool: None, now: 0 },
+        );
+        let h = set_headers(&resp);
+        assert_eq!(
+            h.get("x-user-id").map(String::as_str),
+            Some("system:serviceaccount:nexus:events-writer"),
+        );
+        assert_eq!(h.get("x-workspace-id").map(String::as_str), Some("ws-acting"));
+        assert_eq!(h.get("x-user-type").map(String::as_str), Some("service"));
+        assert_eq!(h.get("x-auth-anonymous").map(String::as_str), Some("false"));
+        assert!(!h.contains_key("x-user-role"), "a service has no workspace role");
+        let r = remove_headers(&resp);
+        for hh in ["x-user-role", "x-user-suspended", "x-user-entitlements"] {
+            assert!(r.contains(&hh.to_owned()), "service path must strip {hh}");
+        }
+    }
+
+    #[test]
+    fn resolved_service_mints_a_contract_unresolved_fails_closed() {
+        // Task 4.3: the mint guard is generalized to "has a resolved authority" — a
+        // Platform authority mints despite no membership. An unresolved service
+        // (absent from the registry, or no acting workspace) mints nothing and strips
+        // the acting scope, exactly like a non-member user (fail closed).
+        let signer = test_signer();
+        let ctx = || SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: 1_000_000 };
+
+        let acting = service_acting("ws-acting", &["events:write"]);
+        let resolved = super::enrich_response(&service_enriched("svc-1", Some(acting)), &ctx());
+        let token = set_headers(&resolved)
+            .get("x-identity-contract")
+            .cloned()
+            .expect("a resolved service must carry a signed contract");
+        assert_eq!(token.split('.').count(), 3, "must be a compact JWS");
+        assert!(!remove_headers(&resolved).contains(&"x-identity-contract".to_owned()));
+
+        // Unresolved: no acting authority -> no contract, acting scope stripped.
+        let unresolved = super::enrich_response(&service_enriched("svc-unknown", None), &ctx());
+        assert!(!set_headers(&unresolved).contains_key("x-identity-contract"));
+        let r = remove_headers(&unresolved);
+        for hh in ["x-identity-contract", "x-workspace-id", "x-user-type", "x-user-role"] {
+            assert!(r.contains(&hh.to_owned()), "unresolved service must strip {hh}");
+        }
+    }
+
+    // ---- customer-api-keys: the api-key (on-behalf-of Workspace authority) path ---- //
+
+    #[test]
+    fn resolved_api_key_authors_on_behalf_of_and_mints_an_apikey_contract() {
+        // Tasks 4.2 / 5.1: a resolved api-key authors x-user-id=key-id, the intersected
+        // membership's type+role, and x-user-on-behalf-of=creator, and mints a signed
+        // contract (principal_kind=apikey carried inside; asserted in signer.rs). The key
+        // acts on the workspace its scope ∩ the creator's membership admitted.
+        let signer = test_signer();
+        let acting = Acting::Workspace(ResolvedMembership {
+            workspace_id: "ws-1".to_owned(),
+            member_type: MemberType::Staff,
+            role: "admin".to_owned(),
+        });
+        let resp = super::enrich_response(
+            &api_key_enriched("pak_key7", "u-creator", Some(acting)),
+            &signed_ctx(&signer),
+        );
+        let h = set_headers(&resp);
+        assert_eq!(h.get("x-user-id").map(String::as_str), Some("pak_key7"));
+        assert_eq!(h.get("x-user-on-behalf-of").map(String::as_str), Some("u-creator"));
+        assert_eq!(h.get("x-workspace-id").map(String::as_str), Some("ws-1"));
+        assert_eq!(h.get("x-user-type").map(String::as_str), Some("staff"));
+        assert_eq!(h.get("x-user-role").map(String::as_str), Some("admin"));
+        let token = h.get("x-identity-contract").expect("a resolved api key must carry a contract");
+        assert_eq!(token.split('.').count(), 3, "must be a compact JWS");
+        // The authored on-behalf-of + acting scope must never also be stripped.
+        let r = remove_headers(&resp);
+        for hh in ["x-user-on-behalf-of", "x-workspace-id", "x-identity-contract"] {
+            assert!(!r.contains(&hh.to_owned()), "authored {hh} must not be stripped");
+        }
+        // The raw credential is ALWAYS stripped before the backend.
+        assert!(r.contains(&"x-api-key".to_owned()), "the raw x-api-key must be stripped");
+    }
+
+    #[test]
+    fn unresolved_api_key_strips_acting_scope_and_mints_nothing() {
+        // Task 4.3: a presented key that resolved to a candidate but whose scope ∩ the
+        // creator's membership is EMPTY (out-of-scope workspace, or the creator lost the
+        // membership) authors NO acting scope, mints NO contract, and strips
+        // on-behalf-of + the acting family + the raw credential (fail closed).
+        let signer = test_signer();
+        let resp = super::enrich_response(
+            &api_key_enriched("pak_key7", "u-creator", None),
+            &signed_ctx(&signer),
+        );
+        assert!(!set_headers(&resp).contains_key("x-identity-contract"), "no authority -> no contract");
+        assert!(!set_headers(&resp).contains_key("x-user-on-behalf-of"), "no acting -> no on-behalf-of");
+        let r = remove_headers(&resp);
+        for hh in [
+            "x-identity-contract",
+            "x-user-on-behalf-of",
+            "x-workspace-id",
+            "x-user-type",
+            "x-user-role",
+            "x-api-key",
+        ] {
+            assert!(r.contains(&hh.to_owned()), "unresolved api key must strip {hh}");
+        }
+    }
+
+    #[test]
+    fn api_key_credential_is_stripped_on_every_path() {
+        // Defense-in-depth: x-api-key is a client credential and must never reach the
+        // backend, on ANY path — including the plain human/anonymous paths.
+        assert!(remove_headers(&enrich_response("u1", None, true, None)).contains(&"x-api-key".to_owned()));
+        assert!(remove_headers(&enrich_response("anonymous", None, false, None)).contains(&"x-api-key".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_resolves_live_and_fails_closed() {
+        // Task 4.3 at the resolve layer: ApiKeyAuth hashes the presented secret and
+        // resolves it through the reader. A live key -> Some(candidate); a revoked/
+        // expired/unknown key (reader yields None) -> None; a reader error -> None (fail
+        // closed, never an admit).
+        use identity_core::{ApiKeyCandidate, ApiKeyScope};
+
+        struct FakeReader {
+            // The one hash the "live" key is stored under.
+            live_hash: Option<String>,
+            err: bool,
+        }
+        #[tonic::async_trait]
+        impl ApiKeyReader for FakeReader {
+            async fn lookup(&self, key_hash: &str) -> Result<Option<ApiKeyCandidate>, BoxError> {
+                if self.err {
+                    return Err("store blip".into());
+                }
+                Ok(self.live_hash.as_deref().filter(|h| *h == key_hash).map(|_| ApiKeyCandidate {
+                    key_id: "pak_1".to_owned(),
+                    creator_sub: "u-creator".to_owned(),
+                    scope: ApiKeyScope::new(vec!["ws-1".to_owned()]),
+                }))
+            }
+        }
+
+        let hasher: Arc<dyn SecretHasher> = Arc::new(HmacSecretHasher::new(b"pepper".to_vec()));
+        let live_hash = hasher.hash("nexus_pat_good");
+
+        let live = ApiKeyAuth {
+            reader: Arc::new(FakeReader { live_hash: Some(live_hash), err: false }),
+            hasher: hasher.clone(),
+        };
+        assert_eq!(
+            live.resolve("nexus_pat_good").await.map(|c| c.key_id),
+            Some("pak_1".to_owned()),
+            "a live key must resolve to its candidate",
+        );
+        assert!(live.resolve("nexus_pat_wrong").await.is_none(), "a non-matching secret must fail closed");
+
+        // A revoked/expired/unknown key: the reader surfaces no live row.
+        let revoked = ApiKeyAuth {
+            reader: Arc::new(FakeReader { live_hash: None, err: false }),
+            hasher: hasher.clone(),
+        };
+        assert!(revoked.resolve("nexus_pat_good").await.is_none(), "no live row -> fail closed");
+
+        // A store error is "cannot decide", never an admit.
+        let broken = ApiKeyAuth {
+            reader: Arc::new(FakeReader { live_hash: None, err: true }),
+            hasher,
+        };
+        assert!(broken.resolve("nexus_pat_good").await.is_none(), "reader error -> fail closed");
+    }
+
+    #[test]
+    fn service_metadata_is_read_from_the_second_provider_key() {
+        // Task 4.1: extract_service reads the verified sub the 2nd jwt_authn provider
+        // wrote under SVC_PAYLOAD_KEY — not the human `verified` key.
+        use envoy_types::pb::envoy::config::core::v3::Metadata;
+        use envoy_types::pb::google::protobuf::{value::Kind, Struct, Value};
+        let mut svc_fields = HashMap::new();
+        svc_fields.insert(
+            "sub".to_owned(),
+            Value { kind: Some(Kind::StringValue("system:serviceaccount:nexus:events-writer".to_owned())) },
+        );
+        let mut ns_fields = HashMap::new();
+        ns_fields.insert(
+            SVC_PAYLOAD_KEY.to_owned(),
+            Value { kind: Some(Kind::StructValue(Struct { fields: svc_fields })) },
+        );
+        let req = ProcessingRequest {
+            metadata_context: Some(Metadata {
+                filter_metadata: {
+                    let mut m = HashMap::new();
+                    m.insert(JWT_NS.to_owned(), Struct { fields: ns_fields });
+                    m
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_service(&req).as_deref(),
+            Some("system:serviceaccount:nexus:events-writer"),
+        );
+        // A request with only the human `verified` key yields no service.
+        let human = req_with_headers(&[]);
+        assert!(extract_service(&human).is_none());
+    }
+
+    #[test]
+    fn caller_cannot_self_assert_service_kind() {
+        // Task 5.3 / spec R "kind is system-authored, never caller-asserted": a client
+        // sending forged `x-user-type: service` + acting-scope headers confers NOTHING.
+        // The service kind comes ONLY from the verified 2nd-provider metadata
+        // (extract_service reads metadata, never a header), and the enrich path strips
+        // any client-authored acting scope on the unresolved (here anonymous) path.
+        let forged = req_with_headers(&[
+            ("x-user-type", "service"),
+            ("x-workspace-id", "ws-forged"),
+            ("x-identity-contract", "client.forged.jws"),
+        ]);
+        // No verified service metadata -> not a service principal.
+        assert!(extract_service(&forged).is_none());
+        // Anonymous enrich (no authority) strips the forged acting scope + contract.
+        let resp = enrich_response("anonymous", None, false, None);
+        assert!(!set_headers(&resp).contains_key("x-user-type"));
+        let r = remove_headers(&resp);
+        for hh in ["x-workspace-id", "x-user-type", "x-user-role", "x-identity-contract"] {
+            assert!(r.contains(&hh.to_owned()), "a self-asserted {hh} must be stripped");
+        }
+    }
+
     #[test]
     fn signed_contract_is_minted_only_for_a_resolved_member() {
         // identity-contract-signing: the signed x-identity-contract is minted ONLY
@@ -1404,7 +2193,7 @@ mod tests {
         // authoritative scope to sign). Member path -> a compact JWS is stamped and
         // NOT stripped.
         let signer = test_signer();
-        let member = super::enrich_response(
+        let member = enrich_signed(
             "u1",
             Some(member_profile("ws_1", MemberType::Staff, "admin")),
             true,
@@ -1428,15 +2217,15 @@ mod tests {
         // Non-member, anonymous, and profile-miss have no resolved identity to sign:
         // NO token is stamped and the header is STRIPPED so a client copy cannot
         // survive — a verifying box then fails closed on an enriched route.
-        let non_member = super::enrich_response(
+        let non_member = enrich_signed(
             "u1",
             Some(member_profile("ws_1", MemberType::Staff, "admin")),
             true,
             Some("ws_other"),
             &signed_ctx(&signer),
         );
-        let anon = super::enrich_response("anonymous", None, false, None, &signed_ctx(&signer));
-        let miss = super::enrich_response("u1", None, true, None, &signed_ctx(&signer));
+        let anon = enrich_signed("anonymous", None, false, None, &signed_ctx(&signer));
+        let miss = enrich_signed("u1", None, true, None, &signed_ctx(&signer));
         for (label, resp) in [("non_member", &non_member), ("anonymous", &anon), ("miss", &miss)] {
             assert!(
                 !set_headers(resp).contains_key("x-identity-contract"),
@@ -1511,10 +2300,13 @@ mod tests {
             .mint(&signer::MintInput {
                 sub: "user-e2e",
                 aud: "evenout",
+                principal_kind: "user",
+                on_behalf_of: None,
                 workspace_id: "ws-e2e",
-                member_type: "staff",
-                role: "admin",
+                member_type: Some("staff"),
+                role: Some("admin"),
                 roles: &["ops".to_owned()],
+                permissions: &[],
                 now: now_secs(),
             })
             .expect("mint");
@@ -1812,7 +2604,6 @@ mod tests {
     async fn ext_proc_stream_survives_past_the_http_request_timeout() {
         use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient;
         use futures::stream::pending as pending_stream;
-        use identity_core::store::ChangeFeed;
         use tokio_stream::wrappers::TcpListenerStream;
 
         /// Store stub: the anonymous enrich path never reads it; watch never yields.
@@ -1846,6 +2637,8 @@ mod tests {
             fail_open: false,
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
             signer: None,
+            platform: None,
+            api_keys: None,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
