@@ -768,6 +768,7 @@ async fn upsert_auth_route(
             "requires_role": auth.requires_role,
             "requires_entitlement": auth.requires_entitlement,
             "min_aal": auth.min_aal,
+            "account_scoped": auth.account_scoped,
         })),
     )
         .into_response()
@@ -800,6 +801,7 @@ async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -
                         "requires_role": r.auth.requires_role,
                         "requires_entitlement": r.auth.requires_entitlement,
                         "min_aal": r.auth.min_aal,
+                        "account_scoped": r.auth.account_scoped,
                     })
                 })
                 .collect();
