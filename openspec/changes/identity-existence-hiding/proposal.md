@@ -53,3 +53,8 @@ risk profile than signing.
 > Status: **proposal only.** Run `/opsx:explore identity-existence-hiding` (or
 > `/opsx:propose` to regenerate full artifacts) to take it forward — the design turns on the
 > open questions above.
+
+> **Coordination:** this change edits the sidecar enrich path shared with `normalized-principal`,
+> `workspace-plan-tier`, and `customer-api-keys`. It **owns the unresolved/forbidden branch
+> (404-vs-403)** and adds **no contract claim**. Sync order and edit-region ownership are recorded
+> canonically in `normalized-principal/design.md` **ADR-10**.

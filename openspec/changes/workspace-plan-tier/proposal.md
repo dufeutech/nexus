@@ -52,3 +52,8 @@ and a producer, then populates both the header and the reserved claim.
 
 > Status: **proposal only.** Run `/opsx:explore workspace-plan-tier` first — the data-model
 > question (source of truth) genuinely blocks a good design and should not be guessed.
+
+> **Coordination:** this change shares `identity-contract-signing` and the sidecar enrich path with
+> `normalized-principal`, `identity-existence-hiding`, and `customer-api-keys`. It **owns only the
+> `plan` claim**. Sync order and claim ownership are recorded canonically in
+> `normalized-principal/design.md` **ADR-10**.
