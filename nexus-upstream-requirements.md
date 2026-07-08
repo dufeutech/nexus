@@ -17,7 +17,7 @@ concern them; any change here must be reflected there ("pin any rename in both r
 | ------ | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | **N1** | ✅ SHIPPED                   | `routing-rs/tenant-router/src/main.rs` — `GET /authorize` on `:9300` (`api::authorize`)                    |
 | **N2** | ✅ SHIPPED                   | `routing-rs/control-plane/src/main.rs` — `/domains/declare`, `/domains/{d}/verify`, leader-elected TXT poll |
-| **N3** | finding only                 | no work — kept below in case wildcard tiers are ever wanted                                                |
+| **N3** | ✅ SHIPPED (ratified + guarded) | composite `(domain, is_wildcard)` coexistence + single-label matcher; specified as `domain-host-resolution` and pinned by guard tests (change `ratify-domain-host-matching`, 2026-07-08) |
 | **N4** | ✅ SHIPPED (both phases)     | phase 1 auth gate + phase 2 role/entitlement/AAL gate (change `edge-role-entitlement-gate`, 2026-07-02)    |
 | **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **consumer obligation is box-side** |
 | **N6** | ✅ SHIPPED                   | edge-rooted W3C tracing (change `edge-rooted-tracing`, 2026-07-03): Envoy OTel tracer → collector → Tempo; client trace context stripped at C3 |
@@ -146,14 +146,33 @@ order). Span attributes observe the access-log PII hygiene (no credentials, no
 
 ---
 
-## N3 — finding: wildcard apex coexistence (no work planned)
+## N3 — wildcard apex coexistence — ✅ model shipped; ratified + guarded
 
-Verified live 2026-06-21, kept in case wildcard tiers are ever wanted: one row per
-`domain` string; `is_wildcard=true` routes subdomains but NOT the apex, `false` routes
-only the apex, and a literal `*.x.com` row never matches (the router strips the left
-label). So apex + wildcard-subdomains cannot coexist for one domain. If wildcard tiers are
-wanted: key by `(domain, is_wildcard)` or let a wildcard cover its own apex — and publish
-ONE canonical matching spec that the router and any other gate implement identically.
+**Superseded finding (pre-2026-07-08).** The original finding described a single-row-per-`domain`
+schema where apex and wildcard-subdomains could not coexist. That is no longer the model. The
+`routing.domains` table is keyed by the composite `PRIMARY KEY (domain, is_wildcard)`
+(`store-postgres/src/lib.rs`), so an apex/exact row and a wildcard row for the same domain string
+**coexist and route independently** — exactly the "key by `(domain, is_wildcard)`" option the finding
+proposed.
+
+**Matching model (industry-standard, single matcher).** `AppState::resolve`
+(`tenant-router/src/main.rs`) resolves a host by exact match first, then — on a miss — a **single-label**
+wildcard match against the immediate parent (`parent_domain`, `router-core/src/normalize.rs`); no
+match fails closed (never a default tenant). So: **exact host > single-label wildcard > none**,
+most-specific-wins, and the wildcard never covers the apex — aligned with TLS-certificate wildcard
+semantics (RFC 6125) and Envoy vhost matching, not DNS multi-label synthesis. The `/authorize` cert
+gate (N1) calls the **same** `resolve()`, so the set it authorizes equals the set the router routes;
+`router-core::auth` matches paths only, so there is exactly one host matcher.
+
+**Now specified + tested (change `ratify-domain-host-matching`, 2026-07-08).** The behavior above is
+the canonical `domain-host-resolution` spec (`openspec/specs/domain-host-resolution/`) and is pinned
+by guard tests (apex ≠ wildcard, exact-beats-wildcard, single-label depth, apex+wildcard coexistence,
+and `/authorize`==router parity) — closing the former "shipped but undocumented/untested" gap.
+
+**Deliberately not built (forward-provisioned only).** Self-service wildcard declaration remains
+admin-seeded; there is no plan-tier depth gating, no PSL/eTLD+1 handling, and no multi-label wildcard
+coverage. The composite key leaves room for a future gated-wildcard tier (Shopify/Cloudflare-style)
+without a schema change if one is ever wanted.
 
 ---
 
