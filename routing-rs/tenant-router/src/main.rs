@@ -1269,9 +1269,10 @@ mod tests {
     #[tokio::test]
     async fn authorize_and_router_resolve_the_identical_host_set() {
         // Seed: an exact `shop.example.com` row and a wildcard `example.com` row.
-        let mut domains = HashMap::new();
-        domains.insert(("shop.example.com".to_owned(), false), "ws_exact".to_owned());
-        domains.insert(("example.com".to_owned(), true), "ws_wild".to_owned());
+        let domains = HashMap::from([
+            (("shop.example.com".to_owned(), false), "ws_exact".to_owned()),
+            (("example.com".to_owned(), true), "ws_wild".to_owned()),
+        ]);
         let state = state_over(FakeStore { domains });
 
         // (host, should_resolve): the router routes exactly these, so the cert gate
