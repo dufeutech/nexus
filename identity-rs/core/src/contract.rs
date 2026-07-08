@@ -76,9 +76,14 @@ pub struct ContractClaims {
     /// for a user/api-key principal.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub permissions: Vec<String>,
-    /// RESERVED — the workspace plan tier. Populated by a later change (no plan-tier
-    /// model exists yet); omitted from the token while `None` so adding it later is a
-    /// value change, not a contract bump.
+    /// The acting workspace's plan tier (`workspace-plan-tier`) — a nexus-authored,
+    /// routing-plane fact (`routing.workspaces.plan`), the same value emitted as
+    /// `x-workspace-plan`. An opaque wire string (the vocabulary is nexus-owned and
+    /// validated at the control-plane write boundary; the read path does not re-validate).
+    /// OMITTED while `None` — an unresolved/unknown acting workspace carries no plan rather
+    /// than a default, so a box treats absence as not-provisioned (fail-soft). Its later
+    /// population was a value change, not a contract bump. nexus-authored, never
+    /// credential-asserted.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub plan: Option<String>,
 }

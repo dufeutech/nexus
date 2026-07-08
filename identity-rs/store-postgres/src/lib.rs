@@ -49,10 +49,14 @@ mod authz;
 mod hasher;
 mod platform_services;
 mod source_memberships;
+mod workspace_plans;
 pub use api_keys::{IssuedKey, PgApiKeyReader, PgApiKeyStore, API_KEY_CHANGE_CHANNEL};
 pub use hasher::HmacSecretHasher;
 pub use platform_services::{PgPlatformServiceReader, PlatformFeed, PLATFORM_CHANGE_CHANNEL};
 pub use source_memberships::PgSourceMembershipReader;
+pub use workspace_plans::{
+    PgWorkspacePlanReader, WorkspacePlanFeed, WORKSPACE_INVALIDATION_CHANNEL,
+};
 
 /// The NOTIFY channel every profile mutation publishes a wakeup on.
 pub const CHANGE_CHANNEL: &str = "identity_changes";

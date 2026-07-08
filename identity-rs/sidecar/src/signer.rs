@@ -42,6 +42,12 @@ pub(crate) struct MintInput<'a> {
     /// The service's platform permission set (least-privilege). Empty for a
     /// user/api-key.
     pub permissions: &'a [String],
+    /// The acting workspace's plan tier (`workspace-plan-tier`) — the same nexus-resolved
+    /// value authored as `x-workspace-plan`. `None` when no plan resolves for the acting
+    /// workspace (unknown workspace / plan source unavailable); then the `plan` claim is
+    /// omitted rather than defaulted (fail-soft), so its presence is a value appearing
+    /// where one was absent, not a contract-shape change.
+    pub plan: Option<&'a str>,
     /// Current time, seconds since the Unix epoch (injected for testability).
     pub now: u64,
 }
@@ -124,7 +130,9 @@ impl Signer {
             role: input.role.map(str::to_owned),
             roles: input.roles.to_vec(),
             permissions: input.permissions.to_vec(),
-            plan: None,
+            // workspace-plan-tier: the nexus-resolved plan for the acting workspace;
+            // omitted (None) when unresolved so an absent plan reads as not-provisioned.
+            plan: input.plan.map(str::to_owned),
         };
         self.sign(&claims)
     }
@@ -187,6 +195,7 @@ mod tests {
                 role: Some("admin"),
                 roles: &["ops".to_owned()],
                 permissions: &[],
+                plan: None,
                 now,
             })
             .unwrap()
@@ -226,7 +235,46 @@ mod tests {
         assert_eq!(claims.ctr, "v1");
         assert_eq!(claims.roles, vec!["ops".to_owned()]);
         assert!(claims.permissions.is_empty(), "a user carries no platform permissions");
-        assert!(claims.plan.is_none(), "plan is reserved, not populated");
+        // workspace-plan-tier: mint_at resolves no plan (unresolved acting workspace), so
+        // the claim is OMITTED (fail-soft), not defaulted.
+        assert!(claims.plan.is_none(), "an unresolved plan is omitted, not defaulted");
+    }
+
+    #[test]
+    fn contract_carries_the_resolved_plan_and_omits_an_unresolved_one() {
+        // workspace-plan-tier tasks 4.3/4.4: a resolved plan rides the signed contract
+        // (trusted cryptographically, not read off an unsigned header); an unresolved plan
+        // is absent from the wire, not a default tier.
+        let signer = test_signer();
+        let token = signer
+            .mint(&MintInput {
+                sub: "user-1",
+                aud: AUD,
+                principal_kind: "user",
+                on_behalf_of: None,
+                workspace_id: "ws-1",
+                member_type: Some("staff"),
+                role: Some("admin"),
+                roles: &[],
+                permissions: &[],
+                plan: Some("pro"),
+                now: now_secs(),
+            })
+            .unwrap();
+        let claims = verify_with(TEST_JWKS, &token).expect("token must verify");
+        assert_eq!(claims.plan.as_deref(), Some("pro"), "the resolved plan rides the contract");
+        assert!(
+            serde_json::to_string(&claims).unwrap().contains("\"plan\":\"pro\""),
+            "a resolved plan appears on the wire"
+        );
+        // Unresolved: the claim is omitted from the JSON entirely (skip_serializing_if).
+        let unresolved = mint_at(&signer, AUD, now_secs());
+        let unresolved_claims = verify_with(TEST_JWKS, &unresolved).expect("token must verify");
+        assert!(unresolved_claims.plan.is_none());
+        assert!(
+            !serde_json::to_string(&unresolved_claims).unwrap().contains("\"plan\""),
+            "an unresolved plan is omitted from the wire, not defaulted"
+        );
     }
 
     #[test]
@@ -246,6 +294,7 @@ mod tests {
                 role: None,
                 roles: &[],
                 permissions: &["events:write".to_owned()],
+                plan: None,
                 now: now_secs(),
             })
             .unwrap();
@@ -286,6 +335,7 @@ mod tests {
                 // Least-privilege: an api key carries no coarse global roles of its own.
                 roles: &[],
                 permissions: &[],
+                plan: None,
                 now: now_secs(),
             })
             .unwrap();

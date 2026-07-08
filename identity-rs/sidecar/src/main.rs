@@ -62,7 +62,10 @@ use identity_core::{
     ApiKeyCandidate, ApiKeyReader, Authority, PlatformScope, PrincipalKind, Profile,
     ResolvedMembership, ScopeIntersectionResolver, SecretHasher,
 };
-use store_postgres::{HmacSecretHasher, PgApiKeyReader, PgPlatformServiceReader, PgProfileStore};
+use store_postgres::{
+    HmacSecretHasher, PgApiKeyReader, PgPlatformServiceReader, PgProfileStore,
+    PgWorkspacePlanReader,
+};
 
 // identity-contract-signing: the ES256 signer adapter (mints the signed
 // x-identity-contract token) and the dedicated JWKS listener that publishes the
@@ -204,6 +207,13 @@ struct AppState {
     /// present-but-empty map means the registry is loaded with no active services (or is
     /// cold-starting): every service then resolves to no authority and fails closed.
     platform: Option<watch::Receiver<Arc<HashMap<String, PlatformScope>>>>,
+    /// The RESIDENT `workspace_id` → plan snapshot (`workspace-plan-tier`), refreshed LIVE
+    /// off the routing plane's workspace-invalidation change feed. `None` when plan
+    /// projection is not configured (`ROUTING_PG_RO_URL` unset) — then no plan ever
+    /// resolves and `x-workspace-plan`/the `plan` claim are simply omitted (fail-soft, NOT
+    /// a 503 — distinct from membership's fail-closed). A workspace absent from the map
+    /// resolves to no plan, which a box treats as not-provisioned.
+    plans: Option<watch::Receiver<Arc<HashMap<String, String>>>>,
     /// API-key authentication (`customer-api-keys`): the live key reader + secret hasher.
     /// `None` when not configured (`APIKEY_PG_RO_URL`/`APIKEY_HMAC_PEPPER` unset) — then
     /// no `x-api-key` ever resolves (human/service paths only, fail closed).
@@ -289,6 +299,19 @@ impl AppState {
         self.platform
             .as_ref()
             .and_then(|rx| rx.borrow().get(service_id).cloned())
+    }
+
+    /// Resolve the acting workspace's plan tier from the resident snapshot
+    /// (`workspace-plan-tier` task 3.2). `Some(plan)` iff the workspace is present in the
+    /// current set; `None` for an unknown workspace OR when plan projection is not
+    /// configured — either way the caller omits the plan (fail-soft, NOT a 503): a box
+    /// treats an absent plan as not-provisioned. A change propagates within seconds because
+    /// the map is refreshed off the routing workspace change feed. Mirrors
+    /// [`Self::resolve_platform_scope`].
+    fn resolve_plan(&self, workspace_id: &str) -> Option<String> {
+        self.plans
+            .as_ref()
+            .and_then(|rx| rx.borrow().get(workspace_id).cloned())
     }
 }
 
@@ -579,7 +602,11 @@ struct SignContext<'a> {
     now: u64,
 }
 
-fn enrich_response(who: &Enriched<'_>, sign_ctx: &SignContext<'_>) -> ProcessingResponse {
+fn enrich_response(
+    who: &Enriched<'_>,
+    plan: Option<&str>,
+    sign_ctx: &SignContext<'_>,
+) -> ProcessingResponse {
     // Rebind the resolved-principal bundle to the names the authoring body reads. The
     // `Arc` clone is cheap; the body only ever borrows the profile (never moves it).
     let sub = who.sub;
@@ -667,6 +694,17 @@ fn enrich_response(who: &Enriched<'_>, sign_ctx: &SignContext<'_>) -> Processing
         (Some(obo), true) => set.push(header("x-user-on-behalf-of", obo)),
         _ => remove.push("x-user-on-behalf-of".to_owned()),
     }
+    // The acting workspace's plan tier (workspace-plan-tier). NEXUS-AUTHORED from the
+    // resident routing-plane snapshot (`resolve_plan`), never a client hint — so any
+    // client-supplied `x-workspace-plan` is STRIPPED when nexus resolves none. Authored
+    // ONLY alongside a resolved acting authority (the caller passes `Some` only then), so
+    // the header and the signed `plan` claim always agree. An unresolved/unknown workspace
+    // (or plan projection unconfigured) omits the header — a box treats absence as
+    // not-provisioned (fail-soft, design D2; NOT a 503, unlike missing membership).
+    match plan {
+        Some(p) => set.push(header("x-workspace-plan", p)),
+        None => remove.push("x-workspace-plan".to_owned()),
+    }
     // The signed identity contract (identity-contract-signing). `x-identity-contract` is
     // ALWAYS a signed token — there is no plain-string form. It is minted ONLY for a
     // fully-resolved request (authenticated AND a member of the acting workspace, with a
@@ -693,6 +731,8 @@ fn enrich_response(who: &Enriched<'_>, sign_ctx: &SignContext<'_>) -> Processing
                     role: Some(m.role.as_str()),
                     roles: profile.as_ref().map_or(&[], |p| p.roles.as_slice()),
                     permissions: &[],
+                    // Same nexus-resolved plan as the header — omitted when unresolved.
+                    plan,
                     now: sign_ctx.now,
                 },
                 Acting::Platform { workspace_id, permissions } => signer::MintInput {
@@ -705,6 +745,7 @@ fn enrich_response(who: &Enriched<'_>, sign_ctx: &SignContext<'_>) -> Processing
                     role: None,
                     roles: &[],
                     permissions,
+                    plan,
                     now: sign_ctx.now,
                 },
             };
@@ -1013,9 +1054,21 @@ impl Sidecar {
                     info!(reason, "route requirements unsatisfied -> 403");
                     break 'decide (forbidden_403(), "forbidden");
                 }
+                // workspace-plan-tier (task 3.3): resolve the acting workspace's plan from
+                // the resident snapshot, but ONLY when an authority resolved — so the plan
+                // is authored exactly where the acting scope is, and never for an
+                // unresolved request. Owned here so it outlives the borrow handed to
+                // `enrich_response`; `None` on an unknown workspace / unconfigured
+                // projection omits the header and the claim (fail-soft, not a 503).
+                let acting_plan: Option<String> = enriched
+                    .acting
+                    .as_ref()
+                    .and_then(|_| ws)
+                    .and_then(|w| self.state.resolve_plan(w));
                 (
                     enrich_response(
                         &enriched,
+                        acting_plan.as_deref(),
                         &SignContext {
                             signer: self.state.signer.as_deref(),
                             route_pool: route_pool.as_deref(),
@@ -1176,6 +1229,52 @@ async fn watch_platform_services(
                 }
             }
             Err(e) => warn!(error = %e, "platform registry watch failed; retrying"),
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Refresh the resident `workspace_id` → plan snapshot off the routing plane's workspace
+/// change feed (`workspace-plan-tier` task 3.1) — the plan twin of
+/// [`watch_platform_services`]. The feed re-primes the whole set on every (re)open, so a
+/// blip keeps the last-known map (a workspace stays resolvable during a short outage,
+/// mirroring the profile cache); only a cold start with the routing store unreachable
+/// leaves the map empty → every workspace resolves to no plan (omitted, fail-soft).
+async fn watch_workspace_plans(
+    url: String,
+    poll: Duration,
+    tx: watch::Sender<Arc<HashMap<String, String>>>,
+) {
+    loop {
+        let reader = match PgWorkspacePlanReader::connect(&url).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "workspace-plan store connect failed; retrying");
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        match reader.watch_active(&url, poll).await {
+            Ok(mut feed) => {
+                info!("watching workspace-plan set");
+                while let Some(item) = feed.next().await {
+                    match item {
+                        Ok(plans) => {
+                            let map: HashMap<String, String> = plans
+                                .into_iter()
+                                .map(|p| (p.workspace_id, p.plan))
+                                .collect();
+                            info!(workspaces = map.len(), "workspace-plan set refreshed");
+                            let _ = tx.send(Arc::new(map));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "workspace-plan feed error; reconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "workspace-plan watch failed; retrying"),
         }
         sleep(Duration::from_secs(2)).await;
     }
@@ -1431,6 +1530,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!("PLATFORM_PG_RO_URL unset -> platform-service authentication OFF (human path only)");
     }
 
+    // Workspace plan-tier projection (workspace-plan-tier): when `ROUTING_PG_RO_URL` is set
+    // (the same routing RO role the membership-sync worker reads with), spawn the resident
+    // plan-snapshot watcher and hand its live receiver to the state. Unset ⇒ no plan is ever
+    // emitted (`x-workspace-plan`/the `plan` claim omitted, fail-soft — never a 503). The
+    // watcher connects+retries on its own (non-blocking), so a slow/absent routing DB never
+    // blocks enrichment at startup; the map starts EMPTY (every workspace omits its plan)
+    // until the first load lands.
+    let plans = env::var("ROUTING_PG_RO_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .map(|url| {
+            let poll = Duration::from_secs(
+                env::var("WORKSPACE_PLAN_POLL_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30),
+            );
+            let (tx, rx) = watch::channel(Arc::new(HashMap::new()));
+            tokio::spawn(watch_workspace_plans(url, poll, tx));
+            info!("workspace plan-tier projection ENABLED (resident snapshot)");
+            rx
+        });
+    if plans.is_none() {
+        info!("ROUTING_PG_RO_URL unset -> workspace plan-tier projection OFF (plan omitted)");
+    }
+
     // customer-api-keys: api-key authentication is ON only when BOTH the read-only key
     // store URL and the HMAC pepper are configured. The store defaults to identitydb (the
     // api_keys table lives alongside identity.profiles), which the profile store already
@@ -1460,6 +1585,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // `None` when signing is deliberately off (anonymous still served).
         signer: build_signer()?,
         platform,
+        plans,
         api_keys,
     };
 
@@ -1620,6 +1746,7 @@ mod tests {
                 authenticated,
                 acting,
             },
+            None,
             &SignContext { signer: None, route_pool: None, now: 0 },
         )
     }
@@ -1646,6 +1773,7 @@ mod tests {
                 authenticated,
                 acting,
             },
+            None,
             sign_ctx,
         )
     }
@@ -1926,6 +2054,7 @@ mod tests {
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
             signer: None,
             platform,
+            plans: None,
             api_keys: None,
         }
     }
@@ -1958,6 +2087,7 @@ mod tests {
         let acting = service_acting("ws-acting", &["events:write"]);
         let resp = super::enrich_response(
             &service_enriched("system:serviceaccount:nexus:events-writer", Some(acting)),
+            None,
             &SignContext { signer: None, route_pool: None, now: 0 },
         );
         let h = set_headers(&resp);
@@ -1985,7 +2115,7 @@ mod tests {
         let ctx = || SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: 1_000_000 };
 
         let acting = service_acting("ws-acting", &["events:write"]);
-        let resolved = super::enrich_response(&service_enriched("svc-1", Some(acting)), &ctx());
+        let resolved = super::enrich_response(&service_enriched("svc-1", Some(acting)), None, &ctx());
         let token = set_headers(&resolved)
             .get("x-identity-contract")
             .cloned()
@@ -1994,12 +2124,139 @@ mod tests {
         assert!(!remove_headers(&resolved).contains(&"x-identity-contract".to_owned()));
 
         // Unresolved: no acting authority -> no contract, acting scope stripped.
-        let unresolved = super::enrich_response(&service_enriched("svc-unknown", None), &ctx());
+        let unresolved = super::enrich_response(&service_enriched("svc-unknown", None), None, &ctx());
         assert!(!set_headers(&unresolved).contains_key("x-identity-contract"));
         let r = remove_headers(&unresolved);
         for hh in ["x-identity-contract", "x-workspace-id", "x-user-type", "x-user-role"] {
             assert!(r.contains(&hh.to_owned()), "unresolved service must strip {hh}");
         }
+    }
+
+    // ---- workspace-plan-tier: the acting workspace's plan projection ---- //
+
+    /// Build an `AppState` carrying a resident workspace→plan snapshot, for the
+    /// plan-resolution tests. Mirrors [`state_with_platform`].
+    fn state_with_plans(plans: Option<watch::Receiver<Arc<HashMap<String, String>>>>) -> AppState {
+        AppState {
+            cache: Cache::new(16),
+            store: Arc::new(EmptyStore),
+            ready: Arc::new(AtomicBool::new(true)),
+            last_apply_ms: Arc::new(AtomicU64::new(0)),
+            warm_ms: Arc::new(AtomicU64::new(0)),
+            start: Instant::now(),
+            fail_open: false,
+            aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            signer: None,
+            platform: None,
+            plans,
+            api_keys: None,
+        }
+    }
+
+    /// Decode a minted contract against the embedded test JWKS, returning its claims —
+    /// the box's-eye view of the signed token (task 4.4).
+    fn decode_contract(token: &str) -> identity_core::ContractClaims {
+        use jsonwebtoken::jwk::JwkSet;
+        use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+        let jwks: JwkSet = serde_json::from_str(TEST_JWKS).unwrap();
+        let kid = decode_header(token).unwrap().kid.unwrap();
+        let key = DecodingKey::from_jwk(jwks.find(&kid).unwrap()).unwrap();
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&["evenout"]);
+        validation.set_issuer(&["https://identity.nexus"]);
+        decode::<identity_core::ContractClaims>(token, &key, &validation).unwrap().claims
+    }
+
+    #[test]
+    fn resolve_plan_reads_the_resident_snapshot() {
+        // Task 3.2 / 4.1: a workspace present in the resident set resolves to its plan; an
+        // absent one resolves to None (omitted downstream); with NO projection configured,
+        // nothing resolves. A live snapshot swap is reflected on the next read (a
+        // downgrade/upgrade takes effect without a token refresh).
+        let mut map = HashMap::new();
+        map.insert("ws-pro".to_owned(), "pro".to_owned());
+        let (tx, rx) = watch::channel(Arc::new(map));
+        let state = state_with_plans(Some(rx));
+        assert_eq!(state.resolve_plan("ws-pro").as_deref(), Some("pro"));
+        assert!(state.resolve_plan("ws-unknown").is_none(), "unknown workspace -> no plan");
+        assert!(
+            state_with_plans(None).resolve_plan("ws-pro").is_none(),
+            "no projection configured -> no plan resolves",
+        );
+        // A downgrade lands on the next read — no token refresh, mirroring suspension.
+        tx.send(Arc::new(HashMap::from([("ws-pro".to_owned(), "free".to_owned())]))).unwrap();
+        assert_eq!(state.resolve_plan("ws-pro").as_deref(), Some("free"), "downgrade is prompt");
+    }
+
+    #[test]
+    fn enrich_authors_plan_as_header_and_signed_claim() {
+        // Tasks 4.2 / 4.4: a resolved plan is authored as `x-workspace-plan` AND carried in
+        // the signed contract's `plan` claim — a box can trust it cryptographically. The
+        // header and the claim are the SAME nexus-resolved value.
+        let signer = test_signer();
+        let acting = Acting::Workspace(ResolvedMembership {
+            workspace_id: "ws-1".to_owned(),
+            member_type: MemberType::Staff,
+            role: "admin".to_owned(),
+        });
+        let resp = super::enrich_response(
+            &Enriched {
+                sub: "u1",
+                kind: Some(PrincipalKind::User.as_str()),
+                on_behalf_of: None,
+                profile: None,
+                authenticated: true,
+                acting: Some(acting),
+            },
+            Some("pro"),
+            // Real-clock `now` so the minted token verifies (decode_contract validates exp).
+            &SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() },
+        );
+        let h = set_headers(&resp);
+        assert_eq!(h.get("x-workspace-plan").map(String::as_str), Some("pro"));
+        let token = h.get("x-identity-contract").expect("a resolved request carries a contract");
+        assert_eq!(decode_contract(token).plan.as_deref(), Some("pro"), "the claim matches the header");
+        // The authored plan header must never also be stripped.
+        assert!(
+            !remove_headers(&resp).contains(&"x-workspace-plan".to_owned()),
+            "an authored plan must not be stripped",
+        );
+    }
+
+    #[test]
+    fn unresolved_plan_omits_header_and_claim_and_strips_client_copy() {
+        // Task 4.3 (fail-soft) + 4.2 (nexus-authored): with no plan resolved, `x-workspace-plan`
+        // is omitted (NOT defaulted) and any client-supplied copy is STRIPPED — even though an
+        // authority resolved and a contract is minted. The `plan` claim is likewise omitted, not
+        // defaulted (no 503, unlike missing membership).
+        let signer = test_signer();
+        let acting = Acting::Workspace(ResolvedMembership {
+            workspace_id: "ws-1".to_owned(),
+            member_type: MemberType::Staff,
+            role: "admin".to_owned(),
+        });
+        let resp = super::enrich_response(
+            &Enriched {
+                sub: "u1",
+                kind: Some(PrincipalKind::User.as_str()),
+                on_behalf_of: None,
+                profile: None,
+                authenticated: true,
+                acting: Some(acting),
+            },
+            None,
+            &SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() },
+        );
+        assert!(!set_headers(&resp).contains_key("x-workspace-plan"), "unresolved plan is omitted");
+        assert!(
+            remove_headers(&resp).contains(&"x-workspace-plan".to_owned()),
+            "a client-supplied plan is stripped when nexus resolves none",
+        );
+        let token = set_headers(&resp)
+            .get("x-identity-contract")
+            .cloned()
+            .expect("the request still resolves an authority -> a contract is minted");
+        assert!(decode_contract(&token).plan.is_none(), "the claim is omitted, not defaulted");
     }
 
     // ---- customer-api-keys: the api-key (on-behalf-of Workspace authority) path ---- //
@@ -2018,6 +2275,7 @@ mod tests {
         });
         let resp = super::enrich_response(
             &api_key_enriched("pak_key7", "u-creator", Some(acting)),
+            None,
             &signed_ctx(&signer),
         );
         let h = set_headers(&resp);
@@ -2046,6 +2304,7 @@ mod tests {
         let signer = test_signer();
         let resp = super::enrich_response(
             &api_key_enriched("pak_key7", "u-creator", None),
+            None,
             &signed_ctx(&signer),
         );
         assert!(!set_headers(&resp).contains_key("x-identity-contract"), "no authority -> no contract");
@@ -2307,6 +2566,7 @@ mod tests {
                 role: Some("admin"),
                 roles: &["ops".to_owned()],
                 permissions: &[],
+                plan: Some("pro"),
                 now: now_secs(),
             })
             .expect("mint");
@@ -2334,6 +2594,9 @@ mod tests {
         assert_eq!(claims.workspace_id, "ws-e2e");
         assert_eq!(claims.aud, "evenout");
         assert_eq!(claims.ctr, "v1");
+        // workspace-plan-tier task 4.4: a box reads the trusted plan from the signed
+        // contract served/verified end-to-end (not an unsigned header).
+        assert_eq!(claims.plan.as_deref(), Some("pro"));
 
         let _ = fs::remove_file(&key_path);
     }
@@ -2638,6 +2901,7 @@ mod tests {
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
             signer: None,
             platform: None,
+            plans: None,
             api_keys: None,
         };
 

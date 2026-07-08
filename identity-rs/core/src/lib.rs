@@ -19,6 +19,7 @@ pub mod profile;
 pub mod projection;
 pub mod store;
 pub mod telemetry;
+pub mod workspace_plan;
 
 pub use api_key::{
     ApiKeyCandidate, ApiKeyReader, ApiKeyScope, ScopeIntersectionResolver, SecretHasher,
@@ -32,3 +33,4 @@ pub use platform::{PlatformService, PlatformServiceReader};
 pub use principal::{Authority, PlatformScope, Principal, PrincipalKind};
 pub use profile::Profile;
 pub use projection::{backstop_pass, sync_subject, BackstopStats};
+pub use workspace_plan::{WorkspacePlan, WorkspacePlanReader};

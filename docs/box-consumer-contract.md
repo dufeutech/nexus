@@ -57,6 +57,7 @@ token minted **only** for a resolved identity (§1a-bis).
 | --- | --- | --- | --- |
 | `x-identity-contract` | **The signed contract.** An ES256 JWS whose claims carry the acting identity; the contract-shape version rides inside as the `ctr` claim. Minted only for an authenticated member (§1a-bis). | compact JWS (`h.p.s`) | **Verify + require** (§1a-bis, §2). |
 | `x-workspace-id` | The **authorized acting workspace** (set only after a live membership check). | id string | Primary tenant scope. Prefer over legacy `x-tenant-id`. |
+| `x-workspace-plan` | The acting workspace's **plan tier** (`workspace-plan-tier`) — **nexus-authored** from nexus's own workspace record, never a client hint. Authored alongside the acting scope; **omitted** (not defaulted) when no plan resolves. Also carried in the signed contract's `plan` claim. | string (e.g. `free`, `pro`) | Storage-cap / feature policy. **Absent ⇒ treat as not-provisioned** (grant no tier). |
 | `x-user-id` | Verified subject (`sub` for a user; the **service id** for a service; the **key id** for an api-key principal). | id string | Audit / ownership checks. |
 | `x-user-on-behalf-of` | **Only for an `apikey` principal:** the **creating user** the key acts for (customer-api-keys). Authored alongside the acting scope; **absent** for a human/service. | id string | Audit / attribution to the human behind the automation. |
 | `x-user-type` | Acting **principal kind / relationship**. `staff`/`customer` for a human (and for an **api-key**, the creator's relationship in the acting workspace); **`service`** for a core platform service (normalized-principal). | `staff` \| `customer` \| `service` | Acting-scope decisions; branch the write door on `service`. |
@@ -88,8 +89,10 @@ token minted **only** for a resolved identity (§1a-bis).
 4. **Read identity from the verified claims** if you wish: `sub`, `workspace_id`, `principal_kind`,
    `role`, `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-type` / `x-user-role` /
    `x-user-roles`). For an **`apikey`** principal the claims additionally carry **`on_behalf_of`** (the
-   creating user) — present only for `apikey`, mirroring `x-user-on-behalf-of`. The `plan` claim is
-   **reserved** and currently absent — treat absent plan as not-provisioned.
+   creating user) — present only for `apikey`, mirroring `x-user-on-behalf-of`. The `plan` claim
+   carries the acting workspace's **plan tier** (`workspace-plan-tier`), mirroring `x-workspace-plan`
+   and signed alongside the rest of the identity — **omitted** (not defaulted) when no plan resolves,
+   so treat an absent plan as **not-provisioned**.
 
 **Minted only for a resolved identity.** nexus signs the token **only** when the request is
 authenticated *and* the caller resolved to an **authority** — a workspace membership (user) or a
@@ -135,10 +138,13 @@ read identity from either), and origin trust (§0) remains the underlying guaran
 
 | Header | Meaning | Format |
 | --- | --- | --- |
-| `x-workspace-plan` | Tenant plan tier. | string |
 | `x-workspace-features` | Enabled feature flags. | comma-joined |
 | `x-route-pool` | Backend pool the edge routed to. | `api` \| `checkout` \| `assets` \| `application` |
 | `x-routed-by` | Provenance marker. | literal `tenant-router` |
+
+> **`x-workspace-plan` is authored by the identity sidecar (§1a), not here** — it is a
+> nexus-owned fact keyed by the *authorized acting* workspace and is also signed into the
+> contract's `plan` claim. Read it as an identity header, not a routing hint.
 
 `x-workspace-id` is also authored here first, then **re-asserted or stripped** by the sidecar
 after the membership check — treat the sidecar's value as authoritative.

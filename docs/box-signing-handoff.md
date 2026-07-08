@@ -18,8 +18,9 @@ short "what to pin and check" for the integration.
 
 Identity claims you may read from the verified token (mirror the headers):
 `sub` (= `x-user-id`), `workspace_id` (= `x-workspace-id`), `role` (= `x-user-role`),
-`roles` (= `x-user-roles`). `plan` is **reserved** and currently absent — treat absent
-plan as not-provisioned.
+`roles` (= `x-user-roles`), `plan` (= `x-workspace-plan`). `plan` is the acting workspace's
+**plan tier** (`workspace-plan-tier`), nexus-authored and signed into the token; it is
+**omitted** (not defaulted) when no plan resolves — treat an absent `plan` as not-provisioned.
 
 ## Verification steps (per request, on an enriched route)
 
