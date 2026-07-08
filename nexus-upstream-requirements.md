@@ -19,7 +19,7 @@ concern them; any change here must be reflected there ("pin any rename in both r
 | **N2** | ✅ SHIPPED                   | `routing-rs/control-plane/src/main.rs` — `/domains/declare`, `/domains/{d}/verify`, leader-elected TXT poll |
 | **N3** | finding only                 | no work — kept below in case wildcard tiers are ever wanted                                                |
 | **N4** | ✅ SHIPPED (both phases)     | phase 1 auth gate + phase 2 role/entitlement/AAL gate (change `edge-role-entitlement-gate`, 2026-07-02)    |
-| **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **open action is backend-side** |
+| **N5** | ✅ SHIPPED (superseded form) | acting-org semantics + tripwire shipped as `x-identity-contract: v1` (NO standalone scope header — spec decision 2026-07-01); **consumer obligation is box-side** |
 | **N6** | ✅ SHIPPED                   | edge-rooted W3C tracing (change `edge-rooted-tracing`, 2026-07-03): Envoy OTel tracer → collector → Tempo; client trace context stripped at C3 |
 
 ---
@@ -96,11 +96,7 @@ Default = pass-through: **no rows for a workspace means `auth: none`** (the `/` 
 operator-set default, not auto-seeded), so any customer site works with zero URL
 constraints; gating is opt-in.
 
----
-
-## Open work in nexus
-
-### N5 — acting-org assurance — ✅ shipped in nexus (superseded form); **open action is backend-side**
+### N5 — acting-org assurance — ✅ shipped in nexus (superseded form)
 
 Both halves of N5 are live in nexus, but the tripwire shipped in a different (better)
 form than the original ask, and the consuming backend must adapt to it (decided 2026-07-02):
@@ -120,7 +116,7 @@ form than the original ask, and the consuming backend must adapt to it (decided 
   client-supplied `x-identity-contract` (C3), and header-shape drift is a version bump
   that fails closed on partial rollout.
 
-**Backend action (the remaining N5 work, box-side):** replace the legacy
+**Consumer obligation (box-side — mirrored here, NOT open nexus work):** replace the legacy
 `x-tenant-scope == acting` check with the contract check — reject a tenant-scoped
 request unless `x-identity-contract` is an accepted version (`v1` today) AND the acting
 `x-workspace-id` + `x-user-type` are present; else `403`. Equivalent strength (both are
@@ -128,7 +124,7 @@ trusted-boundary tripwires, not cryptographic proof). Bring-up ordering concern
 disappears: nexus already emits the stamp, so a backend can switch enforcement any time.
 Bump `v1` → `v2` in BOTH repos together on any future header-shape change.
 
-**Naming pin (part of the same backend action):** nexus injects `x-workspace-id`;
+**Naming pin (part of the same consumer obligation):** nexus injects `x-workspace-id`;
 `x-tenant-id` survives only as a legacy read-fallback inside the sidecar. Boxes read
 `x-workspace-id` (their trusted-header names are configurable box-side).
 
