@@ -24,6 +24,7 @@ use std::env;
 
 use router_core::auth::RouteAuth;
 use router_core::domain::{Pool, WorkspaceConfig};
+use router_core::normalize::{normalize_host, parent_domain};
 use router_core::store::{
     Membership, MembershipStore, OwnershipStore, RoutingStore,
 };
@@ -107,6 +108,143 @@ async fn workspace_account(pool: &sqlx::PgPool, ws: &str) -> Option<String> {
         .await
         .expect("workspace row")
         .get::<Option<String>, _>("account_id")
+}
+
+/// Resolve a host through the store exactly as `AppState::resolve` does
+/// (tenant-router `main.rs`): normalize, one EXACT point read, then — only on a
+/// miss — one SINGLE-LABEL WILDCARD-parent point read; a non-conforming host is
+/// no-match before any read. This mirrors the hot path so the store-layer guard
+/// tests pin the same exact→wildcard→fail-closed ordering the router enforces
+/// (domain-host-resolution). It is the store contract under test, not a second
+/// matcher.
+async fn resolve_via_store(store: &PgRoutingStore, host: &str) -> Option<String> {
+    let key = normalize_host(host);
+    if key.is_empty() {
+        return None;
+    }
+    match store.lookup_domain(&key, false).await.unwrap() {
+        Some(ws) => Some(ws),
+        None => match parent_domain(&key) {
+            Some(parent) => store.lookup_domain(&parent, true).await.unwrap(),
+            None => None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn apex_and_wildcard_coexist_and_route_to_their_own_workspaces() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // domain-host-resolution: the apex (exact row) and its wildcard (wildcard row)
+    // are INDEPENDENT entries for the same domain string — the composite
+    // (domain, is_wildcard) key lets both exist at once. Seed apex→A, wildcard→B.
+    store.upsert_workspace(&workspace("ws_apex")).await.unwrap();
+    store.upsert_workspace(&workspace("ws_wild")).await.unwrap();
+    store.upsert_domain("example.com", "ws_apex", false, true).await.unwrap();
+    store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
+
+    // The apex resolves to its exact workspace (A), NOT via the wildcard...
+    assert_eq!(
+        resolve_via_store(&store, "example.com").await.as_deref(),
+        Some("ws_apex"),
+        "apex resolves to its own exact row, not the wildcard",
+    );
+    // ...and a subdomain with no exact row resolves via the parent wildcard (B).
+    assert_eq!(
+        resolve_via_store(&store, "shop.example.com").await.as_deref(),
+        Some("ws_wild"),
+        "a subdomain resolves via the parent's wildcard row",
+    );
+
+    // A wildcard alone must never answer the apex: drop the exact row and the
+    // apex now fails closed even though the wildcard still covers subdomains.
+    store.delete_domain("example.com", false).await.unwrap();
+    assert_eq!(
+        resolve_via_store(&store, "example.com").await,
+        None,
+        "a wildcard does not cover the apex itself (TLS-wildcard semantics)",
+    );
+    assert_eq!(
+        resolve_via_store(&store, "shop.example.com").await.as_deref(),
+        Some("ws_wild"),
+        "the wildcard still answers its subdomains after the apex row is gone",
+    );
+}
+
+#[tokio::test]
+async fn an_exact_row_beats_a_covering_wildcard() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // domain-host-resolution (most-specific-wins): an exact row for the subdomain
+    // must take precedence over a wildcard that would otherwise cover it.
+    store.upsert_workspace(&workspace("ws_exact")).await.unwrap();
+    store.upsert_workspace(&workspace("ws_wild")).await.unwrap();
+    store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
+    store.upsert_domain("shop.example.com", "ws_exact", false, true).await.unwrap();
+
+    // shop.example.com has both an exact row (A) and a covering wildcard (B) —
+    // the exact-first read wins and the wildcard hop never runs.
+    assert_eq!(
+        resolve_via_store(&store, "shop.example.com").await.as_deref(),
+        Some("ws_exact"),
+        "the exact row wins over the covering wildcard",
+    );
+    // A sibling with no exact row still falls through to the wildcard.
+    assert_eq!(
+        resolve_via_store(&store, "blog.example.com").await.as_deref(),
+        Some("ws_wild"),
+        "a sibling without an exact row still resolves via the wildcard",
+    );
+}
+
+#[tokio::test]
+async fn wildcard_matching_is_single_label_only() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // domain-host-resolution (single-label depth): a wildcard matches ONLY hosts
+    // exactly one label below it. `a.b.example.com` is two labels below
+    // `example.com`, so the `example.com` wildcard must NOT answer it.
+    store.upsert_workspace(&workspace("ws_top")).await.unwrap();
+    store.upsert_domain("example.com", "ws_top", true, true).await.unwrap();
+    assert_eq!(
+        resolve_via_store(&store, "a.b.example.com").await,
+        None,
+        "a two-label-deep host is not covered by the top wildcard",
+    );
+
+    // Coverage of the deeper host requires a wildcard at ITS OWN parent
+    // (`b.example.com`); then the single-label hop resolves it.
+    store.upsert_workspace(&workspace("ws_deep")).await.unwrap();
+    store.upsert_domain("b.example.com", "ws_deep", true, true).await.unwrap();
+    assert_eq!(
+        resolve_via_store(&store, "a.b.example.com").await.as_deref(),
+        Some("ws_deep"),
+        "a wildcard at the host's own parent covers its single-label children",
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_host_fails_closed_to_no_tenant() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // domain-host-resolution (fail-closed): a host with neither an exact row nor a
+    // matching parent wildcard resolves to NO tenant — never a default/catch-all.
+    // Seed an unrelated domain so the store is non-empty (a populated store must
+    // still refuse an unknown host).
+    store.upsert_workspace(&workspace("ws_known")).await.unwrap();
+    store.upsert_domain("known.example.com", "ws_known", false, true).await.unwrap();
+
+    assert_eq!(
+        resolve_via_store(&store, "unknown.other.com").await,
+        None,
+        "an unknown host resolves to no tenant, not a default",
+    );
+    // A non-conforming host is refused before any lookup — same no-tenant result.
+    assert_eq!(
+        resolve_via_store(&store, "ex ample.com").await,
+        None,
+        "a non-conforming host fails closed without a lookup",
+    );
 }
 
 #[tokio::test]

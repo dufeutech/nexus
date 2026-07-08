@@ -982,13 +982,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // --------------------------------------------------------------------------- //
 #[cfg(test)]
 mod tests {
-    use super::{api, auth_signals, sleep, RouteAuth};
+    use super::{api, auth_signals, sleep, AppState, RouteAuth};
+    use std::collections::HashMap;
     use std::env::var;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::routing::get;
     use axum::Router as AxumRouter;
+    use moka::future::Cache;
+    use router_core::auth::AuthPolicy;
+    use router_core::domain::{Pool, WorkspaceConfig};
+    use router_core::store::{BoxError, DomainRecord, RoutingStore};
     use tower::util::ServiceExt;
 
     /// Spec "Requirements ride the resolved rule": a gated rule emits exactly the
@@ -1095,5 +1103,179 @@ mod tests {
             Duration::from_secs(30),
             "default request timeout must be the documented finite 30s",
         );
+    }
+
+    // ----------------------------------------------------------------------- //
+    // domain-host-resolution: /authorize == router host-set parity.
+    //
+    // The cert gate (`authorize`) and the router (`resolve`) MUST authorize/route
+    // the identical host set because they share ONE predicate — `AppState::resolve`.
+    // This drives both real HTTP handlers over one state and asserts they agree
+    // allow-for-allow / deny-for-deny across an exact hit, a wildcard-covered
+    // subdomain, a nested miss, an apex-with-only-a-wildcard, and an unknown host.
+    // ----------------------------------------------------------------------- //
+
+    /// An in-memory `RoutingStore` answering only the three reads `resolve` makes:
+    /// the exact/wildcard domain lookup, the workspace config, and the (pass-through)
+    /// auth policy. Every control-plane write is `unimplemented!()` — the parity
+    /// test never drives them.
+    struct FakeStore {
+        /// verified `(domain, is_wildcard)` → `workspace_id`.
+        domains: HashMap<(String, bool), String>,
+    }
+
+    #[async_trait]
+    impl RoutingStore for FakeStore {
+        async fn lookup_domain(
+            &self,
+            domain: &str,
+            wildcard: bool,
+        ) -> Result<Option<String>, BoxError> {
+            Ok(self.domains.get(&(domain.to_owned(), wildcard)).cloned())
+        }
+
+        async fn get_workspace(
+            &self,
+            workspace_id: &str,
+        ) -> Result<Option<WorkspaceConfig>, BoxError> {
+            // Any workspace a domain row points at has a trivial config — the parity
+            // test only cares whether resolution succeeds, not the config's contents.
+            Ok(Some(WorkspaceConfig {
+                workspace_id: workspace_id.to_owned(),
+                plan: "free".to_owned(),
+                target_pool: Pool::new("application"),
+                features: vec![],
+                updated_at: None,
+            }))
+        }
+
+        async fn get_auth_policy(&self, _workspace_id: &str) -> Result<AuthPolicy, BoxError> {
+            Ok(AuthPolicy::default())
+        }
+
+        // --- control-plane writes: never exercised by the parity test ---------- //
+        async fn upsert_workspace(&self, _cfg: &WorkspaceConfig) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+        async fn upsert_domain(
+            &self,
+            _domain: &str,
+            _workspace_id: &str,
+            _wildcard: bool,
+            _verified: bool,
+        ) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+        async fn create_pending_domain(
+            &self,
+            _domain: &str,
+            _workspace_id: &str,
+        ) -> Result<bool, BoxError> {
+            unimplemented!()
+        }
+        async fn set_domain_verified(&self, _domain: &str, _verified: bool) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+        async fn delete_domain(&self, _domain: &str, _wildcard: bool) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+        async fn domains_for_workspace(
+            &self,
+            _workspace_id: &str,
+        ) -> Result<Vec<String>, BoxError> {
+            unimplemented!()
+        }
+        async fn get_domain(
+            &self,
+            _domain: &str,
+            _wildcard: bool,
+        ) -> Result<Option<DomainRecord>, BoxError> {
+            unimplemented!()
+        }
+        async fn count_domains_for_workspace(&self, _workspace_id: &str) -> Result<u32, BoxError> {
+            unimplemented!()
+        }
+        async fn pending_domains(&self) -> Result<Vec<String>, BoxError> {
+            unimplemented!()
+        }
+        async fn expire_pending_domains(&self, _ttl_secs: i64) -> Result<Vec<String>, BoxError> {
+            unimplemented!()
+        }
+        async fn upsert_auth_route(
+            &self,
+            _workspace_id: &str,
+            _prefix: &str,
+            _auth: &RouteAuth,
+        ) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+        async fn delete_auth_route(
+            &self,
+            _workspace_id: &str,
+            _prefix: &str,
+        ) -> Result<(), BoxError> {
+            unimplemented!()
+        }
+    }
+
+    /// Build a ready `AppState` over the fake store (L1-only, no L2), so the real
+    /// `api::router` handlers resolve through it.
+    fn state_over(store: FakeStore) -> AppState {
+        AppState {
+            l1: Cache::builder().max_capacity(1024).build(),
+            l2: None,
+            store: Arc::new(store),
+            l2_ttl: 60,
+            ready: Arc::new(AtomicBool::new(true)),
+            last_apply_ms: Arc::new(AtomicU64::new(0)),
+            warm_ms: Arc::new(AtomicU64::new(0)),
+            start: Instant::now(),
+        }
+    }
+
+    /// Fire one GET at a fresh router over `state` and return its status.
+    async fn get_status(state: &AppState, uri: &str) -> StatusCode {
+        api::router(state.clone())
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn authorize_and_router_resolve_the_identical_host_set() {
+        // Seed: an exact `shop.example.com` row and a wildcard `example.com` row.
+        let mut domains = HashMap::new();
+        domains.insert(("shop.example.com".to_owned(), false), "ws_exact".to_owned());
+        domains.insert(("example.com".to_owned(), true), "ws_wild".to_owned());
+        let state = state_over(FakeStore { domains });
+
+        // (host, should_resolve): the router routes exactly these, so the cert gate
+        // must authorize exactly these.
+        let cases = [
+            ("shop.example.com", true),  // exact hit
+            ("app.example.com", true),   // wildcard-covered subdomain
+            ("a.b.example.com", false),  // nested: two labels below the wildcard → miss
+            ("example.com", false),      // apex has only a wildcard row → not covered
+            ("nope.other.com", false),   // wholly unknown → fail closed
+        ];
+
+        for (host, should_resolve) in cases {
+            let routed = get_status(&state, &format!("/resolve/{host}")).await;
+            let authorized = get_status(&state, &format!("/authorize?domain={host}")).await;
+
+            // The router routes iff we expect resolution; the gate authorizes iff so.
+            let expected_route = if should_resolve { StatusCode::OK } else { StatusCode::NOT_FOUND };
+            let expected_auth = if should_resolve { StatusCode::OK } else { StatusCode::FORBIDDEN };
+            assert_eq!(routed, expected_route, "router verdict for {host}");
+            assert_eq!(authorized, expected_auth, "cert-gate verdict for {host}");
+
+            // Parity, stated directly: the gate authorizes exactly when the router routes.
+            assert_eq!(
+                authorized == StatusCode::OK,
+                routed == StatusCode::OK,
+                "/authorize and the router must agree on {host}",
+            );
+        }
     }
 }

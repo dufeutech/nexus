@@ -157,4 +157,44 @@ mod tests {
         assert_eq!(normalize_host("[2001:db8::1]:8443"), "2001:db8::1");
         assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
     }
+
+    /// domain-host-resolution: the resolver derives its two point-read keys from
+    /// `normalize`/`parent_domain` — the EXACT key and the SINGLE-LABEL wildcard
+    /// parent — and both key off the same canonical form. Pin that derivation so a
+    /// refactor of the ordering (exact-first, then one wildcard hop) can't silently
+    /// change which two rows a host consults.
+    #[test]
+    fn resolver_derives_exact_key_then_single_label_wildcard_parent() {
+        // A subdomain: the exact key is the whole canonical host, and the sole
+        // wildcard fallback is its immediate parent — exactly one label up.
+        let key = normalize_host("App.Example.com:443");
+        assert_eq!(key, "app.example.com", "exact lookup keys off the canonical host");
+        assert_eq!(
+            parent_domain(&key),
+            Some("example.com".to_owned()),
+            "the wildcard fallback is the single-label parent, not a deeper suffix",
+        );
+        // Depth is single-label only: the parent of `a.b.example.com` is
+        // `b.example.com`, NOT `example.com` — a two-label-up wildcard is never
+        // derived, so a nested host can only match a wildcard at its own parent.
+        assert_eq!(
+            parent_domain("a.b.example.com").as_deref(),
+            Some("b.example.com"),
+            "nesting climbs exactly one label per resolver hop",
+        );
+    }
+
+    /// domain-host-resolution (fail-closed): a non-conforming host normalizes to
+    /// the empty key, which the resolver and the cert-authorization gate both read
+    /// as "no match" — neither the exact nor the wildcard lookup ever runs, so no
+    /// tenant (and no cert) can be resolved for it.
+    #[test]
+    fn non_conforming_host_normalizes_to_no_match() {
+        for bad in ["", "   ", ".example.com", "a..b.com", "ex ample.com", "examplé.com"] {
+            let key = normalize_host(bad);
+            assert!(key.is_empty(), "{bad:?} must normalize to the no-match empty key");
+            // An empty key has no parent either — the wildcard hop is skipped too.
+            assert_eq!(parent_domain(&key), None, "no wildcard fallback for a no-match host");
+        }
+    }
 }

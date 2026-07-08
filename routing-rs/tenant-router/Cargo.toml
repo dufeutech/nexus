@@ -37,6 +37,9 @@ opentelemetry.workspace = true
 [dev-dependencies]
 # http-request-resilience tests: oneshot a router without binding a socket.
 tower.workspace = true
+# domain-host-resolution parity test: an in-memory RoutingStore fake implements
+# the #[async_trait] port so /authorize and /resolve can be driven over one state.
+async-trait.workspace = true
 
 [lints]
 workspace = true
