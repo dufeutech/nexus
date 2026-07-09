@@ -88,6 +88,16 @@ reversible boundary). De-risks both.
 - **Adopt OpenFGA for L3 (seam-ready, later).** Timed to (a) a product that actually has
   deeply-nested per-resource sharing AND (b) the D multi-region DB decision. Until then the
   `MembershipResolver` ReBAC adapter stays unimplemented; the Profile projection remains L3.
+  - **Gate (b) resolved (2026-07-09): store = CNPG (CloudNativePG / Postgres).** OpenFGA's most
+    mature backing store is Postgres, so CNPG is the mainstream deployment, not a compromise. This
+    settles the infra half of L3 and detaches it from the CockroachDB-vs-Postgres question in the D fork.
+  - **Gate (a) NOT met (verified 2026-07-09).** A full-repo scan found no product crate and no
+    per-resource / nested / inherited sharing model anywhere — authz is uniformly flat RBAC/ABAC
+    (route + role/entitlement/AAL/membership; global roles/entitlements/suspension on the Profile).
+    Products live outside this repo as edge "boxes." **There is no real resource graph to design an
+    OpenFGA model against yet**, so L3 stays parked: adopting now would mean operating an empty tuple
+    store and freezing a guessed schema. Re-open L3 only when a real nested-sharing product exists to
+    model against. L3 is now blocked on *product*, not infra.
 - **Entitlement/licensing is NOT an authz engine (L1).** It's a commerce plane; its resolved
   output is fed to Cedar as context. Keep it out of both Cedar policies and OpenFGA tuples.
 - **Non-overlap invariant.** L2 (Cedar) decides *policy/context* rules; L3 (OpenFGA) decides
