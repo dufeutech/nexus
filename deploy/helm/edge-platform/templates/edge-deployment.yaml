@@ -115,6 +115,11 @@ spec:
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: {{ include "edge-platform.otelResourceAttributes" $ | quote }}
             {{- end }}
+            # adopt-cedar-policy-gate: the L2 authorization policy set is DATA, mounted
+            # from the identity-policy ConfigMap. A malformed/unvalidatable set fails
+            # closed (gated routes 403). Unset would fall back to the embedded default.
+            - name: POLICY_DIR
+              value: /etc/nexus/policy
           ports:
             - { name: id-ext-proc, containerPort: 50051 }
             - { name: id-profile, containerPort: 9200 }
@@ -129,6 +134,9 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
           resources: {{- toYaml .Values.edge.resources.identitySidecar | nindent 12 }}
+          volumeMounts:
+            # adopt-cedar-policy-gate: the L2 policy-as-data set (POLICY_DIR above).
+            - { name: identity-policy, mountPath: /etc/nexus/policy, readOnly: true }
         # ---- Envoy edge (the combined tenant-first chain) ----
         - name: envoy
           image: {{ include "edge-platform.image" (dict "repo" $rv.images.envoy.repository "tag" $rv.images.envoy.tag "ctx" .) }}
@@ -154,6 +162,10 @@ spec:
         - name: envoy-config
           configMap:
             name: {{ include "edge-platform.fullname" . }}-edge-envoy
+        # adopt-cedar-policy-gate: the identity sidecar's L2 authorization policy set.
+        - name: identity-policy
+          configMap:
+            name: {{ include "edge-platform.fullname" . }}-identity-policy
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}

@@ -1,0 +1,18 @@
+{{- /*
+adopt-cedar-policy-gate: the identity sidecar's L2 authorization policy set, shipped as
+DATA (a Cedar schema + policy). The sidecar loads + VALIDATES it at startup from
+POLICY_DIR (mounted from this ConfigMap in edge-deployment.yaml); a malformed or
+unvalidatable set FAILS CLOSED — the sidecar refuses gated routes (403) rather than serve
+against an unvalidated set. Editing these files changes authorization decisions without
+rebuilding the sidecar image. They mirror the binary's embedded default parity set
+(identity-rs/policy-cedar/policies); POLICY_DIR overrides that default per environment.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-identity-policy
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/policy/*").AsConfig | nindent 2 }}

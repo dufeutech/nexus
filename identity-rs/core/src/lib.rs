@@ -14,6 +14,7 @@ pub mod authz;
 pub mod contract;
 pub mod membership;
 pub mod platform;
+pub mod policy;
 pub mod principal;
 pub mod profile;
 pub mod projection;
@@ -30,6 +31,10 @@ pub use membership::{
     Membership, MemberType, MembershipResolver, ResolvedMembership, SourceMembershipReader,
 };
 pub use platform::{PlatformService, PlatformServiceReader};
+pub use policy::{
+    Action, Decision, DenyAllPdp, Effect, MinAal, PolicyContext, PolicyDecisionPoint,
+    PolicyPrincipal, PolicyRequest, PolicyResource,
+};
 pub use principal::{Authority, PlatformScope, Principal, PrincipalKind};
 pub use profile::Profile;
 pub use projection::{backstop_pass, sync_subject, BackstopStats};

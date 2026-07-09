@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -60,9 +61,11 @@ use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 use identity_core::telemetry;
 use identity_core::store::{BoxError, Change, ProfileStore, WatchToken};
 use identity_core::{
-    ApiKeyCandidate, ApiKeyReader, Authority, PlatformScope, PrincipalKind, Profile,
-    ResolvedMembership, ScopeIntersectionResolver, SecretHasher,
+    Action, ApiKeyCandidate, ApiKeyReader, Authority, AuthzFacts, DenyAllPdp, PlatformScope,
+    PolicyContext, PolicyDecisionPoint, PolicyPrincipal, PolicyRequest, PolicyResource,
+    PrincipalKind, Profile, ResolvedMembership, ScopeIntersectionResolver, SecretHasher,
 };
+use policy_cedar::CedarPdp;
 use store_postgres::{
     HmacSecretHasher, PgApiKeyReader, PgPlatformServiceReader, PgProfileStore,
     PgWorkspacePlanReader,
@@ -240,6 +243,12 @@ struct AppState {
     /// `None` when not configured (`APIKEY_PG_RO_URL`/`APIKEY_HMAC_PEPPER` unset) — then
     /// no `x-api-key` ever resolves (human/service paths only, fail closed).
     api_keys: Option<ApiKeyAuth>,
+    /// The L2 authorization policy decision point (adopt-cedar-policy-gate). The gated-
+    /// route 403 step (`decide_route_requirements`) asks this port instead of comparing
+    /// headers by hand — a Cedar adapter in production, or [`DenyAllPdp`] when the policy
+    /// set failed to load (gated routes then fail closed). An `Arc<dyn …>` so the engine
+    /// is a reversible adapter swap and cheap to clone per request.
+    pdp: Arc<dyn PolicyDecisionPoint>,
 }
 
 /// The api-key authenticator's dependencies (`customer-api-keys`): the live store reader
@@ -543,11 +552,15 @@ fn extract_requirements(req: &ProcessingRequest) -> RouteRequirements {
     }
 }
 
-/// The N4 phase-2 authorization comparison, isolated for unit tests: EVERY
-/// resolved requirement must be satisfied by the enrichment this filter itself
-/// computed (never by request headers). A requirement that cannot be evaluated —
-/// no enrichment to compare, an unmapped method, an unparseable level — DENIES,
-/// so degraded state can never open a gated route.
+/// The N4 phase-2 authorization comparison — the hand-coded requirement check that the
+/// PDP (`decide_route_requirements`) now replaces in production (adopt-cedar-policy-gate).
+/// Retained ONLY as the `#[cfg(test)]` **parity oracle**: the parity harness runs the
+/// full input matrix through both this and the PDP and asserts identical effects, and
+/// the existing gate tests still pin its exact behavior. EVERY resolved requirement must
+/// be satisfied by the enrichment this filter itself computed (never by request headers);
+/// a requirement that cannot be evaluated — no enrichment to compare, an unmapped method,
+/// an unparseable level — DENIES, so degraded state can never open a gated route.
+#[cfg(test)]
 fn authorize_route(
     reqs: &RouteRequirements,
     roles: &[String],
@@ -582,6 +595,10 @@ fn authorize_route(
 /// sourced ONLY from the live Profile (the AuthzResolver's backing), never the
 /// token — so an absent Profile means no roles/entitlements (deny-by-default). The
 /// method mirrors the emitted `x-auth-method`.
+///
+/// `#[cfg(test)]` — the production gate now runs [`decide_route_requirements`] (the PDP);
+/// this remains as the parity oracle the tests compare against (adopt-cedar-policy-gate).
+#[cfg(test)]
 fn enforce_route_requirements(
     reqs: &RouteRequirements,
     profile: Option<&Arc<Profile>>,
@@ -595,6 +612,64 @@ fn enforce_route_requirements(
     let entitlements = profile.map(|p| p.entitlements.as_slice());
     let method = if authenticated { "bearer" } else { "none" };
     authorize_route(reqs, roles, entitlements, aal_levels.get(method).copied())
+}
+
+/// Translate the in-process enrichment + resolved route requirements into a
+/// vendor-agnostic [`PolicyRequest`] for the PDP (adopt-cedar-policy-gate). Pure
+/// translation — the sidecar never decides: roles/entitlements are the nexus-authored
+/// facts (empty when no Profile ⇒ deny-by-default); the method maps to an assurance
+/// level (a method absent from the ordering ⇒ `None` ⇒ any min-AAL requirement fails
+/// closed); the resolved `x-auth-*` signals become the resource requirements. `kind` is
+/// carried but inert; `account_scoped` is inert in the parity policy (not decided on),
+/// so it is passed as `false` rather than threaded through the hot path — a later change
+/// that decides on it would carry the real value.
+fn build_policy_request(
+    reqs: &RouteRequirements,
+    profile: Option<&Arc<Profile>>,
+    authenticated: bool,
+    aal_levels: &HashMap<String, u8>,
+) -> PolicyRequest {
+    let facts = profile.map(|p| AuthzFacts::from(p.as_ref())).unwrap_or_default();
+    let method = if authenticated { "bearer" } else { "none" };
+    let aal = aal_levels.get(method).map(|level| i64::from(*level));
+    let kind = if authenticated { "authenticated" } else { "anonymous" };
+    PolicyRequest {
+        principal: PolicyPrincipal::from_facts(&facts, aal, kind),
+        action: Action::Access,
+        resource: PolicyResource::from_requirements(
+            reqs.role.as_deref(),
+            reqs.entitlement.as_deref(),
+            reqs.min_aal.as_deref(),
+            false, // account_scoped — inert in the parity policy (design Non-Goal)
+        ),
+        context: PolicyContext::default(),
+    }
+}
+
+/// The production authorization step (adopt-cedar-policy-gate): build the PDP request
+/// from the in-process enrichment + resolved requirements and ask the policy engine,
+/// mapping a deny to the caller's 403 with the engine's auditable reason. An ungated
+/// route (no requirements) short-circuits to pass WITHOUT consulting the PDP — so a
+/// failed-to-load policy set (a [`DenyAllPdp`]) refuses only GATED routes, leaving
+/// public routes served. Replaces the hand-coded [`enforce_route_requirements`] at
+/// strict behavioral parity.
+fn decide_route_requirements(
+    pdp: &dyn PolicyDecisionPoint,
+    reqs: &RouteRequirements,
+    profile: Option<&Arc<Profile>>,
+    authenticated: bool,
+    aal_levels: &HashMap<String, u8>,
+) -> Result<(), String> {
+    if !reqs.any() {
+        return Ok(());
+    }
+    let request = build_policy_request(reqs, profile, authenticated, aal_levels);
+    let decision = pdp.decide(&request);
+    if decision.is_permit() {
+        Ok(())
+    } else {
+        Err(decision.reason)
+    }
 }
 
 /// The resolved acting authority the enrich path authors (normalized-principal task
@@ -1166,13 +1241,14 @@ impl Sidecar {
                 // jwt_authn upstream owns the anonymous-on-protected-route 401; an
                 // anonymous request carrying requirement signals means something
                 // upstream is misconfigured, and it denies here (fail-closed).
-                if let Err(reason) = enforce_route_requirements(
+                if let Err(reason) = decide_route_requirements(
+                    self.state.pdp.as_ref(),
                     &requirements,
                     enriched.profile.as_ref(),
                     enriched.authenticated,
                     &self.state.aal_levels,
                 ) {
-                    info!(reason, "route requirements unsatisfied -> 403");
+                    info!(reason = %reason, "route requirements unsatisfied -> 403");
                     break 'decide (forbidden_403(), "forbidden");
                 }
                 // workspace-plan-tier (task 3.3): resolve the acting workspace's plan from
@@ -1692,6 +1768,32 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
+/// Load the L2 authorization policy engine (adopt-cedar-policy-gate). Reads the parity
+/// Cedar policy set from `POLICY_DIR` when configured (the per-environment override,
+/// design Decision 3), else the embedded default set. A malformed/unvalidatable set
+/// FAILS CLOSED: install [`DenyAllPdp`] so gated routes are refused (403) rather than
+/// served against an empty or partial policy set; ungated routes never consult the PDP
+/// and still pass.
+fn build_policy_pdp() -> Arc<dyn PolicyDecisionPoint> {
+    let loaded = match env::var("POLICY_DIR").ok().filter(|dir| !dir.is_empty()) {
+        Some(dir) => CedarPdp::from_path(Path::new(&dir)),
+        None => CedarPdp::with_default_policies(),
+    };
+    match loaded {
+        Ok(pdp) => {
+            info!("L2 authorization policy engine loaded (Cedar parity policy)");
+            Arc::new(pdp)
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                "L2 policy set failed to load -> failing closed (gated routes denied)"
+            );
+            Arc::new(DenyAllPdp)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // automate-signing-key-rotation: the OpenBao Transit client (vaultrs) uses rustls
@@ -1728,6 +1830,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let aal_levels = parse_aal_levels(
         &env::var("SIDECAR_AAL_LEVELS").unwrap_or_else(|_| DEFAULT_AAL_LEVELS.to_owned()),
     );
+    let pdp = build_policy_pdp();
 
     let store: Arc<dyn ProfileStore> = loop {
         match PgProfileStore::connect(&pg_url).await {
@@ -1827,6 +1930,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         platform,
         plans,
         api_keys,
+        pdp,
     };
 
     // Periodically publish the gauge-style snapshots (the exporter's own listener
@@ -1949,6 +2053,13 @@ mod tests {
     const TEST_PEM: &str = include_str!("testdata/test-ec-p256.pem");
     /// The public JWKS matching `TEST_PEM`, for the end-to-end verify test.
     const TEST_JWKS: &str = include_str!("testdata/test-jwks.json");
+
+    /// The real Cedar PDP over the embedded parity policy — the production engine, so a
+    /// gated route in any test decides exactly as it will in production (adopt-cedar-
+    /// policy-gate).
+    fn test_pdp() -> Arc<dyn PolicyDecisionPoint> {
+        Arc::new(CedarPdp::with_default_policies().expect("default parity policies load"))
+    }
 
     /// A signer over the embedded test key (identity-contract-signing tests).
     fn test_signer() -> signer::Signer {
@@ -2323,6 +2434,7 @@ mod tests {
             start: Instant::now(),
             fail_open: false,
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            pdp: test_pdp(),
             signer: None,
             platform,
             plans: None,
@@ -2417,6 +2529,7 @@ mod tests {
             start: Instant::now(),
             fail_open: false,
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            pdp: test_pdp(),
             signer: None,
             platform: None,
             plans,
@@ -3058,6 +3171,105 @@ mod tests {
         assert!(!set_headers(&enrich_response("u1", Some(viewer), true, None)).contains_key("x-user-roles"));
     }
 
+    /// adopt-cedar-policy-gate task 4.1 — the PARITY ORACLE. Run the full gate input
+    /// matrix (role/entitlement/AAL present·absent·mismatch, empty requirements,
+    /// unparseable AAL, absent enrichment, authenticated·anonymous) through BOTH the
+    /// hand-coded `enforce_route_requirements` oracle and the production PDP path
+    /// (`decide_route_requirements`), and assert IDENTICAL effects (pass vs deny) for
+    /// every combination. Reasons differ (the oracle names the first failing dimension;
+    /// the PDP returns a single deny reason) — only the effect must match.
+    #[test]
+    fn pdp_matches_the_oracle_across_the_full_gate_matrix() {
+        let pdp = test_pdp();
+        let levels = levels();
+        // Profiles span: absent (no enrichment), present-empty, and every combination of
+        // the two facts the gate reads (role `admin`, entitlement `pro`).
+        let with_both = gated_profile(&["admin"], &["pro"]);
+        let with_role = gated_profile(&["admin"], &[]);
+        let with_ent = gated_profile(&[], &["pro"]);
+        let empty = gated_profile(&[], &[]);
+        let profiles: [Option<&Arc<Profile>>; 5] =
+            [None, Some(&empty), Some(&with_role), Some(&with_ent), Some(&with_both)];
+        // Requirement signals span present-match, present-mismatch, and absent; the AAL
+        // requirement spans absent, "0" (present, any level), "1"/"2" (levels), and an
+        // unparseable value.
+        let role_reqs = [None, Some("admin"), Some("editor")];
+        let ent_reqs = [None, Some("pro"), Some("enterprise")];
+        let aal_reqs = [None, Some("0"), Some("1"), Some("2"), Some("high")];
+        let auth_states = [true, false];
+
+        let mut checked = 0_u32;
+        for profile in profiles {
+            for role in role_reqs {
+                for ent in ent_reqs {
+                    for aal in aal_reqs {
+                        for authenticated in auth_states {
+                            let requirements = reqs(role, ent, aal);
+                            let oracle = enforce_route_requirements(
+                                &requirements,
+                                profile,
+                                authenticated,
+                                &levels,
+                            )
+                            .is_ok();
+                            let via_pdp = decide_route_requirements(
+                                pdp.as_ref(),
+                                &requirements,
+                                profile,
+                                authenticated,
+                                &levels,
+                            )
+                            .is_ok();
+                            assert_eq!(
+                                oracle, via_pdp,
+                                "parity drift: role={role:?} ent={ent:?} aal={aal:?} \
+                                 auth={authenticated} profile_present={} \
+                                 oracle_pass={oracle} pdp_pass={via_pdp}",
+                                profile.is_some(),
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // 5 profiles × 3 roles × 3 ents × 5 aals × 2 auth = 450 combinations.
+        assert_eq!(checked, 450, "the whole matrix must be exercised");
+    }
+
+    /// adopt-cedar-policy-gate task 4.2 — decision ORDERING is preserved: the 404
+    /// existence-hide fires BEFORE the PDP 403. A non-member of a private, workspace-
+    /// scoped route (`acting_resolved = false`) is hidden as a 404 and the gate is never
+    /// reached; a MEMBER (`acting_resolved = true`) who merely lacks a required role is
+    /// NOT hidden and falls through to the PDP, which denies → 403. (The 503 fail-closed
+    /// sits further up and is asserted unchanged by `unavailable_503_is_a_blocking_503`.)
+    #[test]
+    fn decision_ordering_404_hides_nonmember_before_pdp_403() {
+        let pdp = test_pdp();
+        let levels = levels();
+        let admin_route = reqs(Some("admin"), None, None);
+
+        // Non-member on an enriched, workspace-scoped route → hidden as 404 (the gate,
+        // and thus the PDP, is never consulted).
+        assert!(
+            hide_nonmember_as_404(true, false, true, false),
+            "a non-member must be hidden as 404 before the 403 gate",
+        );
+
+        // A MEMBER (acting resolved) lacking the required role is NOT hidden…
+        assert!(
+            !hide_nonmember_as_404(true, false, true, true),
+            "a member is not hidden — they reach the honest 403",
+        );
+        // …and the PDP then denies that member → 403.
+        let viewer = gated_profile(&["viewer"], &[]);
+        assert!(
+            decide_route_requirements(pdp.as_ref(), &admin_route, Some(&viewer), true, &levels)
+                .is_err(),
+            "a member lacking the required role is denied by the PDP (403)",
+        );
+    }
+
     #[test]
     fn aal_levels_parse_with_default_and_override() {
         let d = levels();
@@ -3245,6 +3457,7 @@ mod tests {
             start: Instant::now(),
             fail_open: false,
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
+            pdp: test_pdp(),
             signer: None,
             platform: None,
             plans: None,

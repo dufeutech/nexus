@@ -16,6 +16,11 @@ path = "src/main.rs"
 [dependencies]
 identity-core = { path = "../core" }
 store-postgres = { path = "../store-postgres" }
+# adopt-cedar-policy-gate: the L2 authorization PDP adapter. The `cedar-policy` engine
+# is isolated INSIDE this crate behind identity_core::PolicyDecisionPoint — the sidecar
+# depends only on `policy-cedar` (to construct the engine at startup) and the core port,
+# never on `cedar-policy` directly, so the engine stays a reversible adapter swap.
+policy-cedar = { path = "../policy-cedar" }
 tonic = "0.14"
 envoy-types = "0.7"
 tokio.workspace = true

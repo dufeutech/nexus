@@ -1,0 +1,47 @@
+// Parity authorization schema for the L2 policy gate (adopt-cedar-policy-gate,
+// design Decision 2). It is DATA: the shapes the sidecar translates its in-process
+// enrichment + resolved route requirements into. Only role / entitlement / min-AAL
+// are DECIDED on today; suspension (principal) and geo/plan/method (context) are
+// present so a later change can reference them WITHOUT a schema migration — they are
+// inert in the parity policy.
+
+// The subject: nexus-authored authorization facts plus the request's assurance level.
+// `roles`/`entitlements` are always present (possibly empty), so a set requirement
+// against empty enrichment denies. `aal` is OPTIONAL: absent = the authentication
+// method did not map to a level, so any present min-AAL requirement fails closed.
+entity User {
+  roles: Set<String>,
+  entitlements: Set<String>,
+  aal?: Long,
+  suspended: Bool,   // inert (carried, not decided on) — parity Non-Goal
+  kind: String,
+};
+
+// The route and its resolved requirements, carried as data. An empty-string
+// role/entitlement is "no requirement". The min-AAL requirement is expanded into
+// three flags so the parity condition validates under strict mode and never reads an
+// absent attribute:
+//   has_min_aal        — was a min-AAL requirement present at all? (absent = skip)
+//   min_aal            — the required level (meaningful only when present & parseable)
+//   min_aal_parseable  — was the present requirement parseable? (false = fail closed)
+entity Route {
+  requires_role: String,
+  requires_entitlement: String,
+  has_min_aal: Bool,
+  min_aal: Long,
+  min_aal_parseable: Bool,
+  account_scoped: Bool,   // inert (carried, not decided on) — parity Non-Goal
+};
+
+// A single access verb — there is no per-HTTP-method authorization dimension today
+// (the method only feeds AAL upstream). geo/plan/method ride the context, present but
+// unreferenced (inert) so a later change can decide on them without a migration.
+action access appliesTo {
+  principal: [User],
+  resource: [Route],
+  context: {
+    geo?: String,
+    plan?: String,
+    method?: String,
+  }
+};

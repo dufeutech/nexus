@@ -137,9 +137,17 @@ services:
       SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-}
       SIGNING_KID: ${SIGNING_KID:-}
       JWKS_FILE: ${JWKS_FILE:-}
+      # adopt-cedar-policy-gate: the L2 authorization policy set is DATA. POLICY_DIR points
+      # at the mounted Cedar schema + policy (./policy below); unset falls back to the
+      # binary's embedded default parity set. A malformed/unvalidatable set FAILS CLOSED —
+      # the sidecar refuses gated routes (403) rather than serve an unvalidated policy set.
+      POLICY_DIR: ${POLICY_DIR:-/etc/nexus/policy}
     volumes:
       # Operator-supplied signing material (empty until you opt in — see runbook).
       - ./signing:/etc/nexus/signing:ro
+      # L2 authorization policy-as-data (schema.cedarschema + policy.cedar), loaded and
+      # validated at startup. Edit these to change authorization decisions without a rebuild.
+      - ./policy:/etc/nexus/policy:ro
     ports:
       # Public JWKS listener (only serves once JWKS_FILE is set); handy for local curl.
       - "${JWKS_PORT:-9210}:9210"

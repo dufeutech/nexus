@@ -136,8 +136,37 @@ a deploy artifact.
 ## Open Questions
 
 - ~~Resolved at `/opsx:decide`: formally record **Adopt: Cedar** (vs. keep hand-rolled / another engine).~~
-  **Resolved → Decision 0: Adopt Cedar (`cedar-policy` 4.10.x), approved.**
-- Exact home for the `.cedar` files: in the `policy-cedar` crate (`policies/`) vs. a deploy-config path.
-  Leaning: a default set in-crate, overridable by a configured path per environment.
-- Do we keep `authorize_route` as a permanent parity oracle in tests, or delete after cutover? (Leaning
-  delete once the PDP parity test subsumes it.)
+  **Resolved → Decision 0: Adopt Cedar (`cedar-policy` 4.10.x), approved.** (Implemented on
+  `cedar-policy` 4.11 — the current 4.x, semver-compatible with the recorded 4.10 line.)
+- ~~Exact home for the `.cedar` files: in the `policy-cedar` crate (`policies/`) vs. a deploy-config path.~~
+  **Resolved → both, layered.** The canonical parity set lives in the crate (`policy-cedar/policies/`)
+  and is `include_str!`-embedded as the built-in default (`CedarPdp::with_default_policies`), so the
+  sidecar runs with no mounted files. `POLICY_DIR` overrides it per environment (`CedarPdp::from_path`);
+  the deploy ships copies as data — a compose bind-mount (`deploy/compose/policy/`) and a Helm ConfigMap
+  (`deploy/helm/edge-platform/files/policy/` → mounted at `/etc/nexus/policy`). A malformed/unvalidatable
+  set (embedded *or* mounted) fails closed at load: the sidecar installs `DenyAllPdp`, refusing gated
+  routes rather than serving an unvalidated set.
+- ~~Do we keep `authorize_route` as a permanent parity oracle in tests, or delete after cutover?~~
+  **Resolved → keep as an explicitly-labeled `#[cfg(test)]` oracle.** Production now decides via
+  `decide_route_requirements` (the PDP); `authorize_route` + `enforce_route_requirements` are gated
+  `#[cfg(test)]` and serve only the parity harness (which runs the full gate matrix — 450 combinations —
+  through both the oracle and the PDP and asserts identical effects) and the existing exact-string gate
+  tests. They compile out of the production binary (no dead code), so the oracle is a zero-cost test
+  artifact, not a maintained second code path.
+
+## Implementation notes (as-built)
+
+- **PARC modeling refinement.** The parity `min_aal` requirement is carried as a three-state
+  [`identity_core::MinAal`] (`None` = no requirement / `Least(n)` = require level `n` / `Unparseable` =
+  present-but-unparseable → deny). The Cedar adapter expands it into `has_min_aal` / `min_aal` /
+  `min_aal_parseable` resource attributes, and the permit's AAL clause is
+  `!resource.has_min_aal || (resource.min_aal_parseable && principal has aal && principal.aal >= resource.min_aal)`.
+  The `principal has aal` guard (rather than reading an optional attribute unguarded) both passes strict
+  schema validation and reproduces the exact parity edge case that `min_aal="0"` is a *present* requirement
+  an unmapped method must still fail (whereas an *absent* requirement is skipped entirely).
+- **Sync placement.** No spec change was needed for `edge-auth-gate` (parity is a HOW change); the change
+  adds one new capability spec, `authorization-policy-engine`, to sync into the main specs.
+- **Latency (Decision risk / task 5.3).** Cedar evaluation is in-process and microsecond-scale — per
+  request the adapter builds two small entities and evaluates a single permit; policies are parsed and
+  validated once at load. The existing `service-slo-policy` burn-rate instrument on the sidecar plane is
+  the operational guard for any regression; no hot-path benchmark changed.

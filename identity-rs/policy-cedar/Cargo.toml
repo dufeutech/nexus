@@ -1,0 +1,26 @@
+[package]
+name = "policy-cedar"
+edition.workspace = true
+version.workspace = true
+description = "Cedar policy-decision-point adapter for the Nexus identity plane L2 authorization gate"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lib]
+name = "policy_cedar"
+path = "src/lib.rs"
+
+[dependencies]
+identity-core = { path = "../core" }
+# adopt-cedar-policy-gate (design Decision 0): the Cedar policy engine — in-process,
+# policy-as-data with a schema validator that fails closed at load. The `cedar-policy`
+# dependency is ISOLATED to THIS crate behind the identity_core::PolicyDecisionPoint
+# port (Decision 1); neither `core` nor the sidecar imports it, so the engine is a
+# reversible adapter swap.
+cedar-policy = "4.11"
+
+[lints]
+workspace = true
