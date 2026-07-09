@@ -601,6 +601,46 @@ connection to the primary (never a transaction-mode pooler), and the identity
 role needs `CREATE` so the app can run `CREATE SCHEMA IF NOT EXISTS identity` on
 startup. No replica set is required.)
 
+### Cross-region invalidation transport: NATS (optional, `NATS_URL`)
+
+`LISTEN/NOTIFY` is delivered only within a single Postgres server — physical
+replicas do not forward `NOTIFY` (see the bullet above). So the moment a
+tenant-router runs against a replica, an async-failover target, or a second
+region, it stops receiving invalidations and serves stale routes until the L1 TTL
+(`ROUTING_CACHE_TTL`, default 600s) expires. To carry invalidations **across a
+region edge**, the router can source the same feed from **NATS** instead, whose
+gateway/supercluster fan-out spans regions.
+
+- **Opt-in, reversible, default-off.** Set `NATS_URL` (Helm: `nats.enabled=true`
+  + `nats.url`) and the router subscribes to NATS subject **`routing.invalidations`**
+  in place of the pg_notify feed. Leave it unset and the router stays on
+  `LISTEN/NOTIFY` exactly as before — single-region deployments are unaffected.
+  **Rollback is unsetting `NATS_URL`** (no schema or code change to unwind); both
+  transports sit behind the same `Invalidations` port.
+- **Reachability is the one operational requirement.** `NATS_URL` must resolve
+  from **every** router region — a gateway-connected supercluster, or a regional
+  NATS that gateways to the others. A subject only crosses a region when a
+  subscriber there has interest, so idle regions cost nothing.
+- **Core NATS (fire-and-forget), same best-effort contract.** Delivery is
+  at-most-once; a dropped signal self-heals within `ROUTING_CACHE_TTL`, identical
+  to the pg_notify path — the TTL is the correctness floor, so NATS is **not** a
+  correctness dependency. A connect failure or disconnect degrades to the TTL
+  backstop and the router keeps serving (the hot resolve path never touches the
+  feed); it reconnects on its own.
+- **Graduated commitment — JetStream is deliberately NOT used here.** The routing
+  plane needs only fire-and-forget broadcast, so this runs on **core NATS** (no
+  file storage, no RAFT). Durable, replay-from-cursor delivery (JetStream) is
+  reserved for the identity plane's `identity_changes`/`seq` revocation path, which
+  has a real per-second freshness requirement — a separate, later change. Don't
+  provision JetStream for this.
+- **Publish + subscribe both switch on `NATS_URL`, and it is additive.** Set
+  `NATS_URL` on the **control plane** and it fans out each invalidation to
+  **pg_notify AND NATS** (so in-region routers still on pg_notify never lose the
+  signal while cross-region routers get it over NATS); set it on a **tenant-router**
+  and that router sources its feed from NATS instead of pg_notify. Enable the
+  control plane first, then routers. `membership-sync` still `LISTEN`s on
+  `routing_membership_changes` (below) over pg_notify — unchanged and out of scope.
+
 ### Cross-plane: membership-sync reads the routing store (read-only)
 
 The identity plane's **membership-sync** worker is the one component that reaches

@@ -170,3 +170,17 @@ an OPTIONAL external cache tier (RFC decision 9) — never a correctness depende
 {{- required "redis.url is required when redis.enabled=true (external Redis L2)" .Values.redis.url -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The NATS_URL the router dials for cross-region invalidation delivery, or "" when
+disabled. NATS is the OPTIONAL invalidation transport (track D): setting it routes
+invalidations over NATS instead of pg_notify (single-server). Default-off — an
+unset NATS_URL keeps the router on the pg_notify feed, so single-region
+deployments are unaffected. Core NATS (fire-and-forget); a dropped signal
+self-heals within router.cacheTtlSeconds, exactly as pg_notify already tolerates.
+*/}}
+{{- define "routing-plane.natsUrl" -}}
+{{- if .Values.nats.enabled -}}
+{{- required "nats.url is required when nats.enabled=true (cross-region invalidation transport)" .Values.nats.url -}}
+{{- end -}}
+{{- end -}}

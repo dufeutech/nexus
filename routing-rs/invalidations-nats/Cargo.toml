@@ -1,0 +1,28 @@
+[package]
+name = "invalidations-nats"
+edition.workspace = true
+version.workspace = true
+description = "NATS transport adapter for the Nexus routing-plane Invalidations port (cross-region delivery)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lib]
+name = "invalidations_nats"
+path = "src/lib.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+async-nats.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+# Integration test drives a live NATS (gated on NATS_TEST_URL): publish on the
+# subject and assert the subscribe() feed yields the key.
+tokio.workspace = true
+
+[lints]
+workspace = true

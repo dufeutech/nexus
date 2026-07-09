@@ -24,7 +24,7 @@ use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
 use router_core::domain::{Pool, WorkspaceConfig};
 use router_core::store::{
     Account, AccountMember, BoxError, Challenge, ChallengeStore, DomainRecord, InvalidationFeed,
-    Invalidations, Membership, MembershipStore, OwnershipStore, RoutingStore,
+    InvalidationPublisher, Invalidations, Membership, MembershipStore, OwnershipStore, RoutingStore,
 };
 
 /// The NOTIFY channel the control plane publishes invalidations on.
@@ -904,6 +904,16 @@ pub struct PgInvalidations {
 impl PgInvalidations {
     pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
+    }
+}
+
+/// The pg_notify publish path behind the `InvalidationPublisher` port — the
+/// symmetric counterpart of `PgInvalidations` (subscribe). Delegates to the
+/// store's existing `notify_invalidation` so the SQL lives in one place.
+#[async_trait]
+impl InvalidationPublisher for PgRoutingStore {
+    async fn publish(&self, domain: &str) -> Result<(), BoxError> {
+        self.notify_invalidation(domain).await
     }
 }
 

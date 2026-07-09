@@ -263,6 +263,23 @@ redis:
   url: ""                       # e.g. redis://redis.cache.svc.cluster.local:6379
 
 # -------------------------------------------------------------------------- #
+# NATS — the OPTIONAL cross-region invalidation transport (track D). Enabling it
+# routes routing invalidations over NATS instead of pg_notify, which is delivered
+# only within a single Postgres server (physical replicas do not forward NOTIFY),
+# so a router in another region would otherwise serve stale routes until the L1
+# TTL (router.cacheTtlSeconds) expires. Core NATS (fire-and-forget): a dropped
+# signal self-heals within that same TTL — it is NOT a correctness dependency.
+# Disabled => the router stays on pg_notify and single-region deploys are
+# unaffected. When enabled, the URL MUST be reachable from EVERY router region
+# (a supercluster/gateway topology or a regional NATS with gateways).
+# -------------------------------------------------------------------------- #
+nats:
+  enabled: false
+  # Required when enabled. Point it at a NATS you operate that spans your router
+  # regions (e.g. a gateway-connected supercluster). Auth creds go in the URL.
+  url: ""                       # e.g. nats://nats.msg.svc.cluster.local:4222
+
+# -------------------------------------------------------------------------- #
 # Telemetry (first-party-telemetry) — the PRIMARY signal path. The Rust services
 # (tenant-router, control-plane) PUSH traces + metrics + logs via OTLP/gRPC to your
 # OTel Collector (the SINGLE telemetry egress). Set it to light up metrics in your

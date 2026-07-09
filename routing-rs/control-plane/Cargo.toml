@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 router-core = { path = "../router-core" }
 store-postgres = { path = "../store-postgres" }
+invalidations-nats = { path = "../invalidations-nats" }
 dns-resolver = { path = "../dns-resolver" }
 tokio.workspace = true
 axum.workspace = true

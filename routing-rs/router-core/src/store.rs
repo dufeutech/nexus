@@ -4,6 +4,7 @@
 //! core and the services depend only on the traits.
 
 use std::error::Error;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -183,6 +184,51 @@ pub trait Invalidations: Send + Sync {
     async fn subscribe(&self) -> Result<InvalidationFeed, BoxError>;
 }
 
+/// The publish counterpart of [`Invalidations`]: the control plane emits the
+/// affected **normalized domain key** here after every mutation, and every
+/// subscriber (across regions) evicts it. Kept distinct from the store — and
+/// symmetric with the subscribe port — so the transport (pg_notify, a message
+/// bus) is an adapter swap, never a control-plane change.
+#[async_trait]
+pub trait InvalidationPublisher: Send + Sync {
+    /// Publish the invalidation for `domain`. Best-effort: a failure MUST NOT fail
+    /// the committed write — the cache TTL backstop heals a lost signal.
+    async fn publish(&self, domain: &str) -> Result<(), BoxError>;
+}
+
+/// Fan an invalidation out to several transports at once (e.g. pg_notify AND a
+/// message bus during a cross-region rollout). Publishing to every sink keeps
+/// enabling a new transport purely **additive** — subscribers still on the old
+/// one never lose the signal. Best-effort: every sink is attempted even if an
+/// earlier one fails; the last error (if any) is returned for the caller to log.
+pub struct FanoutPublisher {
+    sinks: Vec<Arc<dyn InvalidationPublisher>>,
+}
+
+impl FanoutPublisher {
+    /// Build a fan-out over `sinks`. One sink degenerates to a direct publish.
+    #[must_use]
+    pub fn new(sinks: Vec<Arc<dyn InvalidationPublisher>>) -> Self {
+        Self { sinks }
+    }
+}
+
+#[async_trait]
+impl InvalidationPublisher for FanoutPublisher {
+    async fn publish(&self, domain: &str) -> Result<(), BoxError> {
+        let mut last_err = None;
+        for sink in &self.sinks {
+            if let Err(e) = sink.publish(domain).await {
+                last_err = Some(e);
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 // --- ownership + membership (nexus-owned-workspace-tenancy) ------------------ //
 //
 // The management-plane write surface for the tenancy model: Accounts own
@@ -301,4 +347,67 @@ pub trait MembershipStore: Send + Sync {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<Membership>, BoxError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use futures::executor::block_on;
+
+    use super::{Arc, BoxError, FanoutPublisher, InvalidationPublisher};
+
+    /// Records the domains it was asked to publish; optionally fails to exercise
+    /// the best-effort fan-out semantics.
+    struct Recorder {
+        seen: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl InvalidationPublisher for Recorder {
+        async fn publish(&self, domain: &str) -> Result<(), BoxError> {
+            self.seen.lock().unwrap().push(domain.to_owned());
+            if self.fail {
+                Err("sink failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn recorder(fail: bool) -> Arc<Recorder> {
+        Arc::new(Recorder {
+            seen: Mutex::new(vec![]),
+            fail,
+        })
+    }
+
+    #[test]
+    fn fanout_publishes_to_every_sink() {
+        let first = recorder(false);
+        let second = recorder(false);
+        let fan = FanoutPublisher::new(vec![
+            Arc::clone(&first) as Arc<dyn InvalidationPublisher>,
+            Arc::clone(&second) as Arc<dyn InvalidationPublisher>,
+        ]);
+        block_on(fan.publish("x.example.com")).unwrap();
+        assert_eq!(first.seen.lock().unwrap().as_slice(), ["x.example.com"]);
+        assert_eq!(second.seen.lock().unwrap().as_slice(), ["x.example.com"]);
+    }
+
+    #[test]
+    fn fanout_attempts_all_sinks_even_when_one_fails() {
+        let failing = recorder(true);
+        let healthy = recorder(false);
+        let fan = FanoutPublisher::new(vec![
+            Arc::clone(&failing) as Arc<dyn InvalidationPublisher>,
+            Arc::clone(&healthy) as Arc<dyn InvalidationPublisher>,
+        ]);
+        // A sink failure surfaces as Err (so the operator sees it), but the later
+        // sink still received the signal — enabling one transport never starves
+        // another.
+        assert!(block_on(fan.publish("y.example.com")).is_err());
+        assert_eq!(healthy.seen.lock().unwrap().as_slice(), ["y.example.com"]);
+    }
 }

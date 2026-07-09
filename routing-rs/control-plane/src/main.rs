@@ -49,10 +49,11 @@ use router_core::domain::{PoolSet, WorkspaceConfig};
 use router_core::normalize::normalize_host;
 use router_core::plan::{DomainLimit, PlanLimits};
 use router_core::store::{
-    BoxError, ChallengeStore, Membership, MembershipStore, OwnershipStore, RoutingStore,
-    MEMBER_TYPES,
+    BoxError, ChallengeStore, FanoutPublisher, InvalidationPublisher, Membership, MembershipStore,
+    OwnershipStore, RoutingStore, MEMBER_TYPES,
 };
 use router_core::verify::{challenge_name, ct_eq, token_matches, OwnershipProof};
+use invalidations_nats::NatsPublisher;
 use store_postgres::{LeaderLease, PgRoutingStore};
 
 // --------------------------------------------------------------------------- //
@@ -109,6 +110,12 @@ where
 #[derive(Clone)]
 struct App {
     store: Arc<PgRoutingStore>,
+    /// Where invalidations are published (RFC C16). pg_notify by default; a
+    /// fan-out over pg_notify + NATS when `NATS_URL` is set, so cross-region
+    /// subscribers get the signal while in-region pg_notify subscribers keep
+    /// theirs. Behind the `InvalidationPublisher` port so the transport is an
+    /// adapter swap, never a control-plane change.
+    publisher: Arc<dyn InvalidationPublisher>,
     /// Data-driven plan → domain-limit table for the declare quota gate (RFC C5).
     limits: Arc<PlanLimits>,
     /// Data-driven allow-list of backend pools (RFC C15). Loaded from config so a
@@ -204,7 +211,7 @@ impl App {
     /// Publish the invalidation for a domain key (best-effort; logged on failure
     /// since the cache TTL is the backstop).
     async fn invalidate(&self, domain: &str) {
-        if let Err(e) = self.store.notify_invalidation(domain).await {
+        if let Err(e) = self.publisher.publish(domain).await {
             warn!(error = %e, domain, "notify failed (cache TTL will self-heal)");
         }
     }
@@ -1156,6 +1163,31 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     info!("routing schema ready");
 
+    // Invalidation transport (RFC C16). Always publish via pg_notify (the store);
+    // when NATS_URL is set, fan out to NATS too so cross-region subscribers get
+    // the signal without in-region pg_notify subscribers losing theirs. A NATS
+    // connect failure degrades to pg_notify-only (best-effort — the TTL backstop
+    // heals a lost cross-region signal), never failing startup.
+    let publisher: Arc<dyn InvalidationPublisher> = {
+        let pg: Arc<dyn InvalidationPublisher> = Arc::clone(&store) as Arc<dyn InvalidationPublisher>;
+        match env("NATS_URL", "") {
+            url if !url.is_empty() => match NatsPublisher::connect(&url).await {
+                Ok(nats) => {
+                    info!("invalidation publisher: pg_notify + NATS (cross-region fan-out)");
+                    Arc::new(FanoutPublisher::new(vec![pg, Arc::new(nats)]))
+                }
+                Err(e) => {
+                    warn!(error = %e, "NATS publisher connect failed; publishing pg_notify only");
+                    pg
+                }
+            },
+            _ => {
+                info!("invalidation publisher: pg_notify (single-server, default)");
+                pg
+            }
+        }
+    };
+
     let challenge_ttl: i64 = env("ROUTING_CHALLENGE_TTL", "86400").parse().unwrap_or(86400);
     // Default 7 days; a domain unverified past this expires and frees quota.
     let pending_ttl: i64 = env("ROUTING_PENDING_TTL", "604800").parse().unwrap_or(604800);
@@ -1183,6 +1215,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let app = App {
         store,
+        publisher,
         limits: Arc::new(load_plan_limits()),
         pools: Arc::new(load_pools()),
         verifier: Arc::new(DnsOwnershipProof::public()),

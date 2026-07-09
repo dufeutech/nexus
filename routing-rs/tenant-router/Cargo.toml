@@ -17,6 +17,7 @@ path = "src/main.rs"
 router-core = { path = "../router-core" }
 store-postgres = { path = "../store-postgres" }
 cache-redis = { path = "../cache-redis" }
+invalidations-nats = { path = "../invalidations-nats" }
 tonic = "0.14"
 envoy-types = "0.7"
 tokio.workspace = true

@@ -53,6 +53,15 @@ spec:
             - name: REDIS_URL
               value: {{ $redis | quote }}
             {{- end }}
+            {{- $nats := include "routing-plane.natsUrl" . }}
+            {{- if $nats }}
+            # OPTIONAL cross-region invalidation transport (track D). Set =>
+            # invalidations ride NATS instead of pg_notify (which cannot cross a
+            # region edge). Unset => stay on pg_notify. Must be reachable from
+            # EVERY router region — see deploy README.
+            - name: NATS_URL
+              value: {{ $nats | quote }}
+            {{- end }}
             - name: ROUTING_CACHE_CAPACITY
               value: {{ .Values.router.cacheCapacity | quote }}
             - name: ROUTING_CACHE_TTL

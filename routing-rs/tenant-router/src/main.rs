@@ -68,6 +68,7 @@ use router_core::geo::GeoContext;
 use router_core::normalize::{normalize_host, parent_domain};
 use router_core::store::{BoxError, Invalidations, RoutingStore};
 use cache_redis::RedisCache;
+use invalidations_nats::NatsInvalidations;
 use store_postgres::{PgInvalidations, PgRoutingStore};
 
 // --------------------------------------------------------------------------- //
@@ -1023,10 +1024,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
-    // Invalidation feed watcher.
+    // Invalidation feed watcher. Transport is selected by config: NATS_URL set
+    // routes invalidations over NATS (cross-region delivery, track D); absent it
+    // stays on the default pg_notify feed. Both sit behind the `Invalidations`
+    // port, so this is the only line that changes and rollback is unsetting the
+    // env var. NATS is core (fire-and-forget) — a dropped signal self-heals within
+    // ROUTING_CACHE_TTL, exactly as the pg_notify path already tolerates.
     {
         let st = state.clone();
-        let invs: Arc<dyn Invalidations> = Arc::new(PgInvalidations::new(pg_url.clone()));
+        let invs: Arc<dyn Invalidations> = match var("NATS_URL") {
+            Ok(url) if !url.is_empty() => {
+                info!("invalidation transport: NATS (cross-region)");
+                Arc::new(NatsInvalidations::new(url))
+            }
+            _ => {
+                info!("invalidation transport: pg_notify (single-server, default)");
+                Arc::new(PgInvalidations::new(pg_url.clone()))
+            }
+        };
         tokio::spawn(async move {
             watch_invalidations(st, invs).await;
         })
