@@ -1,6 +1,6 @@
 ## 0. Gate (do first)
 
-- [ ] 0.1 Run `/opsx:decide` and record the ADR in `design.md`: formally **Adopt Cedar** as the policy engine (vs. keep the hand-rolled comparison / another engine), consistent with `authz-engine-strategy` EXPLORATION.md. Do not start section 2+ until recorded.
+- [x] 0.1 Run `/opsx:decide` and record the ADR in `design.md`: formally **Adopt Cedar** as the policy engine (vs. keep the hand-rolled comparison / another engine), consistent with `authz-engine-strategy` EXPLORATION.md. Do not start section 2+ until recorded. → **Recorded as Decision 0 (approved).**
 
 ## 1. The PDP port (WHAT, in core)
 

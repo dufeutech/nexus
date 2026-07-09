@@ -45,9 +45,22 @@ headers (`RouteRequirements`, sidecar :499-523).
 
 ## Decisions
 
-> The **policy engine** is a correctness-critical concern → `/opsx:decide` records the formal
-> Adopt/Build call (the `authz-engine-strategy` exploration already recommends **Cedar**). The
-> placement/port/schema decisions below are this change's HOW.
+> The **policy engine** is the correctness-critical concern gated at `/opsx:decide`; the formal
+> Adopt call is **Decision 0** below. The placement/port/schema decisions (1–3) are this change's HOW.
+
+### Decision 0 — Policy engine: **Adopt Cedar** (`cedar-policy` 4.10.x)
+
+- **Status**: approved
+- **Why**: Rust-native crate with in-process microsecond eval, policy-as-data with a schema
+  validator that fails closed at load, and formal analyzability — the right fit for a correctness-
+  critical L2 gate on the sidecar hot path, and it makes the hand-rolled comparison declarative.
+- **Considered**: *OPA/Rego* — mature/CNCF but a Go engine, embeddable only via a WASM runtime or a
+  service sidecar (extra footprint, non-native eval on the hot path); *Build (keep hand-rolled)* —
+  no new dependency but re-implements a solved, correctness-critical problem and keeps authz logic
+  scattered — the exact anti-pattern this gate prevents.
+- **Isolation**: the `cedar-policy` dependency lives only in the new `identity-rs/policy-cedar`
+  crate, behind the `PolicyDecisionPoint` port in `identity-rs/core` (Decision 1) — reversible as
+  an adapter swap; `core` and `sidecar` never import the engine.
 
 ### Decision 1 — A new `PolicyDecisionPoint` port in `identity-rs/core`; Cedar adapter in a new `identity-rs/policy-cedar` crate
 
@@ -122,7 +135,8 @@ a deploy artifact.
 
 ## Open Questions
 
-- Resolved at `/opsx:decide`: formally record **Adopt: Cedar** (vs. keep hand-rolled / another engine).
+- ~~Resolved at `/opsx:decide`: formally record **Adopt: Cedar** (vs. keep hand-rolled / another engine).~~
+  **Resolved → Decision 0: Adopt Cedar (`cedar-policy` 4.10.x), approved.**
 - Exact home for the `.cedar` files: in the `policy-cedar` crate (`policies/`) vs. a deploy-config path.
   Leaning: a default set in-crate, overridable by a configured path per environment.
 - Do we keep `authorize_route` as a permanent parity oracle in tests, or delete after cutover? (Leaning
