@@ -153,13 +153,14 @@ while [ "$tries" -lt 45 ]; do
 done
 ok "$PASSED" "gated route now passes (200) without re-authentication (last code: ${LAST:-<none>})"
 
-# The enriched role set is the nexus-authored one — not from the token.
-BODY=$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE$GATE")
-UR=$(hdr_val "$BODY" "X-User-Roles")
-case ",$UR," in
-  *",$ROLE,"*) ok 1 "x-user-roles carries the nexus-authored role \"$ROLE\" (got '${UR:-<none>}')";;
-  *)           ok 0 "x-user-roles carries the nexus-authored role \"$ROLE\" (got '${UR:-<none>}')";;
-esac
+# That the gate flips 403 -> 200 on the grant (and back to 403 on revoke, step 5) is the
+# proof that the nexus-authored global role is live and token-independent. The bare
+# `x-user-roles` mirror that used to echo here was RETIRED by identity-revocation-
+# integrity: coarse roles now ride the SIGNED x-identity-contract token's `roles` claim,
+# minted only for a resolved acting identity (a member/service). This subject is
+# deliberately membership-isolated, so no contract is minted and the claim is not
+# surfaced here — that signed-contract surfacing path is exercised by
+# tenancy-edge-auth-e2e.sh, not this decision-focused suite.
 
 echo "== 5. revoke via authz-admin -> the route stops passing within seconds (spec R3) =="
 RC=$(azcurl -o /dev/null -w '%{http_code}' -X DELETE "$AUTHZ/authz/$USER_ID/roles/$ROLE")
@@ -172,20 +173,17 @@ while [ "$tries" -lt 45 ]; do
 done
 ok "$REVOKED" "gated route refuses again after revocation (last code: ${LAST:-<none>})"
 
-echo "== 6. suspend via authz-admin -> x-user-suspended flips live (spec R3) =="
-# The subject has a Profile now (authoring created it), so an enriched route emits
-# x-user-suspended. It starts false; suspension flips it to true within seconds. The
-# root path is public (no auth-route rule) so the authenticated request is enriched.
-BEFORE=$(hdr_val "$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")" "X-User-Suspended")
+echo "== 6. suspend via authz-admin (authoring surface; suspension rides the signed contract) =="
+# authz-admin authors suspension the same way it authors roles. The bare `x-user-suspended`
+# header that used to flip here was RETIRED by identity-revocation-integrity: suspension now
+# rides the SIGNED x-identity-contract token's `suspended` claim (so a client cannot forge a
+# "not suspended" value), minted only for a resolved acting identity and ENFORCED by the box
+# (out of edge scope — the edge gate is deliberately inert on suspension). This membership-
+# isolated subject establishes no acting identity, so the claim is not surfaced at the edge;
+# assert the authoring succeeds — the live grant/revoke above already prove nexus-authored
+# facts resolve within seconds.
 SC=$(azcurl -o /dev/null -w '%{http_code}' -X POST "$AUTHZ/authz/$USER_ID/suspend")
 ok "$([ "$SC" = "200" ] && echo 1 || echo 0)" "authz-admin suspended the subject (HTTP $SC)"
-SUSPENDED=0; tries=0; SVAL=""
-while [ "$tries" -lt 45 ]; do
-  SVAL=$(hdr_val "$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")" "X-User-Suspended")
-  if [ "$SVAL" = "true" ]; then SUSPENDED=1; break; fi
-  tries=$((tries+1)); sleep 2
-done
-ok "$SUSPENDED" "x-user-suspended flips to true within seconds (was '${BEFORE:-<none>}', now '${SVAL:-<none>}')"
 
 echo
 echo "RESULT: $pass passed, $fail failed"
