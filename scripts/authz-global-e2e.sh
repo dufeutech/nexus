@@ -13,7 +13,9 @@
 #   0. Health-gate ZITADEL discovery, the admin PAT, the control plane, and the
 #      authz-admin surface.
 #   1. Create a machine user + mint a real ZITADEL JWT (the token asserts NO roles).
-#   2. Gate a path on a required GLOBAL role via the control-plane auth-routes API.
+#   2. Gate an ACCOUNT-SCOPED path on a required GLOBAL role via the control-plane
+#      auth-routes API (account-scoped so a non-member is not existence-hidden as 404 —
+#      the global-role gate is what decides, isolating global authz from membership).
 #   3. Deny-by-default: the authenticated subject with NO nexus grant is refused (403),
 #      even though it presents a valid token — a provider-asserted role would confer
 #      nothing (spec R1/R2).
@@ -115,10 +117,18 @@ done
 DOTS=$(printf '%s' "$TOKEN" | tr -cd '.' | wc -c | tr -d ' ')
 ok "$([ "$DOTS" = "2" ] && echo 1 || echo 0)" "minted access token is a JWT (header.payload.signature)"
 
-echo "== 2. gate a route on the GLOBAL role \"$ROLE\" (control-plane auth policy) =="
+echo "== 2. gate an ACCOUNT-SCOPED route on the GLOBAL role \"$ROLE\" (control-plane auth policy) =="
+# `account_scoped:true` is load-bearing here. This subject is authenticated but is NOT a
+# member of workspace `acme`, and on a WORKSPACE-scoped gated route a non-member is hidden
+# behind a 404 (identity-existence-hiding) BEFORE the role gate ever runs — so the test
+# would poll for 403 and only ever see 404. An account-scoped route (the `/me`-style
+# "reachable without a workspace membership" kind) is not membership-gated, so the GLOBAL
+# role requirement is what decides — isolating global authz from membership exactly as this
+# test intends (see the header comment). The role/AAL gate still applies (account_scoped
+# only suppresses the existence-hiding 404, never the 403 requirement check).
 GRC=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/acme/auth-routes" \
-  -d "{\"path_prefix\":\"$GATE\",\"auth_required\":true,\"requires_role\":\"$ROLE\",\"min_aal\":1}")
-ok "$([ "$GRC" = "200" ] && echo 1 || echo 0)" "auth-route requiring role \"$ROLE\" configured (HTTP $GRC)"
+  -d "{\"path_prefix\":\"$GATE\",\"auth_required\":true,\"requires_role\":\"$ROLE\",\"min_aal\":1,\"account_scoped\":true}")
+ok "$([ "$GRC" = "200" ] && echo 1 || echo 0)" "account-scoped auth-route requiring role \"$ROLE\" configured (HTTP $GRC)"
 
 echo "== 3. deny-by-default: authenticated but NO nexus grant -> 403 (spec R1/R2) =="
 # Poll until the gate is live (the control-plane invalidation reaches the router
