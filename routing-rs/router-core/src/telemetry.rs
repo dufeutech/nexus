@@ -83,6 +83,10 @@ impl fmt::Debug for TelemetryGuard {
     }
 }
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "Drop's `pin_drop` is an unstable provided method that cannot be implemented on stable Rust; only `drop` is overridable here"
+)]
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
         if let Some(providers) = self.providers.take() {
@@ -251,12 +255,23 @@ pub fn init(service_name: &str) -> TelemetryGuard {
         match require_environment(&res) {
             Ok(value) => environment = Some(value),
             Err(reason) => {
-                eprintln!(
-                    "FATAL: OTLP telemetry export is enabled but {reason}. Refusing to \
-                     start so no environment-less telemetry is emitted (deploy-time \
-                     fail-closed; see the first-party-telemetry spec)."
-                );
-                std::process::exit(1);
+                // Deploy-time fail-closed: the tracing subscriber is not yet installed, so
+                // stderr is the only channel; a non-zero exit is the intended refusal to
+                // serve. eprintln!/process::exit are the mechanism here, not a lint slip.
+                #[expect(
+                    clippy::print_stderr,
+                    clippy::exit,
+                    clippy::absolute_paths,
+                    reason = "startup fail-closed before the logger exists: stderr + non-zero exit is the intended deploy-time refusal (first-party-telemetry spec)"
+                )]
+                {
+                    eprintln!(
+                        "FATAL: OTLP telemetry export is enabled but {reason}. Refusing to \
+                         start so no environment-less telemetry is emitted (deploy-time \
+                         fail-closed; see the first-party-telemetry spec)."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         match build_providers(res) {

@@ -281,6 +281,10 @@ mod tests {
 
     /// Build a request from raw facts + resolved requirement signals, exactly as the
     /// sidecar translator will.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test builder spans the full gate input matrix (facts + every requirement dimension)"
+    )]
     fn request(
         roles: &[&str],
         entitlements: &[&str],

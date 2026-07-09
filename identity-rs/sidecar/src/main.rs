@@ -980,6 +980,10 @@ fn forbidden_403() -> ProcessingResponse {
 /// to the honest 403 for a missing role. Public (`!auth_required`) and
 /// account-scoped routes are never gated. `account_scoped` defaults false on the
 /// wire, so its absence is the fail-closed (gated) reading.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "a pure decision over four independent, named trusted route/enrichment flags — a struct would not clarify a single-expression predicate"
+)]
 const fn hide_nonmember_as_404(
     auth_required: bool,
     account_scoped: bool,
@@ -1260,7 +1264,7 @@ impl Sidecar {
                 let acting_plan: Option<String> = enriched
                     .acting
                     .as_ref()
-                    .and_then(|_| ws)
+                    .and(ws)
                     .and_then(|w| self.state.resolve_plan(w));
                 // The active signer is a swap-able rotation target (automate-signing-key-
                 // rotation): clone the current one up front so the Arc outlives the borrow
