@@ -274,9 +274,48 @@ services:
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
-      - "${EDGE_PORT:-10000}:10000"   # the only public listener
+      - "${EDGE_PORT:-10000}:10000"   # internal edge listener (fronted by caddy below)
     depends_on:
       tenant-router:
         condition: service_healthy
       identity-sidecar:
         condition: service_healthy
+
+  # --- Customer-domain TLS front tier (custom-domains-tls) ------------------ #
+  # Caddy/CertMagic terminates TLS for UNBOUNDED tenant custom domains, obtains
+  # certs ON DEMAND (gated by tenant-router /authorize), stores them in the SHARED
+  # Postgres cert store, and forwards cleartext to the Envoy edge above. Adopted
+  # infra: it touches nexus only via the `ask` HTTP contract and the PG Storage
+  # interface. Native config is the mounted ./Caddyfile (never baked). See
+  # ../caddy/README.md. This becomes the public listener; envoy:10000 stays up
+  # alongside for the parallel-run / rollback path (migration plan step 5).
+  caddy:
+    image: ${CADDY_REPO:-caddy-front}/caddy:${IMAGE_TAG:-0.1.0}
+    build: { context: ../caddy }
+    restart: unless-stopped
+    environment:
+      # Shared cert store: the SAME external Postgres as the routing store, `routing`
+      # DB, public schema (certmagic_* tables). Direct/session URL — CertMagic locks.
+      CADDY_STORAGE_PG_URL: ${CADDY_STORAGE_PG_URL:?set CADDY_STORAGE_PG_URL to your external Postgres (routing DB)}
+      # The `ask` gate: the co-located tenant-router. Fail-closed (403) for unknown SNI.
+      AUTHORIZE_URL: ${AUTHORIZE_URL:-http://tenant-router:9300/authorize}
+      # Cleartext upstream: the tenant-first Envoy edge (unchanged downstream).
+      EDGE_UPSTREAM: ${EDGE_UPSTREAM:-envoy:10000}
+      # ACME: default to Let's Encrypt STAGING in the lab so verifications never spend
+      # production new-order budget. Point at prod only for real onboarding.
+      ACME_CA_DIR: ${ACME_CA_DIR:-https://acme-staging-v02.api.letsencrypt.org/directory}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL to the ACME account email}
+      # ACME account key injected by-key from OpenBao Transit (D8); leaf certs stay in
+      # Postgres. Provision/inject with ../caddy/acme-account-transit-init.sh.
+      ACME_ACCOUNT_KEY_FILE: ${ACME_ACCOUNT_KEY_FILE:-/run/secrets/acme-account.key}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${TLS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      tenant-router:
+        condition: service_healthy
+      envoy:
+        condition: service_started

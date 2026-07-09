@@ -1,0 +1,28 @@
+# LAB-ONLY: attach the customer-domain TLS front tier to the ALREADY-RUNNING
+# zitadel-lab stack (root docker-compose.yaml) without touching it. Runs as its own
+# compose project on the lab's existing network, reaching postgres / tenant-router /
+# envoy by service name. Uses Caddyfile.lab (internal CA). Tear down with:
+#   docker compose -f deploy/caddy/docker-compose.lab.yaml down
+name: caddy-front-lab
+
+services:
+  caddy:
+    build: { context: . }
+    image: caddy-front/caddy:lab
+    container_name: caddy-front-lab
+    restart: unless-stopped
+    environment:
+      CADDY_STORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/routing?sslmode=disable
+      AUTHORIZE_URL: http://tenant-router:9300/authorize
+      EDGE_UPSTREAM: envoy:10000
+    volumes:
+      - ./Caddyfile.lab:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8443:443"   # avoid clashing with any host :443
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: zitadel-lab_default
+    external: true

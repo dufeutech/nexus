@@ -1,0 +1,40 @@
+# LAB-ONLY variant of ./Caddyfile — exercises the SAME on-demand + `ask` + shared
+# Postgres storage path locally, with Caddy's INTERNAL CA swapped in for Let's Encrypt
+# (LE cannot complete a challenge against localhost, so public issuance is not testable
+# in the lab). Everything else — the ask gate, ECDSA p256, the Postgres Storage adapter
+# over our owned schema (disable_ddl), fail-closed handshake, cert reuse — is identical
+# to production. Do NOT ship this file; production uses ./Caddyfile.
+
+{
+	key_type p256
+
+	# Shared, durable cert store: Postgres behind CertMagic's Storage interface. We own
+	# the schema (0001_certmagic_store.sql), so DDL stays disabled here.
+	storage postgres {
+		connection_string {$CADDY_STORAGE_PG_URL}
+		disable_ddl true
+	}
+
+	# On-demand issuance, authorization-gated by nexus /authorize (fail-closed).
+	on_demand_tls {
+		ask {$AUTHORIZE_URL}
+	}
+
+	# Internal CA as the GLOBAL default issuer (mirrors prod's global `cert_issuer
+	# acme`), permitted to sign on demand — stands in for LE locally. Declaring the
+	# issuer globally (not in the catch-all `https://` site block) avoids the
+	# default-policy conflict Caddy raises for a hostless site key.
+	cert_issuer internal {
+		on_demand
+	}
+
+	# Lab CA: don't try to install a trust root into the container's system store.
+	skip_install_trust
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy {$EDGE_UPSTREAM}
+}

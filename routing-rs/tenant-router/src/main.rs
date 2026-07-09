@@ -129,6 +129,13 @@ struct AppState {
     l1: Cache<String, Arc<RoutingDecision>>,
     /// L2: OPTIONAL shared tier (RFC decision 9) — pure optimization.
     l2: Option<Arc<dyn SharedCache>>,
+    /// Bounded negative-authorization cache for the on-demand-TLS `ask`
+    /// (certificate-issuance-authorization). A host the gate refuses is
+    /// remembered here for a short TTL so a flood of unknown SNIs is served the
+    /// remembered refusal without re-hitting the store or the CA. `max_capacity`
+    /// bounds the memory a flood of DISTINCT unknown hosts can occupy (LRU
+    /// eviction), so the refusal memory cannot itself become the DoS.
+    neg: Cache<String, ()>,
     store: Arc<dyn RoutingStore>,
     l2_ttl: u64,
     ready: Arc<AtomicBool>,
@@ -792,7 +799,7 @@ async fn run_invalidations(state: &AppState, invs: &dyn Invalidations) -> Result
 // localhost API: resolve debug (admin), health, metrics.
 // --------------------------------------------------------------------------- //
 mod api {
-    use super::{AppState, KeyValue, Ordering, METRICS};
+    use super::{normalize_host, AppState, KeyValue, Ordering, METRICS};
     use std::env::var;
     use std::time::Duration;
     use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -856,8 +863,25 @@ mod api {
     async fn authorize(State(s): State<AppState>, Query(q): Query<AuthorizeQuery>) -> impl IntoResponse {
         let domain = q.domain.unwrap_or_default();
         // Fail closed until the plane is ready: deny rather than authorize a cert
-        // for a host we cannot yet evaluate.
+        // for a host we cannot yet evaluate. (A not-ready deny is global, not
+        // host-specific, so it is NOT remembered in the negative cache.)
         if domain.is_empty() || !s.ready.load(Ordering::Relaxed) {
+            METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
+            return StatusCode::FORBIDDEN;
+        }
+        // Key on the SAME canonical host the matcher uses, so the negative cache
+        // dedupes SNI spellings exactly as routing does; a host normalize refuses
+        // outright is denied without touching the cache.
+        let key = normalize_host(&domain);
+        if key.is_empty() {
+            METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
+            return StatusCode::FORBIDDEN;
+        }
+        // Remembered refusal (certificate-issuance-authorization): a recently
+        // refused host is denied without re-consulting the store or the CA, so
+        // repeated connections for the same unknown SNI — and a flood of them —
+        // cannot drive unbounded issuance work.
+        if s.neg.get(&key).await.is_some() {
             METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
             return StatusCode::FORBIDDEN;
         }
@@ -865,6 +889,11 @@ mod api {
             METRICS.authorize.add(1, &[KeyValue::new("result", "allow")]);
             StatusCode::OK
         } else {
+            // Refused: remember it for a bounded interval (TTL + capacity set at
+            // construction) so the next connection for this host is served from
+            // memory. A host that later becomes verified is re-evaluated once the
+            // entry expires — the gate never caches a *positive*.
+            s.neg.insert(key, ()).await;
             METRICS.authorize.add(1, &[KeyValue::new("result", "deny")]);
             StatusCode::FORBIDDEN
         }
@@ -947,6 +976,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ttl: u64 = env("ROUTING_CACHE_TTL", "600").parse().unwrap_or(600);
     let l2_ttl: u64 = env("ROUTING_L2_TTL", "600").parse().unwrap_or(600);
     let capacity: u64 = env("ROUTING_CACHE_CAPACITY", "200000").parse().unwrap_or(200_000);
+    // Negative-authorization cache for the `ask` gate. TTL is short so a host that
+    // becomes verified is re-evaluated promptly; capacity bounds the memory a
+    // flood of distinct unknown SNIs can pin (LRU eviction past the bound).
+    let neg_ttl: u64 = env("AUTHORIZE_NEG_TTL", "30").parse().unwrap_or(30);
+    let neg_capacity: u64 = env("AUTHORIZE_NEG_CAPACITY", "100000").parse().unwrap_or(100_000);
 
     let store: Arc<dyn RoutingStore> = loop {
         match PgRoutingStore::connect(&pg_read_url).await {
@@ -985,6 +1019,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .time_to_live(Duration::from_secs(ttl))
             .build(),
         l2,
+        neg: Cache::builder()
+            .max_capacity(neg_capacity)
+            .time_to_live(Duration::from_secs(neg_ttl))
+            .build(),
         store,
         l2_ttl,
         ready: Arc::new(AtomicBool::new(false)),
@@ -1102,7 +1140,7 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet};
     use std::env::var;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use async_trait::async_trait;
@@ -1362,6 +1400,9 @@ mod tests {
     struct FakeStore {
         /// verified `(domain, is_wildcard)` → `workspace_id`.
         domains: HashMap<(String, bool), String>,
+        /// Count of `lookup_domain` calls — lets the negative-cache test assert that
+        /// a repeat flood collapses to a single store evaluation.
+        lookups: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1371,6 +1412,7 @@ mod tests {
             domain: &str,
             wildcard: bool,
         ) -> Result<Option<String>, BoxError> {
+            let _ = self.lookups.fetch_add(1, Ordering::Relaxed);
             Ok(self.domains.get(&(domain.to_owned(), wildcard)).cloned())
         }
 
@@ -1488,6 +1530,7 @@ mod tests {
         AppState {
             l1: Cache::builder().max_capacity(1024).build(),
             l2: None,
+            neg: Cache::builder().max_capacity(1024).build(),
             store: Arc::new(store),
             l2_ttl: 60,
             ready: Arc::new(AtomicBool::new(true)),
@@ -1513,7 +1556,7 @@ mod tests {
             (("shop.example.com".to_owned(), false), "ws_exact".to_owned()),
             (("example.com".to_owned(), true), "ws_wild".to_owned()),
         ]);
-        let state = state_over(FakeStore { domains });
+        let state = state_over(FakeStore { domains, lookups: Arc::new(AtomicUsize::new(0)) });
 
         // (host, should_resolve): the router routes exactly these, so the cert gate
         // must authorize exactly these.
@@ -1541,6 +1584,51 @@ mod tests {
                 routed == StatusCode::OK,
                 "/authorize and the router must agree on {host}",
             );
+        }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // certificate-issuance-authorization: refusals are remembered to bound
+    // issuance work under load. A flood of connections for the same unknown SNI
+    // must collapse to ONE store evaluation — the rest are served the cached
+    // refusal — and must never authorize (no CA order is ever placed for it).
+    // ----------------------------------------------------------------------- //
+    #[tokio::test]
+    async fn ask_negative_cache_collapses_repeat_unknown_host_flood() {
+        // Empty store → every host is unknown and fails closed.
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let state = state_over(FakeStore { domains: HashMap::new(), lookups: lookups.clone() });
+
+        // Hammer the gate with the SAME unknown host many times.
+        for _ in 0..50 {
+            let status = get_status(&state, "/authorize?domain=attacker.example.com").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "unknown host must fail closed every time");
+        }
+
+        // Only the FIRST connection reached the store; every later one was served
+        // the remembered refusal. `resolve` makes at most two lookups per
+        // evaluation (exact, then wildcard-parent), so a single evaluation is
+        // ≤ 2 store lookups — proving the flood did not re-evaluate per connection.
+        let n = lookups.load(Ordering::Relaxed);
+        assert!(
+            n <= 2,
+            "negative cache must collapse a repeat flood to one evaluation; saw {n} store lookups",
+        );
+    }
+
+    /// A flood across MANY distinct unknown hosts still authorizes none of them —
+    /// the gate places zero CA orders for unapproved hostnames, so it cannot
+    /// consume the issuance budget reserved for approved ones.
+    #[tokio::test]
+    async fn ask_distinct_unknown_host_flood_authorizes_nothing() {
+        let state = state_over(FakeStore {
+            domains: HashMap::new(),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        });
+        for i in 0..200 {
+            let host = format!("junk-{i}.example.com");
+            let status = get_status(&state, &format!("/authorize?domain={host}")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "distinct unknown host {host} must be refused");
         }
     }
 }

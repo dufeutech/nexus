@@ -1,0 +1,71 @@
+# Customer-domain TLS front tier (capabilities: on-demand-certificate-lifecycle,
+# certificate-store-durability, certificate-issuance-authorization).
+#
+# Caddy/CertMagic terminates TLS for UNBOUNDED, self-service tenant custom domains
+# ("bring-your-own-domain") and forwards cleartext to the existing identity/authz
+# Envoy edge. It is ADOPTED infra (design D1): it enters the system only through the
+# `ask` HTTP contract and the Postgres Storage interface — nexus core has no
+# compile-time dependency on it. This file is NATIVE config loaded from disk (mounted
+# read-only), never inlined into application code (the config-adapter discipline).
+#
+# Every value is env-driven so the SAME file serves compose and Helm. See
+# deploy/caddy/README.md for the build (xcaddy), the env contract, ACME account-key
+# injection from OpenBao, and the issuer-list seam.
+
+{
+	# --- Keys: ECDSA P-256, locked in from day one (design D5) ------------------ #
+	# ECDSA gives cheaper handshakes at every scale; changing key type later means
+	# re-issuing every certificate. p256 == ECDSA P-256.
+	key_type p256
+
+	# --- Issuer list: Let's Encrypt now; second issuer is CONFIG-ONLY (D4) ------ #
+	# ARI (ACME Renewal Information) is automatic on Caddy 2.8+ for issuers that
+	# support it (Let's Encrypt does): renewals ride LE's ARI rate-limit exemption,
+	# so steady-state renewal of a large population is unthrottled — the governed
+	# quantity is net-new onboarding. Do NOT disable ARI.
+	#
+	# The account EMAIL and the account KEY are custodied outside this file: the key
+	# comes from OpenBao Transit, seeded into the ACME account before boot (D8; see
+	# README "ACME account key"). Adding a fallback issuer later (e.g. ZeroSSL with
+	# `eab`) is a second `cert_issuer` line here and nothing else — issuers are tried
+	# in the order defined.
+	cert_issuer acme {
+		dir {$ACME_CA_DIR}
+		email {$ACME_EMAIL}
+	}
+
+	# --- Shared, durable cert store: Postgres behind CertMagic's Storage (D3) --- #
+	# Every Caddy instance pointed at the same Postgres forms ONE cluster: CertMagic
+	# coordinates issuance (single-flight via the certmagic_locks table) and shares
+	# certs/keys/OCSP staples across all nodes. "Any node serves any domain" and
+	# "cert survives node loss" fall out of this. We OWN the schema
+	# (routing-rs/store-postgres/migrations/0001_certmagic_store.sql), so DDL is
+	# disabled here and the DB role is DML-only.
+	storage postgres {
+		connection_string {$CADDY_STORAGE_PG_URL}
+		disable_ddl true
+	}
+
+	# --- On-demand issuance, authorization-gated (D6) --------------------------- #
+	# Before issuing for an SNI, Caddy GETs {ask}?domain=<sni> and issues IFF the
+	# response is 2xx. nexus /authorize is fail-closed (403 for unknown / unverified
+	# / not-ready) and negative-caches refusals, so this is safe to expose to
+	# arbitrary SNI: an unknown-hostname flood places ZERO CA orders. Point it at the
+	# LOCAL tenant-router co-located on every edge host (answers in ~ms from cache).
+	on_demand_tls {
+		ask {$AUTHORIZE_URL}
+	}
+}
+
+# The tenant-domain listener. `on_demand` ENABLES on-demand issuance for this site
+# (the global block only configures it). A hostname the `ask` gate refuses — or one
+# with no valid stored cert while the issuer is down — fails the handshake CLOSED:
+# Caddy presents no default/self-signed/catch-all certificate.
+https:// {
+	tls {
+		on_demand
+	}
+	# Forward cleartext to the existing tenant-first Envoy edge. TLS terminates here;
+	# identity enrichment, the auth gate, and tenant resolution are UNCHANGED downstream.
+	reverse_proxy {$EDGE_UPSTREAM}
+}
