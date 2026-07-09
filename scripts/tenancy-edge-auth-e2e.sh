@@ -30,6 +30,14 @@ CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
 # unquoted $CPAUTH-style expansion would word-split "Bearer <token>" into two
 # args and silently send an invalid header (unauthenticated 401s).
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+# authz-admin surface (identity-revocation-integrity): authors GLOBAL facts (roles,
+# suspension) — host 9303 -> container 9300 in the lab compose. Used in step 4 to prove
+# those facts surface in the SIGNED contract's claims.
+AUTHZ=http://localhost:9303
+IDENTITY_ADMIN_TOKEN="${IDENTITY_ADMIN_TOKEN:-zitadel-lab-dev-token}"
+azcurl() { curl -s -H "authorization: Bearer $IDENTITY_ADMIN_TOKEN" "$@"; }
+GROLE=billing   # a GLOBAL role, distinct from the membership role (admin), so it can only
+                # come from the nexus grant — never from the seeded workspace membership.
 pass=0; fail=0
 
 ok()  { if [ "$1" = "1" ]; then echo "  PASS  $2"; pass=$((pass+1)); else echo "  FAIL  $2"; fail=$((fail+1)); fi; }
@@ -72,6 +80,10 @@ USER_ID=$(printf '%s' "$CREATE" | json_get userId)
 cleanup() {
   curl -sf -X DELETE "$ZITADEL/management/v1/users/$USER_ID" -H "Authorization: Bearer $PAT" >/dev/null 2>&1
   cpcurl $JSON -X DELETE "$CP/workspaces/acme/members/$USER_ID" >/dev/null 2>&1
+  # reset the global facts authored in step 4 (best-effort; the per-run-unique subject
+  # makes any lingering inert row harmless).
+  azcurl -X DELETE "$AUTHZ/authz/$USER_ID/roles/$GROLE" >/dev/null 2>&1
+  azcurl -X POST "$AUTHZ/authz/$USER_ID/reactivate" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -146,7 +158,47 @@ ok "$([ "$UT" = "staff" ] && echo 1 || echo 0)" "x-user-type equals the seeded m
 UR=$(hdr_val "$BODY" "X-User-Role")
 ok "$([ "$UR" = "admin" ] && echo 1 || echo 0)" "x-user-role equals the seeded membership role (got '${UR:-<none>}')"
 
-echo "== 4. the scope is MEMBERSHIP-derived, not token-derived: revoke and it disappears =="
+echo "== 4. the SIGNED contract carries the nexus-authored GLOBAL facts (roles + suspended) =="
+# identity-revocation-integrity moved the coarse global roles + the suspension flag OFF the
+# (retired) bare x-user-roles / x-user-suspended headers and INTO the signed
+# x-identity-contract token's `roles` / `suspended` claims — over the signature, so a box
+# trusts they are nexus-authored, not client-forged. A member resolves an acting identity, so
+# a contract IS minted here; author a GLOBAL role + suspend via authz-admin and confirm both
+# surface in the signed claims within seconds (the authz write invalidates the sidecar's
+# profile cache over the LISTEN/NOTIFY feed). The deny-by-default DECISION path is
+# authz-global-e2e.sh. Meaningful only with signing enabled (CI mounts a test key).
+contract_now() { hdr_val "$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")" "X-Identity-Contract"; }
+if [ -n "$(contract_now)" ]; then
+  # decoded payload of the contract minted for the member's current request to `/`
+  contract_payload() { b64url_decode "$(contract_now | cut -d. -f2)"; }
+
+  GC=$(azcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$AUTHZ/authz/$USER_ID/roles" -d "{\"role\":\"$GROLE\"}")
+  ok "$([ "$GC" = "200" ] && echo 1 || echo 0)" "authz-admin authored the global role \"$GROLE\" (HTTP $GC)"
+  ROLED=0; tries=0
+  while [ "$tries" -lt 45 ]; do
+    contract_payload | grep -q "\"$GROLE\"" && { ROLED=1; break; }
+    tries=$((tries+1)); sleep 2
+  done
+  ok "$ROLED" "signed contract's roles claim carries the nexus-authored role \"$GROLE\" within seconds"
+
+  # profile now resolved -> suspension is a signed, PRESENT claim (false); a box must read
+  # absence as "unknown", never false, so surfacing false explicitly matters.
+  ok "$(contract_payload | grep -q '"suspended":false' && echo 1 || echo 0)" \
+    "signed contract carries suspended=false for a resolved, not-suspended member"
+
+  SC=$(azcurl -o /dev/null -w '%{http_code}' -X POST "$AUTHZ/authz/$USER_ID/suspend")
+  ok "$([ "$SC" = "200" ] && echo 1 || echo 0)" "authz-admin suspended the subject (HTTP $SC)"
+  SUSP=0; tries=0
+  while [ "$tries" -lt 45 ]; do
+    contract_payload | grep -q '"suspended":true' && { SUSP=1; break; }
+    tries=$((tries+1)); sleep 2
+  done
+  ok "$SUSP" "signed contract's suspended claim flips to true within seconds"
+else
+  ok 1 "signing disabled -> global-fact claims not surfaced (no contract minted)"
+fi
+
+echo "== 5. the scope is MEMBERSHIP-derived, not token-derived: revoke and it disappears =="
 cpcurl $JSON -X DELETE "$CP/workspaces/acme/members/$USER_ID" >/dev/null 2>&1
 REVOKED=0; tries=0
 while [ "$tries" -lt 45 ]; do
