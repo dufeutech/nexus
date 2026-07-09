@@ -62,12 +62,18 @@ token minted **only** for a resolved identity (§1a-bis).
 | `x-user-on-behalf-of` | **Only for an `apikey` principal:** the **creating user** the key acts for (customer-api-keys). Authored alongside the acting scope; **absent** for a human/service. | id string | Audit / attribution to the human behind the automation. |
 | `x-user-type` | Acting **principal kind / relationship**. `staff`/`customer` for a human (and for an **api-key**, the creator's relationship in the acting workspace); **`service`** for a core platform service (normalized-principal). | `staff` \| `customer` \| `service` | Acting-scope decisions; branch the write door on `service`. |
 | `x-user-role` | Workspace-scoped role (not global). **Absent for a `service`** (a service has no workspace role). | role string | Acting-scope decisions. |
-| `x-user-roles` | Coarse global roles, **nexus-authored** (from the live Profile via the resolver — never the token or the OIDC provider; `nexus-native-authorization`). | comma-joined | Enrichment. |
-| `x-user-entitlements` | Entitlements, nexus-authored (live Profile). | comma-joined | Feature checks. |
-| `x-user-suspended` | Suspension flag, nexus-authored (always from live Profile — revocation-sensitive, effective within seconds). | `true` \| `false` | Hard block. |
 | `x-user-enriched-by` | Provenance marker. | `identity-sidecar-rs` \| `identity-sidecar-rs:miss` | Diagnostics. |
 | `x-auth-anonymous` | Is the caller anonymous. | `true` \| `false` | Branch on identity. |
 | `x-auth-method` | Auth method used. | `bearer` \| `none` | Diagnostics / step-up. |
+
+> **Retired bare headers — read the signed contract instead (identity-revocation-integrity).**
+> The coarse-role and revocation-sensitive signals that used to ride bare, unsigned headers —
+> **`x-user-roles`**, **`x-user-entitlements`**, and **`x-user-suspended`** — are **no longer
+> emitted**. They now ride **only** the signed `x-identity-contract` (claims `roles`,
+> `entitlements`, `suspended`; see §1a-bis step 4), so a client or on-path party can no longer
+> forge them. Your box **MUST** read entitlement and suspension from the **verified** contract
+> claim, never from a header. Any client-supplied copy of these names is stripped and will never
+> reach you.
 
 ### 1a-bis. Verifying the signed `x-identity-contract` (identity-contract-signing)
 
@@ -86,13 +92,27 @@ token minted **only** for a resolved identity (§1a-bis).
      short-lived and minted per request.
    - `ctr` — the contract version (replaces the old `vN` string). Reject a version you do not
      understand — this is the drift tripwire for the whole `x-user-*`/`x-workspace-*` shape.
-4. **Read identity from the verified claims** if you wish: `sub`, `workspace_id`, `principal_kind`,
-   `role`, `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-type` / `x-user-role` /
-   `x-user-roles`). For an **`apikey`** principal the claims additionally carry **`on_behalf_of`** (the
-   creating user) — present only for `apikey`, mirroring `x-user-on-behalf-of`. The `plan` claim
-   carries the acting workspace's **plan tier** (`workspace-plan-tier`), mirroring `x-workspace-plan`
-   and signed alongside the rest of the identity — **omitted** (not defaulted) when no plan resolves,
-   so treat an absent plan as **not-provisioned**.
+4. **Read identity from the verified claims:** `sub`, `workspace_id`, `principal_kind`, `role`,
+   `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-type` / `x-user-role`; the bare
+   `x-user-roles` mirror is **retired**, so `roles` is read from the claim only). For an **`apikey`**
+   principal the claims additionally carry **`on_behalf_of`** (the creating user) — present only for
+   `apikey`, mirroring `x-user-on-behalf-of`. The `plan` claim carries the acting workspace's **plan
+   tier** (`workspace-plan-tier`), mirroring `x-workspace-plan` and signed alongside the rest of the
+   identity — **omitted** (not defaulted) when no plan resolves, so treat an absent plan as
+   **not-provisioned**.
+   - **`entitlements`** (comma-free JSON array) and **`suspended`** (bool) — the revocation-sensitive
+     signals (identity-revocation-integrity). They are **signed**, so you can trust they are
+     nexus-authored and unforged. Both are **omitted when nexus has no resolved profile** for the
+     caller (and for a `service` principal, who is not a suspendable user): treat an **absent
+     `suspended` as _unknown_ and fail safe** — **never** as `false`. A present `suspended: true`
+     **MUST** hard-block the caller.
+5. **Freshness — do NOT cache the contract past `exp` (identity-revocation-integrity).** The
+   `entitlements`/`suspended` claims are as fresh as the token: nexus resolves them live and mints a
+   new contract per request, so `exp` is the freshness bound. Caching a verified contract (or its
+   `suspended`/`entitlements` claims) **beyond its `exp`** would let a just-suspended user keep acting
+   on a stale "not suspended" — so **honor a claim only within its own `exp`** and re-read the next
+   request's contract. The TTL (`CONTRACT_TOKEN_TTL_SECONDS`, ~60s) is the maximum staleness; lower it
+   at nexus if you need a tighter revocation bound.
 
 **Minted only for a resolved identity.** nexus signs the token **only** when the request is
 authenticated *and* the caller resolved to an **authority** — a workspace membership (user) or a

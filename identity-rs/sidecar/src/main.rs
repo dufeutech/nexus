@@ -651,22 +651,23 @@ fn enrich_response(
         header("x-auth-method", if authenticated { "bearer" } else { "none" }),
         header("x-user-id", sub),
     ];
-    // Roles are NEXUS-AUTHORED (spec R1): sourced ONLY from the live Profile (the
-    // AuthzResolver's backing), NEVER the token — so a grant/revoke takes effect
-    // within seconds without a token refresh, and a provider-asserted role confers
-    // nothing. Absent Profile → empty roles (deny-by-default). Always authored
-    // (OverwriteIfExistsOrAdd), so a client copy is overwritten. `x-user-roles-source`
-    // is retired — the source is always nexus now.
-    let roles = profile.as_ref().map_or_else(String::new, |p| p.roles.join(","));
-    set.push(header("x-user-roles", &roles));
-    // Defense-in-depth strip (RFC C3, belt-and-suspenders vs. the edge strip):
-    // the sidecar removes any client-supplied identity header it does NOT itself
-    // author on THIS path, so a forged value can't reach the backend even if the
-    // sidecar is somehow reached without the stripping edge in front. Headers we
-    // DO set below are overwritten authoritatively (OverwriteIfExistsOrAdd), so
-    // they are deliberately kept OUT of this remove list — that keeps the result
-    // independent of Envoy's set-vs-remove apply order (a header in both lists
-    // could otherwise be wiped after we set it).
+    // Roles are NEXUS-AUTHORED (spec R1) and now ride ONLY the signed contract's `roles`
+    // claim (identity-revocation-integrity): the bare `x-user-roles` mirror is RETIRED, so
+    // there is no unsigned twin a client or on-path party could forge. The sidecar always
+    // STRIPS any client-supplied `x-user-roles` (below) — a box reads roles from the
+    // verified contract, never a header. (`x-user-roles-source` was already retired.)
+    // COARSE DEFENSE-IN-DEPTH strip (edge-trusted-header-strip, design D2): the
+    // AUTHORITATIVE default-drop of the trusted family is a single-sourced PREFIX drop
+    // in the tenant-router ext_proc (`routing-rs`, `trusted_family_strip`), the first
+    // component every box-bound request crosses. This exact-name denylist is a
+    // belt-and-suspenders re-strip in case the sidecar is somehow reached without the
+    // tenant-router/edge in front — it is NOT the load-bearing control, so its
+    // completeness is no longer a maintenance invariant. It removes any client-supplied
+    // identity header this filter does NOT itself author on THIS path. Headers we DO set
+    // below are overwritten authoritatively (OverwriteIfExistsOrAdd), so they are
+    // deliberately kept OUT of this remove list — keeping the result independent of
+    // Envoy's set-vs-remove apply order (a header in both lists could otherwise be wiped
+    // after we set it).
     // `x-auth-required` is consumed by jwt_authn upstream and never authored
     // here, so it is always stripped before forwarding to the backend. The
     // phase-2 requirement signals are consumed by THIS filter's gate and are
@@ -676,6 +677,13 @@ fn enrich_response(
         HDR_REQUIRES_ROLE.to_owned(),
         HDR_REQUIRES_ENTITLEMENT.to_owned(),
         HDR_MIN_AAL.to_owned(),
+        // The revocation-sensitive signals + coarse roles now ride ONLY the signed
+        // contract (identity-revocation-integrity). Their bare header mirrors are retired
+        // and ALWAYS stripped from client input on every path, so no unsigned twin can be
+        // forged and a box only ever trusts the value carried over the signature.
+        "x-user-roles".to_owned(),
+        "x-user-entitlements".to_owned(),
+        "x-user-suspended".to_owned(),
     ];
     // The nexus-owned acting scope (workspace-tenancy 3.2). Authored ONLY from a
     // LIVE membership check of the resolved workspace against the Profile — never
@@ -685,8 +693,9 @@ fn enrich_response(
     // let an unauthorized acting scope reach the backend (fail-closed; the
     // reject-vs-anonymous-vs-signup policy for a non-member is the backend's, per
     // the surface). `x-user-type`/`x-user-role` are the matched relationship's, not
-    // a global role; the plural `x-user-roles` above stays the coarse token/profile
-    // roles. For a SERVICE (Platform authority, normalized-principal task 4.4) the
+    // a global role; the coarse global roles now ride ONLY the signed contract's
+    // `roles` claim (the bare `x-user-roles` mirror is retired, stripped above). For a
+    // SERVICE (Platform authority, normalized-principal task 4.4) the
     // acting `x-user-type` is `service` — the principal kind the box branches its write
     // door on — and there is NO workspace role, so `x-user-role` is stripped.
     match acting {
@@ -756,6 +765,12 @@ fn enrich_response(
                     permissions: &[],
                     // Same nexus-resolved plan as the header — omitted when unresolved.
                     plan,
+                    // identity-revocation-integrity: the revocation-sensitive signals ride
+                    // the signature, sourced from the SAME per-request Profile that used to
+                    // author the bare `x-user-entitlements`/`x-user-suspended` headers.
+                    // Omitted when the profile is unresolved so absence reads as "unknown".
+                    entitlements: profile.as_ref().map(|p| p.entitlements.as_slice()),
+                    suspended: profile.as_ref().map(|p| p.is_suspended),
                     now: sign_ctx.now,
                 },
                 Acting::Platform { workspace_id, permissions } => signer::MintInput {
@@ -769,6 +784,10 @@ fn enrich_response(
                     roles: &[],
                     permissions,
                     plan,
+                    // A service principal is not a suspendable user and carries no
+                    // entitlement set — omit both so the box reads them as N/A, not `false`.
+                    entitlements: None,
+                    suspended: None,
                     now: sign_ctx.now,
                 },
             };
@@ -790,24 +809,17 @@ fn enrich_response(
     // an authorization input, so it is NEVER authored and ALWAYS stripped from
     // client input, on every path.
     remove.push("x-user-org".to_owned());
-    if let Some(p) = &profile {
-        set.push(header("x-user-entitlements", &p.entitlements.join(",")));
-        // Revocation-sensitive: ALWAYS from the live Profile, never the token,
-        // so a suspension takes effect within seconds without a token refresh.
-        set.push(header(
-            "x-user-suspended",
-            if p.is_suspended { "true" } else { "false" },
-        ));
-        set.push(header("x-user-enriched-by", "identity-sidecar-rs"));
-    } else {
-        // No profile: this response does NOT author entitlements/suspended, so
-        // strip any client copies. Suspension especially — an absent
-        // x-user-suspended must mean "unknown", never a client-asserted "false"
-        // that would slip a suspended user through.
-        remove.push("x-user-entitlements".to_owned());
-        remove.push("x-user-suspended".to_owned());
-        set.push(header("x-user-enriched-by", "identity-sidecar-rs:miss"));
-    }
+    // The revocation-sensitive signals (entitlements/suspended) are NO LONGER emitted as
+    // bare headers — they ride the signed contract's `entitlements`/`suspended` claims
+    // (identity-revocation-integrity), minted above from this SAME `profile`. Their bare
+    // twins are unconditionally stripped (see the `remove` seed), so a box can only trust
+    // the nexus-authored, unforgeable value carried over the signature, and the
+    // profile-miss path omits the signed claim entirely (absence reads as "unknown",
+    // never a client-asserted "false"). We keep only the enrichment marker.
+    set.push(header(
+        "x-user-enriched-by",
+        if profile.is_some() { "identity-sidecar-rs" } else { "identity-sidecar-rs:miss" },
+    ));
     let common = CommonResponse {
         header_mutation: Some(HeaderMutation {
             set_headers: set,
@@ -1971,13 +1983,23 @@ mod tests {
         );
         let r_some = remove_headers(&some);
         assert!(r_some.contains(&"x-auth-required".to_owned()));
-        // On the profile-present path the sidecar AUTHORS entitlements/suspended, so
-        // it must NOT also remove them (that would risk wiping the value it just set,
-        // depending on Envoy's apply order).
-        assert!(!r_some.contains(&"x-user-suspended".to_owned()));
+        // identity-revocation-integrity: the bare entitlements/suspended/roles mirrors are
+        // RETIRED — those signals ride the signed contract now — so their client copies are
+        // ALWAYS stripped, even on the profile-present path, and never re-emitted as headers.
+        for h in ["x-user-suspended", "x-user-entitlements", "x-user-roles"] {
+            assert!(r_some.contains(&h.to_owned()), "retired mirror {h} must always be stripped");
+            assert!(!set_headers(&some).contains_key(h), "retired mirror {h} must not be emitted");
+        }
         // `x-user-org` is retired: never authored, so ALWAYS stripped — even on the
         // profile-present path.
         assert!(r_some.contains(&"x-user-org".to_owned()));
+        // edge-trusted-header-strip: the allowlisted client hint `x-requested-workspace`
+        // is NOT a trusted-family header — the sidecar must never strip it (the
+        // authoritative prefix drop in the tenant-router likewise preserves it).
+        assert!(
+            !r_some.contains(&"x-requested-workspace".to_owned()),
+            "the allowlisted client hint must survive the sidecar strip",
+        );
         // No acting workspace resolved -> no membership -> the acting scope is
         // stripped, never asserted.
         for h in ["x-workspace-id", "x-user-type", "x-user-role"] {
@@ -2017,18 +2039,39 @@ mod tests {
     }
 
     #[test]
-    fn enrich_emits_live_suspension_only_from_profile() {
+    fn enrich_signs_live_suspension_from_profile_and_retires_the_bare_header() {
+        // identity-revocation-integrity: the revocation gate rides the SIGNED contract,
+        // sourced live from the Profile — never a bare header a client could forge. A
+        // suspended, resolved member's contract carries suspended=true (and its
+        // entitlements), while the bare x-user-suspended/x-user-entitlements are RETIRED
+        // (never emitted, always stripped).
+        let signer = test_signer();
+        let ctx = SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() };
         let suspended = Arc::new(Profile {
             sub: "u1".into(),
             is_suspended: true,
+            entitlements: vec!["beta".into()],
+            memberships: vec![Membership {
+                workspace_id: "ws-1".into(),
+                member_type: MemberType::Staff,
+                role: "admin".into(),
+                entitlements: Vec::new(),
+            }],
             ..Default::default()
         });
-        let h = set_headers(&enrich_response("u1", Some(suspended), true, None));
-        assert_eq!(h.get("x-user-suspended").map(String::as_str), Some("true"));
+        let resp = enrich_signed("u1", Some(suspended), true, Some("ws-1"), &ctx);
+        let h = set_headers(&resp);
         assert_eq!(h.get("x-auth-anonymous").map(String::as_str), Some("false"));
+        // The bare mirrors are gone; a box reads the gate from the verified claim only.
+        assert!(!h.contains_key("x-user-suspended"), "the bare suspension header is retired");
+        assert!(!h.contains_key("x-user-entitlements"), "the bare entitlements header is retired");
+        let token = h.get("x-identity-contract").expect("a resolved member carries a contract");
+        let claims = decode_contract(token);
+        assert_eq!(claims.suspended, Some(true), "the suspension rides the signed contract");
+        assert_eq!(claims.entitlements, Some(vec!["beta".to_owned()]), "entitlements ride it too");
 
-        // A profile MISS (no row) must NOT assert a suspension either way — the
-        // header is simply absent, which is exactly why a store outage that
+        // A profile MISS (no row) must NOT assert a suspension either way — the signed
+        // claim is OMITTED (absence == unknown), which is exactly why a store outage that
         // collapses to "miss" is dangerous and must instead fail closed.
         let h_miss = set_headers(&enrich_response("u1", None, true, None));
         assert!(!h_miss.contains_key("x-user-suspended"));
@@ -2660,6 +2703,8 @@ mod tests {
                 roles: &["ops".to_owned()],
                 permissions: &[],
                 plan: Some("pro"),
+                entitlements: Some(&["beta".to_owned()]),
+                suspended: Some(false),
                 now: now_secs(),
             })
             .expect("mint");
@@ -2845,16 +2890,23 @@ mod tests {
     }
 
     /// Spec R1 / task 8.1: a role-claiming token confers nothing. Roles are
-    /// nexus-authored only — sourced from the Profile, never the token. A subject
-    /// nexus holds no roles for gets an empty `x-user-roles` and is refused a
-    /// role-gated route; even a Profile role that isn't the required one denies.
-    /// (Structurally there is NO token→roles path: `extract_identity` reads no roles
-    /// claim and `enrich_response`/`enforce_route_requirements` take no token roles.)
+    /// nexus-authored only — sourced from the Profile, never the token — and now ride
+    /// ONLY the signed contract's `roles` claim (identity-revocation-integrity): the bare
+    /// `x-user-roles` mirror is retired, so there is no forgeable header twin. A subject
+    /// nexus holds no roles for is refused a role-gated route; even a Profile role that
+    /// isn't the required one denies. (Structurally there is NO token→roles path:
+    /// `extract_identity` reads no roles claim and `enforce_route_requirements` takes none.)
     #[test]
     fn role_claiming_token_confers_nothing() {
-        // No nexus Profile → deny-by-default: empty roles header, role route refused.
+        // No nexus Profile → deny-by-default. The bare roles mirror is retired: never
+        // emitted, and any client-supplied copy is stripped, so a role-claiming header
+        // confers nothing structurally. The role route is refused on the nexus-authored set.
         let miss = enrich_response("u1", None, true, None);
-        assert_eq!(set_headers(&miss).get("x-user-roles").map(String::as_str), Some(""));
+        assert!(!set_headers(&miss).contains_key("x-user-roles"), "the bare roles mirror is retired");
+        assert!(
+            remove_headers(&miss).contains(&"x-user-roles".to_owned()),
+            "a client-supplied roles header is stripped",
+        );
         assert_eq!(
             enforce_route_requirements(&reqs(Some("admin"), None, None), None, true, &levels()),
             Err("role"),
@@ -2865,9 +2917,9 @@ mod tests {
             enforce_route_requirements(&reqs(Some("admin"), None, None), Some(&viewer), true, &levels()),
             Err("role"),
         );
-        // The emitted roles are exactly the nexus-authored set, nothing else.
-        let h = set_headers(&enrich_response("u1", Some(viewer), true, None));
-        assert_eq!(h.get("x-user-roles").map(String::as_str), Some("viewer"));
+        // Even with a profile, the bare header is never emitted — the coarse roles live in
+        // the signed contract (`roles` claim, asserted in signer.rs), not a forgeable header.
+        assert!(!set_headers(&enrich_response("u1", Some(viewer), true, None)).contains_key("x-user-roles"));
     }
 
     #[test]

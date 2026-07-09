@@ -171,11 +171,16 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: pool_application }
                 http_filters:
-                  # FIRST: strip any client-supplied trusted headers, before any
-                  # resolution runs, so the plane-injected sets are authoritative
-                  # and unforgeable (RFC C3 / §3.12). Covers BOTH planes' headers.
-                  # Route-level removal would run at the router (after ext_proc)
-                  # and wrongly strip the injected headers.
+                  # COARSE DEFENSE-IN-DEPTH (edge-trusted-header-strip, design D2).
+                  # This exact-name denylist is NO LONGER the load-bearing control:
+                  # the AUTHORITATIVE default-drop of the whole trusted family is a
+                  # single-sourced PREFIX drop in the tenant-router ext_proc (Rust,
+                  # `trusted_family_strip`), which catches un-enumerated trusted
+                  # headers by default. This block is kept only as a coarse first-pass
+                  # strip before resolution runs; because completeness now lives in the
+                  # ext_proc, this list is NOT a maintenance invariant — a newly added
+                  # trusted header need NOT be added here to be safe.
+                  # `x-requested-workspace` is deliberately NOT stripped (allowed hint).
                   - name: envoy.filters.http.header_mutation
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation

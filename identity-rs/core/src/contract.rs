@@ -76,6 +76,25 @@ pub struct ContractClaims {
     /// for a user/api-key principal.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub permissions: Vec<String>,
+    /// Nexus-authored global entitlements (`identity-revocation-integrity`) — the same
+    /// `Profile.entitlements` that used to ride the bare, unsigned `x-user-entitlements`
+    /// header, now carried *over the signature* so a box can trust the value was
+    /// nexus-authored and not client-forged. `Some(vec![])` is a resolved subject with no
+    /// entitlements; OMITTED (`None`) when the subject's profile is unresolved (no profile /
+    /// a service principal) — absence therefore reads as "unknown", never an asserted empty
+    /// set. Freshness is bounded by the token `exp` (boxes MUST NOT cache past it).
+    /// nexus-authored, never client-asserted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub entitlements: Option<Vec<String>>,
+    /// Whether nexus has suspended the subject (`identity-revocation-integrity`) — the
+    /// revocation gate that used to ride the bare, unsigned `x-user-suspended` header, now
+    /// signed so a client cannot forge a "not suspended" value. `Some(false)` is a resolved,
+    /// not-suspended subject; OMITTED (`None`) when the profile is unresolved — a box MUST
+    /// treat absence as "unknown" and fail safe, NEVER as `false` (that would slip a
+    /// suspended user through). Freshness bounded by `exp`. nexus-authored, never
+    /// credential-asserted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub suspended: Option<bool>,
     /// The acting workspace's plan tier (`workspace-plan-tier`) — a nexus-authored,
     /// routing-plane fact (`routing.workspaces.plan`), the same value emitted as
     /// `x-workspace-plan`. An opaque wire string (the vocabulary is nexus-owned and

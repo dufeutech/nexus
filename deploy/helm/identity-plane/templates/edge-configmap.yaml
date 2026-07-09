@@ -122,8 +122,11 @@ data:
                             - match: { prefix: "/" }
                               route: { cluster: backend }
                     http_filters:
-                      # FIRST: strip client-supplied identity headers before
-                      # enrichment so the injected set is authoritative (RFC C3).
+                      # COARSE DEFENSE-IN-DEPTH (edge-trusted-header-strip, design D2):
+                      # a first-pass exact-name strip before enrichment. The AUTHORITATIVE
+                      # default-drop of the trusted family is a single-sourced PREFIX drop
+                      # in the tenant-router ext_proc, so this list is not a maintenance
+                      # invariant (a new trusted header is safe without being added here).
                       - name: envoy.filters.http.header_mutation
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation

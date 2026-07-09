@@ -42,6 +42,17 @@ pub(crate) struct MintInput<'a> {
     /// The service's platform permission set (least-privilege). Empty for a
     /// user/api-key.
     pub permissions: &'a [String],
+    /// Nexus-authored global entitlements for the resolved subject
+    /// (`identity-revocation-integrity`) — the same `Profile.entitlements` that used to
+    /// ride the bare `x-user-entitlements` header, now signed. `Some(&[])` is a resolved
+    /// subject with no entitlements; `None` when the profile is unresolved (or a service
+    /// principal), which omits the claim so absence reads as "unknown".
+    pub entitlements: Option<&'a [String]>,
+    /// Whether nexus has suspended the subject (`identity-revocation-integrity`) — the
+    /// signed replacement for the bare `x-user-suspended` header. `Some(false)` is a
+    /// resolved, not-suspended subject; `None` when the profile is unresolved, which omits
+    /// the claim so a box reads absence as "unknown" and fails safe, never as `false`.
+    pub suspended: Option<bool>,
     /// The acting workspace's plan tier (`workspace-plan-tier`) — the same nexus-resolved
     /// value authored as `x-workspace-plan`. `None` when no plan resolves for the acting
     /// workspace (unknown workspace / plan source unavailable); then the `plan` claim is
@@ -133,6 +144,11 @@ impl Signer {
             // workspace-plan-tier: the nexus-resolved plan for the acting workspace;
             // omitted (None) when unresolved so an absent plan reads as not-provisioned.
             plan: input.plan.map(str::to_owned),
+            // identity-revocation-integrity: the revocation-sensitive signals ride the
+            // signature. Omitted (None) when the profile is unresolved so absence reads as
+            // "unknown" — a box must never treat an absent `suspended` as not-suspended.
+            entitlements: input.entitlements.map(<[String]>::to_vec),
+            suspended: input.suspended,
         };
         self.sign(&claims)
     }
@@ -196,6 +212,8 @@ mod tests {
                 roles: &["ops".to_owned()],
                 permissions: &[],
                 plan: None,
+                entitlements: None,
+                suspended: None,
                 now,
             })
             .unwrap()
@@ -258,6 +276,8 @@ mod tests {
                 roles: &[],
                 permissions: &[],
                 plan: Some("pro"),
+                entitlements: None,
+                suspended: None,
                 now: now_secs(),
             })
             .unwrap();
@@ -278,6 +298,88 @@ mod tests {
     }
 
     #[test]
+    fn contract_carries_entitlements_and_suspended_over_the_signature() {
+        // identity-revocation-integrity task 1.5: the revocation-sensitive signals ride
+        // the SIGNED contract (not a bare header), so a box trusts them as nexus-authored.
+        // A resolved subject carries entitlements + an explicit suspended flag; both
+        // survive the sign→verify round-trip and appear on the wire.
+        let signer = test_signer();
+        let token = signer
+            .mint(&MintInput {
+                sub: "user-1",
+                aud: AUD,
+                principal_kind: "user",
+                on_behalf_of: None,
+                workspace_id: "ws-1",
+                member_type: Some("staff"),
+                role: Some("admin"),
+                roles: &[],
+                permissions: &[],
+                plan: None,
+                entitlements: Some(&["seats:5".to_owned(), "beta".to_owned()]),
+                suspended: Some(true),
+                now: now_secs(),
+            })
+            .unwrap();
+        let claims = verify_with(TEST_JWKS, &token).expect("token must verify");
+        assert_eq!(
+            claims.entitlements,
+            Some(vec!["seats:5".to_owned(), "beta".to_owned()]),
+            "entitlements ride the signed contract"
+        );
+        assert_eq!(claims.suspended, Some(true), "the suspension gate is signed, not bare");
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"entitlements\""), "entitlements appear on the wire");
+        assert!(json.contains("\"suspended\":true"), "suspended appears on the wire");
+    }
+
+    #[test]
+    fn a_resolved_not_suspended_subject_signs_suspended_false_not_omitted() {
+        // The distinction that makes the gate safe: a resolved, not-suspended subject
+        // carries suspended=false EXPLICITLY (Some(false)), so a box reads a definite
+        // "not suspended" — never conflated with the unresolved/omitted case.
+        let signer = test_signer();
+        let token = signer
+            .mint(&MintInput {
+                sub: "user-1",
+                aud: AUD,
+                principal_kind: "user",
+                on_behalf_of: None,
+                workspace_id: "ws-1",
+                member_type: Some("staff"),
+                role: Some("admin"),
+                roles: &[],
+                permissions: &[],
+                plan: None,
+                entitlements: Some(&[]),
+                suspended: Some(false),
+                now: now_secs(),
+            })
+            .unwrap();
+        let claims = verify_with(TEST_JWKS, &token).expect("token must verify");
+        assert_eq!(claims.suspended, Some(false), "not-suspended is signed explicitly");
+        assert_eq!(claims.entitlements, Some(vec![]), "a resolved empty entitlement set is Some([])");
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"suspended\":false"), "an explicit false is on the wire");
+    }
+
+    #[test]
+    fn revocation_claims_omitted_when_the_profile_is_unresolved() {
+        // identity-revocation-integrity task 1.5: with no resolved profile (None), the
+        // revocation claims are OMITTED from the token entirely — absence reads as
+        // "unknown", never a defaulted `suspended:false` that would slip a suspended user
+        // through. mint_at passes entitlements/suspended = None (the profile-miss shape).
+        let signer = test_signer();
+        let claims = verify_with(TEST_JWKS, &mint_at(&signer, AUD, now_secs()))
+            .expect("token must verify");
+        assert!(claims.suspended.is_none(), "an unresolved suspension is omitted, not false");
+        assert!(claims.entitlements.is_none(), "unresolved entitlements are omitted");
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(!json.contains("\"suspended\""), "omitted suspended must not appear on the wire");
+        assert!(!json.contains("\"entitlements\""), "omitted entitlements must not appear on the wire");
+    }
+
+    #[test]
     fn service_contract_conveys_platform_authority_not_a_member_role() {
         // Task 5.2: for a Platform authority the token carries principal_kind=service,
         // the acting workspace, and the permission set — and OMITS member_type/role
@@ -295,6 +397,8 @@ mod tests {
                 roles: &[],
                 permissions: &["events:write".to_owned()],
                 plan: None,
+                entitlements: None,
+                suspended: None,
                 now: now_secs(),
             })
             .unwrap();
@@ -336,6 +440,8 @@ mod tests {
                 roles: &[],
                 permissions: &[],
                 plan: None,
+                entitlements: None,
+                suspended: None,
                 now: now_secs(),
             })
             .unwrap();

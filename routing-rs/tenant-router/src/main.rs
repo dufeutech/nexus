@@ -20,7 +20,7 @@
 //! `ext_proc` fails CLOSED with a 503 until the store is reachable + the feed is
 //! subscribed — a routing failure must not silently become a default route.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::var;
 use std::error::Error;
 #[cfg(not(unix))]
@@ -421,18 +421,102 @@ fn header(key: &str, value: &str) -> HeaderValueOption {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// edge-trusted-header-strip: the authoritative, single-sourced client-header strip.
+//
+// The tenant-router is the FIRST component every box-bound request crosses, so the
+// load-bearing anti-forgery control lives here (design D2). We DEFAULT-DROP the whole
+// nexus-authored "trusted family" by PREFIX from client input and forward only an
+// explicit allowlist of permitted hints. Completeness is by prefix, so a newly added
+// trusted header a box reads is safe-by-default (dropped) instead of
+// forgeable-until-someone-adds-it-to-a-denylist. The edge Envoy + identity sidecar
+// denylists are retained only as COARSE defense-in-depth, no longer the primary control.
+//
+// Single source of truth: this prefix/exact/allowlist set lives ONCE, here, and is
+// referenced — never copy-pasted across the mirrored envoy configmaps.
+// --------------------------------------------------------------------------- //
+
+/// Lowercased name prefixes of the nexus-authored trusted family. Any client-supplied
+/// header whose lowercased name starts with one of these is dropped (unless allowlisted).
+/// `x-route` covers both `x-route-pool` and `x-routed-by`.
+const TRUSTED_HEADER_PREFIXES: &[&str] = &[
+    "x-user-",
+    "x-workspace-",
+    "x-geo-",
+    "x-identity-",
+    "x-auth-",
+    "x-route",
+    "x-enriched-",
+    "x-privacy-",
+];
+
+/// Exact lowercased trusted-family names that don't share a common prefix with the set
+/// above — the normalized request-context annotations nexus authors.
+const TRUSTED_HEADER_EXACT: &[&str] = &["x-locale", "x-lang", "x-currency", "x-device-type"];
+
+/// The ONLY client-supplied trusted-family headers the edge forwards — an explicit
+/// allowlist of hints a client is permitted to set. A name here is exempt from the
+/// default-drop even if it matches a trusted prefix. Kept deliberately tiny.
+const CLIENT_HINT_ALLOWLIST: &[&str] = &["x-requested-workspace"];
+
+/// Whether a (lowercased) header name belongs to the nexus-authored trusted family.
+fn is_trusted_family(lower_name: &str) -> bool {
+    TRUSTED_HEADER_PREFIXES.iter().any(|p| lower_name.starts_with(p))
+        || TRUSTED_HEADER_EXACT.contains(&lower_name)
+}
+
+/// Compute the client-supplied trusted-family headers to DEFAULT-DROP. `incoming` is the
+/// request's header names as received; `authored` is the lowercased set of names THIS
+/// filter authors on this path — those are overwritten authoritatively via `set_headers`,
+/// so they are EXCLUDED from the remove list to keep the result independent of Envoy's
+/// set-vs-remove apply order (a name in both lists could otherwise be wiped after we set
+/// it). Returns the original-cased names to remove, de-duplicated.
+fn trusted_family_strip(incoming: &[&str], authored: &HashSet<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut remove = Vec::new();
+    for &name in incoming {
+        let lower = name.to_ascii_lowercase();
+        if is_trusted_family(&lower)
+            && !CLIENT_HINT_ALLOWLIST.contains(&lower.as_str())
+            && !authored.contains(&lower)
+            && seen.insert(lower)
+        {
+            remove.push(name.to_owned());
+        }
+    }
+    remove
+}
+
+/// The header names carried on an incoming ext_proc `RequestHeaders` message (as
+/// received), for the trusted-family strip. Empty for any other message kind.
+fn request_header_names(req: &ProcessingRequest) -> Vec<&str> {
+    match &req.request {
+        Some(processing_request::Request::RequestHeaders(h)) => h
+            .headers
+            .as_ref()
+            .map(|hm| hm.headers.iter().map(|hv| hv.key.as_str()).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Inject the trusted workspace annotations + the pool selector (RFC §3.12), plus
 /// any normalized request-context annotations (`x-geo-*`, `x-locale`, `x-currency`,
 /// `x-privacy-*`, `x-device-type`, …) in `extra`. The edge data plane routes on
 /// `x-route-pool`; the backend trusts every header we set here. Client-supplied
-/// copies were stripped before this filter ran (C3-equivalent).
+/// copies of the trusted family are default-dropped by prefix in this same response
+/// (`trusted_family_strip`), the authoritative edge-trusted-header-strip control.
 //
 // The emitted names are the `x-workspace-*` wire contract (task 4.1 cut-over).
 // `x-workspace-id` is the domain's RESOLVED workspace; the identity sidecar runs
 // after this filter and either re-asserts it (authoritative, member) or strips it
 // (non-member), so the value the backend sees is membership-authorized. The C3 edge
 // strip removes any client-forged copy before this filter sets the trusted one.
-fn route_response(d: &RoutingDecision, extra: &[(&'static str, String)]) -> ProcessingResponse {
+fn route_response(
+    req: &ProcessingRequest,
+    d: &RoutingDecision,
+    extra: &[(&'static str, String)],
+) -> ProcessingResponse {
     let mut set = vec![
         header("x-workspace-id", &d.workspace_id),
         header("x-workspace-plan", &d.plan),
@@ -443,10 +527,20 @@ fn route_response(d: &RoutingDecision, extra: &[(&'static str, String)]) -> Proc
     for (k, v) in extra {
         set.push(header(k, v));
     }
+    // edge-trusted-header-strip: default-drop every client-supplied trusted-family header
+    // that isn't allowlisted and isn't one we author here. The authored names are excluded
+    // (they overwrite authoritatively via OverwriteIfExistsOrAdd), keeping the mutation
+    // independent of Envoy's set-vs-remove apply order.
+    let authored: HashSet<String> = set
+        .iter()
+        .filter_map(|opt| opt.header.as_ref())
+        .map(|h| h.key.to_ascii_lowercase())
+        .collect();
+    let remove = trusted_family_strip(&request_header_names(req), &authored);
     let common = CommonResponse {
         header_mutation: Some(HeaderMutation {
             set_headers: set,
-            ..Default::default()
+            remove_headers: remove,
         }),
         // The edge data plane selects the route from x-route-pool, which we just
         // set — so the route computed before this filter ran must be recomputed.
@@ -590,7 +684,7 @@ impl Router {
                 }
                 extra.extend(extract_client_context(&req, country.as_deref()));
                 info!(host = %host, workspace = %d.workspace_id, pool = d.pool.as_str(), annotations = extra.len(), "route");
-                (route_response(&d, &extra), "hit")
+                (route_response(&req, &d, &extra), "hit")
             } else {
                 // Debug-format (escapes control/ESC bytes): this is the RAW,
                 // un-normalized :authority — the reject branch is exactly where a
@@ -987,8 +1081,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // --------------------------------------------------------------------------- //
 #[cfg(test)]
 mod tests {
-    use super::{api, auth_signals, sleep, AppState, RouteAuth};
-    use std::collections::HashMap;
+    use super::{
+        api, auth_signals, is_trusted_family, route_response, trusted_family_strip, sleep,
+        AppState, RouteAuth,
+    };
+    use std::collections::{HashMap, HashSet};
     use std::env::var;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
@@ -1059,6 +1156,129 @@ mod tests {
 
         let protected = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };
         assert_eq!(auth_signals(&protected), vec![("x-auth-required", "true".to_owned())]);
+    }
+
+    // ----------------------------------------------------------------------- //
+    // edge-trusted-header-strip: the authoritative default-drop-by-prefix control.
+    // ----------------------------------------------------------------------- //
+
+    /// The trusted family is recognized by PREFIX (so an un-enumerated member is caught)
+    /// and by the few exact context names; nothing outside the family is claimed.
+    #[test]
+    fn trusted_family_membership_is_by_prefix_and_exact_name() {
+        // Enumerated AND un-enumerated members of a trusted prefix are both in-family.
+        for h in [
+            "x-user-suspended",
+            "x-user-entitlements",
+            "x-user-roles",
+            "x-user-some-future-header", // nobody enumerated this — still caught
+            "x-workspace-id",
+            "x-geo-country",
+            "x-identity-contract",
+            "x-auth-required",
+            "x-route-pool",
+            "x-routed-by",
+            "x-enriched-by",
+            "x-privacy-gpc",
+            "x-locale",
+            "x-currency",
+            "x-device-type",
+        ] {
+            assert!(is_trusted_family(h), "{h} must be recognized as trusted-family");
+        }
+        // Ordinary client/request headers and the permitted hint are NOT in-family.
+        for h in ["authorization", "x-api-key", "host", "cf-ray", "accept-language", "x-request-id"] {
+            assert!(!is_trusted_family(h), "{h} must NOT be treated as trusted-family");
+        }
+    }
+
+    /// The core anti-forgery property: an un-enumerated client `x-user-*` is dropped by
+    /// DEFAULT, the allowlisted hint survives, ordinary headers are untouched, and a name
+    /// this filter authors is NOT put on the remove list (it's overwritten authoritatively).
+    #[test]
+    fn strip_drops_unknown_trusted_family_keeps_allowlist_and_authored() {
+        // What THIS filter authors on the request path (excluded from removal).
+        let authored: HashSet<String> =
+            ["x-workspace-id", "x-route-pool", "x-routed-by", "x-geo-country"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        let incoming = [
+            "x-user-suspended",          // forged revocation signal -> DROP
+            "x-user-brand-new",          // un-enumerated trusted header -> DROP by default
+            "X-Identity-Contract",       // forged signed-contract copy (mixed case) -> DROP
+            "x-requested-workspace",     // allowlisted client hint -> KEEP
+            "authorization",             // ordinary header -> KEEP
+            "x-workspace-id",            // authored here -> KEEP (overwritten, not removed)
+            "x-geo-country",             // authored here -> KEEP
+        ];
+        let removed = trusted_family_strip(&incoming, &authored);
+
+        assert!(removed.contains(&"x-user-suspended".to_owned()), "a forged revocation header is dropped");
+        assert!(removed.contains(&"x-user-brand-new".to_owned()), "an un-enumerated trusted header is dropped by default");
+        // Original casing is preserved in the removal name.
+        assert!(removed.contains(&"X-Identity-Contract".to_owned()), "a forged contract copy is dropped (case-insensitive match)");
+        // Survivors: the allowlisted hint, ordinary headers, and authored names.
+        for keep in ["x-requested-workspace", "authorization", "x-workspace-id", "x-geo-country"] {
+            assert!(!removed.contains(&keep.to_owned()), "{keep} must survive the strip");
+        }
+    }
+
+    /// `route_response` wires the strip into the ext_proc reply: a forged trusted header on
+    /// the incoming request is default-dropped, while the values the router authors ride in
+    /// set_headers and are never also removed.
+    #[test]
+    fn route_response_strips_forged_trusted_headers_and_preserves_authored() {
+        use envoy_types::pb::envoy::config::core::v3::{HeaderMap, HeaderValue};
+        use envoy_types::pb::envoy::service::ext_proc::v3::{processing_request, HttpHeaders};
+        use super::{processing_response, ProcessingRequest, RoutingDecision};
+        use router_core::domain::Pool;
+
+        let hv = |k: &str| HeaderValue { key: k.to_owned(), ..Default::default() };
+        let req = ProcessingRequest {
+            request: Some(processing_request::Request::RequestHeaders(HttpHeaders {
+                headers: Some(HeaderMap {
+                    headers: vec![
+                        hv("x-user-suspended"),      // forged -> must be stripped
+                        hv("x-identity-contract"),   // forged -> must be stripped
+                        hv("x-requested-workspace"), // allowlisted -> kept
+                        hv("authorization"),         // ordinary -> kept
+                    ],
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decision = RoutingDecision {
+            workspace_id: "ws-1".to_owned(),
+            plan: "pro".to_owned(),
+            pool: Pool::new("evenout"),
+            features: Vec::new(),
+            auth: AuthPolicy::default(),
+        };
+        let resp = route_response(&req, &decision, &[]);
+        let Some(processing_response::Response::RequestHeaders(headers)) = &resp.response else {
+            unreachable!("route_response always returns a RequestHeaders response");
+        };
+        let mutation =
+            headers.response.as_ref().and_then(|c| c.header_mutation.as_ref()).expect("mutation set");
+        let removed: HashSet<&str> = mutation.remove_headers.iter().map(String::as_str).collect();
+        let set: HashSet<String> = mutation
+            .set_headers
+            .iter()
+            .filter_map(|opt| opt.header.as_ref())
+            .map(|h| h.key.to_ascii_lowercase())
+            .collect();
+
+        // Forged trusted headers on client input are dropped.
+        assert!(removed.contains("x-user-suspended"), "forged suspension dropped");
+        assert!(removed.contains("x-identity-contract"), "forged contract dropped");
+        // Allowlisted hint + ordinary headers survive.
+        assert!(!removed.contains("x-requested-workspace"), "allowlisted hint survives");
+        assert!(!removed.contains("authorization"), "ordinary header survives");
+        // The router's authored values ride set_headers and are never also on the remove list.
+        assert!(set.contains("x-workspace-id") && !removed.contains("x-workspace-id"));
+        assert!(set.contains("x-route-pool") && !removed.contains("x-route-pool"));
     }
 
     /// A handler that outlives the timeout must be terminated with 408 rather

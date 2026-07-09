@@ -18,9 +18,17 @@ short "what to pin and check" for the integration.
 
 Identity claims you may read from the verified token (mirror the headers):
 `sub` (= `x-user-id`), `workspace_id` (= `x-workspace-id`), `role` (= `x-user-role`),
-`roles` (= `x-user-roles`), `plan` (= `x-workspace-plan`). `plan` is the acting workspace's
+`roles`, `plan` (= `x-workspace-plan`). `plan` is the acting workspace's
 **plan tier** (`workspace-plan-tier`), nexus-authored and signed into the token; it is
 **omitted** (not defaulted) when no plan resolves — treat an absent `plan` as not-provisioned.
+
+**Signed-only, no bare header (identity-revocation-integrity):** `roles`, **`entitlements`**
+(string array), and **`suspended`** (bool) ride **only** the token now — the bare `x-user-roles` /
+`x-user-entitlements` / `x-user-suspended` headers are **retired**. `entitlements`/`suspended` are
+**omitted** when nexus has no resolved profile (and for a `service` principal): treat an absent
+`suspended` as **unknown → fail safe, never `false`**; a `suspended: true` MUST hard-block.
+**Do not cache the contract past its `exp`** — `exp` (~60s) is the revocation freshness bound, so a
+just-suspended user is honored as suspended within the TTL. Re-read the next request's contract.
 
 ## Verification steps (per request, on an enriched route)
 
@@ -36,8 +44,10 @@ Identity claims you may read from the verified token (mirror the headers):
 
 ## What does NOT change
 
-- The raw `x-user-*` / `x-workspace-*` headers are still emitted; you may read identity from
-  the token or the headers.
+- Most raw `x-user-*` / `x-workspace-*` headers are still emitted; you may read identity from
+  the token or the headers — **except** the retired `x-user-roles` / `x-user-entitlements` /
+  `x-user-suspended`, which are now token-only (read `roles`/`entitlements`/`suspended` from the
+  verified claim; see *Concrete values* above).
 - **Origin trust stays the primary control.** Keep your ingress restricted to the edge
   (NetworkPolicy) — the signature is defense-in-depth, not a replacement.
 
