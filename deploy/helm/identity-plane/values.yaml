@@ -224,15 +224,44 @@ sidecar:
   signing:
     enabled: false
     issuer: "https://identity.nexus"   # the `iss` claim; boxes pin this exact string
-    kid: ""                            # MUST equal the JWKS entry's kid; required when enabled
     tokenTtlSeconds: 60
     jwksListen: "0.0.0.0:9210"
+    # automate-signing-key-rotation: managed key custody + AUTOMATED rotation via OpenBao
+    # Transit (Mode B — the plane exports key material and signs LOCALLY, so the hot path
+    # never hops to Bao). When `transit.enabled`, the sidecar pulls versioned keys from
+    # Transit, GENERATES the JWKS from Transit's exportable public keys (no hand-synced
+    # ConfigMap), and rotates on a schedule / on demand — no manual runbook. The break-glass
+    # `kid`/`privateKeyPem`/`jwks` below stay a SUPPORTED fallback: if Bao is unreachable at
+    # startup the plane boots on the manual PEM instead of running unsigned (fail loud).
+    # See docs/runbook-contract-signing-keys.md.
+    transit:
+      enabled: false
+      address: "http://openbao.openbao:8200"    # the OpenBao API URL
+      mount: "transit"                            # the Transit engine mount path
+      keyName: "identity-contract-signing"        # the ecdsa-p256 key; each version is a kid
+      # The plane's OpenBao token. Production: bind a Kubernetes-auth role to a least-
+      # privilege policy (export public/signing key + rotate on this one key), create the
+      # token Secret out-of-band, and set `tokenExistingSecret` (key `token`); leave `token`
+      # empty. Dev only: paste a token into `token` and the chart creates the Secret.
+      tokenExistingSecret: ""
+      token: ""
+      # Plane-driven scheduled rotation period (seconds). Empty ⇒ the plane only mirrors
+      # rotations triggered at the source (Transit auto-rotate, or an operator on suspected
+      # compromise) — it never initiates one itself.
+      rotationPeriodSeconds: ""
+      pollSeconds: 30           # how fast an out-of-band / on-demand rotation is adopted
+      maxClockSkewSeconds: 60   # overlap window = tokenTtlSeconds + this (no in-flight reject)
+    # Break-glass MANUAL key material (the pre-rotation path; also the Transit-mode startup
+    # fallback). `kid` MUST equal the JWKS entry's kid. Leave all three empty to run pure
+    # Transit with no manual fallback.
+    kid: ""
     # PRIVATE key (ES256 PKCS#8 PEM). Production: create a Secret out-of-band and set
     # `existingSecret` (key `key.pem`); leave `privateKeyPem` empty. Dev only: paste the
     # PEM into `privateKeyPem` and the chart creates the Secret. NEVER commit a real key.
     existingSecret: ""
     privateKeyPem: ""
-    # PUBLIC JWKS document, served verbatim (not secret). Its `kid` MUST match `kid`.
+    # PUBLIC JWKS document, served verbatim on the break-glass path (not secret). Its `kid`
+    # MUST match `kid`. Unused in Transit mode (the JWKS is generated).
     jwks: ""
 
 # -------------------------------------------------------------------------- #

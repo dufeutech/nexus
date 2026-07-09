@@ -1,4 +1,5 @@
-# Never commit signing material — only the README/.gitignore are tracked.
+# Never commit signing material — only the README/.gitignore/init script are tracked.
 *
 !README.md
 !.gitignore
+!transit-init.sh

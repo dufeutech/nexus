@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::future::pending;
 
 use moka::future::Cache;
+use rustls::crypto::ring;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{mpsc, watch};
@@ -69,9 +70,17 @@ use store_postgres::{
 
 // identity-contract-signing: the ES256 signer adapter (mints the signed
 // x-identity-contract token) and the dedicated JWKS listener that publishes the
-// operator-supplied public keys for boxes to verify against.
+// public keys for boxes to verify against.
 mod jwks;
 mod signer;
+// automate-signing-key-rotation: managed key custody + automated rotation. The
+// `KeyProvider` port (keyprovider) isolates where signing keys come from; the OpenBao
+// Transit adapter (transit, Mode B local signing) is the production source; the rotation
+// manager (rotation) drives cut-over + generates the published JWKS + enforces the
+// two-key overlap window. The manual `SIGNING_KEY_PATH` PEM stays a break-glass fallback.
+mod keyprovider;
+mod rotation;
+mod transit;
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): the RED baseline + operational gauges, emitted
@@ -206,9 +215,13 @@ struct AppState {
     /// (`SIDECAR_AAL_LEVELS`, default [`DEFAULT_AAL_LEVELS`]).
     aal_levels: Arc<HashMap<String, u8>>,
     /// The ES256 signer for the `x-identity-contract` token (identity-contract-signing).
-    /// `None` when signing is not configured (`SIGNING_KEY_PATH` unset) — then no token
-    /// is minted and any client copy is stripped, so a verifying box fails closed.
-    signer: Option<Arc<signer::Signer>>,
+    /// A `watch` receiver so the ACTIVE signer is swap-able under automated rotation
+    /// (automate-signing-key-rotation): the rotation manager republishes it on each
+    /// cut-over and the hot path reads the current one with a cheap `Arc` clone. In
+    /// break-glass mode it wraps the static `SIGNING_KEY_PATH` PEM signer (never changes).
+    /// `None` when signing is not configured — then no token is minted and any client copy
+    /// is stripped, so a verifying box fails closed.
+    signer: Option<watch::Receiver<Arc<signer::Signer>>>,
     /// The RESIDENT active platform-service registry (`service_id` → its least-privilege
     /// [`PlatformScope`]), refreshed LIVE off the `platform.services` change feed
     /// (normalized-principal ADR-7). `None` when platform-service auth is not configured
@@ -321,6 +334,14 @@ impl AppState {
         self.plans
             .as_ref()
             .and_then(|rx| rx.borrow().get(workspace_id).cloned())
+    }
+
+    /// The CURRENT active contract signer (automate-signing-key-rotation). Reads the
+    /// swap-able `watch` value with a cheap `Arc` clone so no borrow guard is held across
+    /// the mint — a rotation cut-over is picked up on the next request with no restart.
+    /// `None` when signing is not configured.
+    fn current_signer(&self) -> Option<Arc<signer::Signer>> {
+        self.signer.as_ref().map(|rx| rx.borrow().clone())
     }
 }
 
@@ -1165,12 +1186,16 @@ impl Sidecar {
                     .as_ref()
                     .and_then(|_| ws)
                     .and_then(|w| self.state.resolve_plan(w));
+                // The active signer is a swap-able rotation target (automate-signing-key-
+                // rotation): clone the current one up front so the Arc outlives the borrow
+                // handed to `enrich_response`, and a mid-request rotation never tears.
+                let active_signer = self.state.current_signer();
                 (
                     enrich_response(
                         &enriched,
                         acting_plan.as_deref(),
                         &SignContext {
-                            signer: self.state.signer.as_deref(),
+                            signer: active_signer.as_deref(),
                             route_pool: route_pool.as_deref(),
                             now: now_secs(),
                         },
@@ -1531,9 +1556,9 @@ async fn build_api_key_auth() -> Option<ApiKeyAuth> {
     }
 }
 
-/// Load the operator-supplied JWKS document to publish verbatim
-/// (identity-contract-signing). `None` (endpoint not started) when `JWKS_FILE` is
-/// unset or unreadable.
+/// Load the operator-supplied break-glass JWKS document (identity-contract-signing).
+/// `None` (endpoint not started) when `JWKS_FILE` is unset or unreadable. Used only on
+/// the break-glass PEM path; the Transit path GENERATES the JWKS from key material.
 fn load_jwks() -> Option<Arc<String>> {
     let path = env::var("JWKS_FILE").ok().filter(|p| !p.is_empty())?;
     match fs::read_to_string(&path) {
@@ -1543,6 +1568,106 @@ fn load_jwks() -> Option<Arc<String>> {
             None
         }
     }
+}
+
+/// The signer + JWKS publication the plane runs with, resolved once at startup — a
+/// swap-able active signer and a republish-able JWKS document, both as `watch` receivers
+/// so the hot path and the JWKS listener share one shape whether keys are managed
+/// (Transit) or static (break-glass PEM). `None` on either arm means that surface is off.
+struct SigningSetup {
+    signer: Option<watch::Receiver<Arc<signer::Signer>>>,
+    jwks: Option<watch::Receiver<Arc<String>>>,
+}
+
+/// Resolve the signing wiring in precedence order (automate-signing-key-rotation):
+///
+///   1. **OpenBao Transit** (managed custody + automated rotation) when
+///      `SIGNING_TRANSIT_KEY` is set: the plane pulls key material and signs locally
+///      (Mode B), the rotation manager generates the JWKS and enforces the overlap
+///      window, and a background task drives scheduled/on-demand rotation. If Transit is
+///      unreachable at startup it FALLS BACK to the break-glass PEM (design.md Risk: Bao
+///      unreachable) — fail loud, never silently unsigned.
+///   2. **Break-glass `SIGNING_KEY_PATH` PEM** (the pre-rotation manual path): a static
+///      signer + the operator-supplied `JWKS_FILE`, each wrapped in a never-changing
+///      `watch`.
+///   3. **Signing off** when neither is configured.
+async fn build_signing() -> Result<SigningSetup, Box<dyn Error>> {
+    if let Some(key_name) = env::var("SIGNING_TRANSIT_KEY").ok().filter(|v| !v.is_empty()) {
+        match build_transit_rotation(key_name).await {
+            Ok(setup) => return Ok(setup),
+            Err(e) => error!(
+                error = %e,
+                "OpenBao Transit signing unavailable at startup -> falling back to break-glass SIGNING_KEY_PATH PEM"
+            ),
+        }
+    }
+    // Break-glass / static path: wrap the static signer + operator JWKS in never-changing
+    // `watch` channels (the sender drops immediately; `borrow()` keeps serving the value).
+    let signer = build_signer()?.map(|active| watch::channel(active).1);
+    let jwks = load_jwks().map(|doc| watch::channel(doc).1);
+    Ok(SigningSetup { signer, jwks })
+}
+
+/// Stand up the OpenBao Transit provider + rotation manager (Mode B) and spawn its poll
+/// loop. Returns the swap-able signer + generated-JWKS receivers. Any startup failure
+/// (Bao unreachable, missing token, no exportable key) is surfaced so [`build_signing`]
+/// can fall back to the break-glass PEM.
+async fn build_transit_rotation(key_name: String) -> Result<SigningSetup, Box<dyn Error>> {
+    let address = env::var("BAO_ADDR")
+        .or_else(|_| env::var("VAULT_ADDR"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8200".to_owned());
+    let token = env::var("BAO_TOKEN")
+        .or_else(|_| env::var("VAULT_TOKEN"))
+        .map_err(|_| "SIGNING_TRANSIT_KEY set but neither BAO_TOKEN nor VAULT_TOKEN is set")?;
+    let mount = env::var("SIGNING_TRANSIT_MOUNT").unwrap_or_else(|_| "transit".to_owned());
+    let issuer =
+        env::var("SIGNING_ISSUER").unwrap_or_else(|_| "https://identity.nexus".to_owned());
+    let ttl_secs: u64 = env::var("CONTRACT_TOKEN_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    // The overlap window MUST cover a token's whole in-flight life: its TTL plus the max
+    // clock skew between the plane and a verifying box, so no token signed just before a
+    // cut-over is rejected mid-rotation (spec: rotation preserves the overlap guarantee).
+    let skew_secs: u64 = env::var("CONTRACT_MAX_CLOCK_SKEW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let overlap_secs = ttl_secs.saturating_add(skew_secs);
+    let poll_secs: u64 = env::var("SIGNING_KEY_POLL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    // Optional plane-driven scheduled rotation. Unset ⇒ the plane only mirrors rotations
+    // triggered at the source (Transit auto-rotate, or an operator on suspected compromise).
+    let rotation_period_secs = env::var("SIGNING_ROTATION_PERIOD_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    let provider = transit::TransitKeyProvider::new(address, token, mount, key_name)
+        .map_err(|e| format!("build OpenBao Transit provider: {e}"))?;
+    let cfg = rotation::RotationConfig {
+        issuer,
+        contract_version: IDENTITY_CONTRACT_VERSION.to_owned(),
+        ttl_secs,
+        overlap_secs,
+        rotation_period_secs,
+        poll_secs,
+    };
+    let (manager, handles) = rotation::RotationManager::bootstrap(Arc::new(provider), cfg)
+        .await
+        .map_err(|e| format!("bootstrap signing-key rotation: {e}"))?;
+    drop(tokio::spawn(manager.run()));
+    info!(
+        ttl_s = ttl_secs,
+        overlap_s = overlap_secs,
+        poll_s = poll_secs,
+        "x-identity-contract signing via OpenBao Transit ENABLED (automated rotation, Mode B local signing)"
+    );
+    Ok(SigningSetup {
+        signer: Some(handles.signer_rx),
+        jwks: Some(handles.jwks_rx),
+    })
 }
 
 /// Resolves when the process receives SIGINT or (on unix) SIGTERM.
@@ -1569,6 +1694,11 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // automate-signing-key-rotation: the OpenBao Transit client (vaultrs) uses rustls
+    // WITHOUT a bundled crypto provider (so we don't pull aws-lc-sys / cmake), so install
+    // the in-tree `ring` provider as the process default before any TLS is built. `Err`
+    // means one was already installed — benign, so it is ignored.
+    drop(ring::default_provider().install_default());
     // Shared telemetry (first-party-telemetry): stdout logs as before, plus OTLP
     // traces/logs/metrics when OTEL_EXPORTER_OTLP_ENDPOINT is set. Held for the
     // process lifetime so it flushes on shutdown.
@@ -1672,6 +1802,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         info!("customer-api-key authentication OFF (APIKEY_PG_RO_URL/APIKEY_HMAC_PEPPER unset)");
     }
 
+    // identity-contract-signing + automate-signing-key-rotation: resolve the signer +
+    // JWKS publication once (OpenBao Transit managed rotation, else break-glass PEM, else
+    // off). Fails fast only on a genuine misconfiguration of the break-glass PEM itself.
+    let signing = build_signing().await?;
+
     let state = AppState {
         // max_capacity is the WORKING-SET bound (RFC §6.3 revised), not the
         // population; cold subjects load on demand and evict normally.
@@ -1686,9 +1821,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         start: Instant::now(),
         fail_open,
         aal_levels: Arc::new(aal_levels),
-        // Fail-fast if a signing key is configured but unloadable (misconfiguration);
-        // `None` when signing is deliberately off (anonymous still served).
-        signer: build_signer()?,
+        // The swap-able active signer resolved above (Transit-managed or break-glass
+        // PEM); `None` when signing is deliberately off (anonymous still served).
+        signer: signing.signer,
         platform,
         plans,
         api_keys,
@@ -1745,7 +1880,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // internal :9200 profile API so publishing the public keys never exposes
     // `/profile/{sub}`. Subscribed to the shutdown fan-out BEFORE `tx` moves into the
     // signal task below; only started when a JWKS document is configured.
-    if let Some(doc) = load_jwks() {
+    if let Some(doc) = signing.jwks {
         let jwks_addr = env::var("JWKS_LISTEN").unwrap_or_else(|_| "0.0.0.0:9210".to_owned());
         let mut r_jwks = tx.subscribe();
         let app = jwks::router(doc);
@@ -2710,7 +2845,8 @@ mod tests {
             .expect("mint");
 
         // Publish the JWKS through the real handler and fetch the document over HTTP.
-        let app = jwks::router(Arc::new(TEST_JWKS.to_owned()));
+        let (_jwks_tx, jwks_rx) = watch::channel(Arc::new(TEST_JWKS.to_owned()));
+        let app = jwks::router(jwks_rx);
         let resp = app
             .oneshot(HttpRequest::builder().uri(jwks::JWKS_PATH).body(Body::empty()).unwrap())
             .await

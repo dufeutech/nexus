@@ -27,6 +27,15 @@ serde_json.workspace = true
 # ONLY crate that touches jsonwebtoken — isolated in `signer.rs` behind the
 # identity_core::ContractSigner port.
 jsonwebtoken.workspace = true
+# automate-signing-key-rotation: the KeyProvider port + OpenBao Transit adapter
+# (vaultrs, Mode B local signing) + the generated-JWKS helper (p256). Confined to
+# keyprovider.rs / transit.rs / rotation.rs behind the port. async-trait makes the
+# provider port object-safe for dyn dispatch (fake vs Transit).
+async-trait.workspace = true
+vaultrs.workspace = true
+# Install the ring crypto provider as the process default (vaultrs uses rustls-no-provider).
+rustls.workspace = true
+p256.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -40,6 +49,9 @@ opentelemetry.workspace = true
 # ext_proc service on an ephemeral listener (tokio-stream `net`).
 tower.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
+# automate-signing-key-rotation: the fake KeyProvider generates EC P-256 keys for the
+# rotation/overlap unit tests; rand_core is the CSPRNG it draws from (test-only).
+rand_core.workspace = true
 
 [lints]
 workspace = true

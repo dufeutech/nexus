@@ -1,13 +1,26 @@
 {{- /*
-identity-contract-signing: the ES256 signing material for the x-identity-contract
-token. The PRIVATE key is a Secret (mounted into the sidecar, never leaves the identity
-plane); the PUBLIC JWKS is a ConfigMap (served verbatim by the sidecar's :9210 listener
-for boxes to verify against). Rendered only when sidecar.signing.enabled — default off,
-so an existing release is unaffected until you opt in. See
-docs/runbook-contract-signing-keys.md for key generation + zero-downtime rotation.
+identity-contract-signing + automate-signing-key-rotation: the signing material for the
+x-identity-contract token.
+
+In TRANSIT mode (sidecar.signing.transit.enabled) the key lifecycle lives in OpenBao — the
+plane exports key material and signs locally (Mode B), and GENERATES the public JWKS from
+Transit, so neither the private-key Secret nor the JWKS ConfigMap below is required. This
+template then renders only the plane's OpenBao token Secret (dev convenience; production
+supplies it out-of-band via a Kubernetes-auth role and sets `tokenExistingSecret`).
+
+In BREAK-GLASS mode (the manual pre-rotation path, and the Transit-mode startup fallback)
+the PRIVATE key is a Secret (mounted into the sidecar, never leaves the identity plane) and
+the PUBLIC JWKS is a ConfigMap (served verbatim by the :9210 listener). These render only
+when their material is provided, so pure-Transit deployments carry no manual key.
+
+Rendered only when sidecar.signing.enabled — default off, so an existing release is
+unaffected until you opt in. See docs/runbook-contract-signing-keys.md for the automated
+flow + the break-glass fallback.
 */ -}}
 {{- if .Values.sidecar.signing.enabled }}
-{{- if not .Values.sidecar.signing.existingSecret }}
+{{- $s := .Values.sidecar.signing }}
+{{- /* Break-glass PRIVATE key Secret — only when a PEM is provided inline (dev). */ -}}
+{{- if and $s.privateKeyPem (not $s.existingSecret) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -17,9 +30,11 @@ metadata:
 type: Opaque
 stringData:
   key.pem: |
-    {{- required "sidecar.signing: set privateKeyPem or existingSecret when signing is enabled" .Values.sidecar.signing.privateKeyPem | nindent 4 }}
+    {{- $s.privateKeyPem | nindent 4 }}
 ---
 {{- end }}
+{{- /* Break-glass PUBLIC JWKS ConfigMap — only when a JWKS document is provided. */ -}}
+{{- if $s.jwks }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -28,5 +43,23 @@ metadata:
     {{- include "identity-plane.labels" . | nindent 4 }}
 data:
   jwks.json: |
-    {{- required "sidecar.signing.jwks is required when signing is enabled" .Values.sidecar.signing.jwks | nindent 4 }}
+    {{- $s.jwks | nindent 4 }}
+---
+{{- end }}
+{{- /*
+automate-signing-key-rotation: the plane's OpenBao token Secret (dev convenience). In
+production leave `token` empty and point `tokenExistingSecret` at a Secret populated
+out-of-band from a least-privilege Kubernetes-auth role.
+*/ -}}
+{{- if and $s.transit.enabled $s.transit.token (not $s.transit.tokenExistingSecret) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "identity-plane.fullname" . }}-bao-token
+  labels:
+    {{- include "identity-plane.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  token: {{ $s.transit.token | quote }}
+{{- end }}
 {{- end }}

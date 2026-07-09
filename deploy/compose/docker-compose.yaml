@@ -111,16 +111,32 @@ services:
       # runs with telemetry on out of the box.
       OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=lab}
       # identity-contract-signing: x-identity-contract is a SIGNED token (no plain-string
-      # form). Provide signing material to emit it — drop key.pem + jwks.json into
-      # ./signing/ and set SIGNING_KEY_PATH + SIGNING_KID + JWKS_FILE. Without it the
-      # sidecar emits no contract (a verifying box fails closed). See
-      # docs/runbook-contract-signing-keys.md.
-      SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-}
-      SIGNING_KID: ${SIGNING_KID:-}
+      # form). Two ways to provide signing material — see docs/runbook-contract-signing-keys.md:
+      #
+      #   1. automate-signing-key-rotation (recommended): managed custody + AUTOMATED
+      #      rotation via OpenBao Transit (Mode B — the plane signs locally). Start the
+      #      bundled OpenBao with `docker compose --profile signing up`, provision the key
+      #      (./signing/transit-init.sh), then set SIGNING_TRANSIT_KEY + BAO_ADDR + BAO_TOKEN.
+      #      The JWKS is GENERATED from Transit and served on :9210 — no jwks.json to sync.
+      #   2. Break-glass (manual, also the Transit startup fallback): drop key.pem + jwks.json
+      #      into ./signing/ and set SIGNING_KEY_PATH + SIGNING_KID + JWKS_FILE.
+      #
+      # Without either, the sidecar emits no contract (a verifying box fails closed).
       SIGNING_ISSUER: ${SIGNING_ISSUER:-https://identity.nexus}
       CONTRACT_TOKEN_TTL_SECONDS: ${CONTRACT_TOKEN_TTL_SECONDS:-60}
-      JWKS_FILE: ${JWKS_FILE:-}
       JWKS_LISTEN: ${JWKS_LISTEN:-0.0.0.0:9210}
+      # (1) OpenBao Transit — managed automated rotation. Empty by default (off).
+      SIGNING_TRANSIT_KEY: ${SIGNING_TRANSIT_KEY:-}
+      SIGNING_TRANSIT_MOUNT: ${SIGNING_TRANSIT_MOUNT:-transit}
+      BAO_ADDR: ${BAO_ADDR:-}
+      BAO_TOKEN: ${BAO_TOKEN:-}
+      SIGNING_KEY_POLL_SECONDS: ${SIGNING_KEY_POLL_SECONDS:-30}
+      CONTRACT_MAX_CLOCK_SKEW_SECONDS: ${CONTRACT_MAX_CLOCK_SKEW_SECONDS:-60}
+      SIGNING_ROTATION_PERIOD_SECONDS: ${SIGNING_ROTATION_PERIOD_SECONDS:-}
+      # (2) Break-glass manual PEM. Empty by default (off).
+      SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-}
+      SIGNING_KID: ${SIGNING_KID:-}
+      JWKS_FILE: ${JWKS_FILE:-}
     volumes:
       # Operator-supplied signing material (empty until you opt in — see runbook).
       - ./signing:/etc/nexus/signing:ro
@@ -133,6 +149,31 @@ services:
       timeout: 3s
       retries: 6
       start_period: 10s
+
+  # automate-signing-key-rotation: a local OpenBao for the managed-rotation path. Behind
+  # the `signing` profile so it is OFF by default (`docker compose up` is unaffected);
+  # start it with `docker compose --profile signing up openbao`. DEV MODE ONLY — an
+  # in-memory, unsealed, root-token server; NEVER a production posture. After it is up,
+  # provision the Transit key with ./signing/transit-init.sh, then point the sidecar at it
+  # (SIGNING_TRANSIT_KEY=identity-contract-signing, BAO_ADDR=http://openbao:8200,
+  # BAO_TOKEN=root). See docs/runbook-contract-signing-keys.md.
+  openbao:
+    image: ${OPENBAO_IMAGE:-openbao/openbao:2.4}
+    profiles: ["signing"]
+    restart: unless-stopped
+    cap_add: ["IPC_LOCK"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${BAO_DEV_ROOT_TOKEN_ID:-root}
+      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    command: ["server", "-dev"]
+    ports:
+      - "${BAO_PORT:-8200}:8200"
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
 
   # Nexus-native authorization authoring surface (nexus-native-authorization). The
   # SINGLE source of record for roles/entitlements/suspension: it authors them into

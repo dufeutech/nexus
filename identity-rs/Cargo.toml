@@ -62,6 +62,25 @@ getrandom = "0.2"
 # carries RUSTSEC-2023-0071 (unfixed RSA timing side-channel) which cargo-deny rejects,
 # and we only ever use ES256. `use_pem` (default) enables from_ec_pem / from_jwk.
 jsonwebtoken = "9"
+# automate-signing-key-rotation: managed key custody + rotation via OpenBao Transit
+# (Mode B — the plane exports key material and signs LOCALLY, so the per-request hot
+# path never hops to Bao). `vaultrs` is the maintained async Transit client; `p256`
+# derives the published JWK from Transit's exported public keys (and generates EC P-256
+# keys for the in-memory fake provider in tests); `rand_core` (test-only) is the CSPRNG
+# that fake key generation draws from. All three are confined to the sidecar's
+# keyprovider/transit adapters behind the `KeyProvider` port — no Transit/crypto type
+# crosses it. See the change's design.md Decision 1.
+# `rustls-no-provider`: use rustls WITHOUT its bundled default crypto provider so vaultrs
+# reuses the `ring` backend already in-tree (jsonwebtoken/sqlx) instead of pulling
+# `aws-lc-sys` — which carries the OpenSSL license (NOT in deny.toml's allow-list, so
+# cargo-deny would reject it) and needs a cmake/C toolchain to build. Staying on ring
+# avoids both, matching the same "ring, not OpenSSL" posture as the jsonwebtoken pin above.
+vaultrs = { version = "0.8", default-features = false, features = ["rustls-no-provider"] }
+# Since vaultrs uses rustls WITHOUT a bundled provider, install the in-tree `ring` provider
+# as the process default at startup so its Transit HTTPS client has a crypto backend.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+p256 = { version = "0.13", features = ["jwk", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # ──────────────────────────────────────────────────────────────
 # Rustc lints — deny everything allowed-by-default that matters

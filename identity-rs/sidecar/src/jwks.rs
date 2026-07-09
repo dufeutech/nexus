@@ -1,15 +1,18 @@
-//! Dedicated public JWKS listener (identity-contract-signing). Publishes the
-//! operator-supplied JWKS document — the PUBLIC verification keys for the signed
-//! `x-identity-contract` token — so a box can fetch and cache them and verify a
-//! token's signature/`iss`/`aud`/`exp` itself.
+//! Dedicated public JWKS listener (identity-contract-signing). Publishes the PUBLIC
+//! verification keys for the signed `x-identity-contract` token — so a box can fetch
+//! and cache them and verify a token's signature/`iss`/`aud`/`exp` itself.
 //!
 //! Deliberately a SEPARATE surface from the `:9200` profile API: that server exposes
 //! `/profile/{sub}` (sensitive) and must stay internal, whereas the JWKS is public and
-//! box-reachable. The document is operator-supplied and served **verbatim** — the
-//! sidecar never derives public keys from the private signing key, so no EC-parsing
-//! dependency is pulled in. Rotation = update the mounted JWKS file (publish the new
-//! `kid` before the signer starts using it; keep the retired key until its tokens
-//! expire).
+//! box-reachable.
+//!
+//! Since automate-signing-key-rotation the served document is **swap-able**: the
+//! rotation manager ([`crate::rotation`]) regenerates it from the key provider's public
+//! keys on every rotation and publishes it over a `watch` channel, so a two-key overlap
+//! window appears automatically as a two-entry `keys` array with NO hand-sync step. In
+//! break-glass mode the operator-supplied `JWKS_FILE` is wrapped in a never-changing
+//! `watch` and served through the same path. Each request reads the CURRENT document, so
+//! a rotation is visible to boxes without a restart.
 
 use std::sync::Arc;
 
@@ -17,19 +20,20 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use tokio::sync::watch;
 
 /// The well-known path boxes fetch the key set from (`iss` + this path).
 pub(crate) const JWKS_PATH: &str = "/.well-known/jwks.json";
 
-/// Build the JWKS router. `document` is the operator-supplied JSON, loaded once at
-/// startup and served verbatim with a JSON content type. Supporting multiple keys
-/// (rotation overlap) is inherent — whatever the operator publishes in the document is
-/// served, so a two-key overlap window is just a two-entry `keys` array.
-pub(crate) fn router(document: Arc<String>) -> Router {
+/// Build the JWKS router over a swap-able document. `document` is a `watch` receiver the
+/// rotation manager republishes on every rotation (or a never-changing channel wrapping
+/// the break-glass `JWKS_FILE`); each request serves the CURRENT value with a JSON
+/// content type, so the published overlap set tracks rotation with no restart.
+pub(crate) fn router(document: watch::Receiver<Arc<String>>) -> Router {
     Router::new().route(
         JWKS_PATH,
         get(move || {
-            let body = Arc::clone(&document);
+            let body = document.borrow().clone();
             async move { ([(CONTENT_TYPE, "application/json")], body.as_str().to_owned()).into_response() }
         }),
     )
@@ -49,7 +53,8 @@ mod tests {
     #[tokio::test]
     async fn serves_the_supplied_jwks_verbatim_as_json() {
         let doc = Arc::new(r#"{"keys":[{"kid":"k1"}]}"#.to_owned());
-        let app = router(Arc::clone(&doc));
+        let (_tx, rx) = watch::channel(Arc::clone(&doc));
+        let app = router(rx);
         let resp = app
             .oneshot(Request::builder().uri(JWKS_PATH).body(Body::empty()).unwrap())
             .await
