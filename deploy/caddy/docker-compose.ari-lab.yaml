@@ -1,0 +1,52 @@
+# LAB-ONLY: task 4.6 ARI renewal-observation stack. A local, ARI-capable ACME CA (Pebble)
+# + the front tier (Caddyfile.ari) pointed at it, sharing the running zitadel-lab network
+# so the front tier reaches tenant-router (ask) and envoy (upstream). Lets us observe
+# certmagic obtaining a real ACME cert and driving renewal via ARI, WITHOUT Let's Encrypt.
+#   docker compose -f deploy/caddy/docker-compose.ari-lab.yaml up -d
+#   docker compose -f deploy/caddy/docker-compose.ari-lab.yaml down
+name: caddy-ari-lab
+
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    container_name: ari-pebble
+    command: ["-config", "/pebble/pebble-config.json"]
+    environment:
+      # Skip the challenge-VALIDATION callback (we are not testing DNS/HTTP-01 here, only
+      # ARI). With this, Pebble accepts authorizations without dialing back to the domain,
+      # so no challtestsrv/DNS wiring is needed. NOSLEEP removes the random VA delay.
+      PEBBLE_VA_ALWAYS_VALID: "1"
+      PEBBLE_VA_NOSLEEP: "1"
+    volumes:
+      - ./ari-lab/pebble-config.json:/pebble/pebble-config.json:ro
+    networks:
+      lab:
+        # Pebble's :14000 endpoint cert is valid for SAN `pebble`/`localhost`, so the ACME
+        # client must reach it by that name (container_name ari-pebble avoids host clashes).
+        aliases: [pebble]
+
+  caddy-ari:
+    image: caddy-front/caddy:lab           # reuse the xcaddy image built for the lab tier
+    container_name: caddy-ari-lab
+    restart: "no"
+    depends_on: [pebble]
+    environment:
+      CADDY_STORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/routing?sslmode=disable
+      AUTHORIZE_URL: http://tenant-router:9300/authorize
+      EDGE_UPSTREAM: envoy:10000
+      ACME_CA_DIR: https://pebble:14000/dir
+      ACME_EMAIL: tls-ops@acme.test
+      # Trust Pebble's ACME HTTPS endpoint: Go's crypto/x509 honors SSL_CERT_FILE, so
+      # certmagic's ACME client trusts pebble.minica.pem for the :14000 connection.
+      SSL_CERT_FILE: /ari/pebble.minica.pem
+    volumes:
+      - ./Caddyfile.ari:/etc/caddy/Caddyfile:ro
+      - ./ari-lab/pebble.minica.pem:/ari/pebble.minica.pem:ro
+    ports:
+      - "8445:443"
+    networks: [lab]
+
+networks:
+  lab:
+    name: zitadel-lab_default
+    external: true

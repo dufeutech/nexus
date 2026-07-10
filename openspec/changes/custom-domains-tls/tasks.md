@@ -71,6 +71,29 @@ authorizes arbitrarily many distinct SNIs, so cardinality needs no DB seeding.
   rows — and the tier stays up (a second attempt defers cleanly). Onboarding failure never
   touched live serving.
 
+### Live lab run (4.6 partial) — ARI-driven renewal against a local ARI CA
+
+`scripts/custom-domains-tls-ari.sh` (`Caddyfile.ari` + `docker-compose.ari-lab.yaml` +
+`ari-lab/pebble-config.json`) stands up **Pebble** — an ACME CA that implements ARI
+(`draft-ietf-acme-ari-03`) — as the issuer, with a shortened cert validity so a renewal is
+observable in-run. Observed end-to-end (the CA is reached over HTTPS trusted via
+`SSL_CERT_FILE`=Pebble's minica; challenge validation is bypassed with
+`PEBBLE_VA_ALWAYS_VALID` since only ARI is under test):
+
+- certmagic obtained a **real ACME cert** for `ari-test.acme.test` from Pebble (issuer
+  `pebble:14000-dir`), not the internal CA.
+- certmagic **fetched the CA's `renewalInfo`** (`got renewal info` — window_start/window_end/
+  selected_time; Pebble logged the `GET /draft-ietf-acme-ari-03/renewalInfo/` hit).
+- certmagic **renewed the cert in advance**, explicitly ARI-driven: `certificate needs
+  renewal based on ARI window` → renewed with ~60s still remaining before expiry → a second
+  Pebble issuance (serial `458f…` → `48e1…`). Note: an on-demand cert renews on next access
+  once inside its ARI window (`renewal_cutoff`), not purely via background maintenance.
+
+This closes the **"renews in advance, ARI-driven"** half of 4.6 locally. The remaining half
+— that renewals do **not** consume net-new order budget (the ARI *exemption*) — is a
+Let's-Encrypt-account rate-limit property Pebble cannot reproduce, so 4.6 stays open pending
+the real LE issuer (design.md D4).
+
 ### Live lab run (5.1) — front tier deployed alongside the running edge
 
 Deployed `deploy/caddy/docker-compose.lab.yaml` (Caddy v2.8.4 + xcaddy `postgres`
@@ -116,15 +139,19 @@ attached to the lab network; migration applied to the live `routing` DB. Observe
 **Still open (2 tasks)** — both intrinsically require the real Let's Encrypt service; the
 internal-CA lab cannot cover them:
 
-- **4.6** — renewal ahead of expiry + ARI rate-limit exemption. The "renews in advance /
-  fetches the ARI window" behavior is observable against a local ARI-capable test CA
-  (Pebble, pulled and available), but the governed property — that renewals do NOT consume
-  net-new issuance budget — is a Let's-Encrypt-account rate-limit observation that only the
-  real LE issuer over a renewal cycle can show. Not wall-clock testable locally.
+- **4.6** — renewal ahead of expiry + ARI rate-limit exemption. The **"renews in advance,
+  ARI-driven" half is now VERIFIED locally** against Pebble (an ARI-capable test CA) — see
+  the 4.6-partial run above and `scripts/custom-domains-tls-ari.sh`. What remains is the
+  governed property: that renewals do NOT consume net-new issuance budget (the ARI
+  *exemption*), which is a Let's-Encrypt-account rate-limit observation only the real LE
+  issuer over a renewal cycle can show. The task stays open until that half is confirmed.
 - **5.2** — request the LE per-account new-order override (external party; path documented
   in `design.md` Open Questions and runbook §4). Blocks on product's onboarding-rate number.
 
 **Harnesses:** `scripts/custom-domains-tls-e2e.sh` runs the §2–§4 checks against a
 public-DNS + LE staging deployment when one is available;
 `scripts/custom-domains-tls-cardinality.sh` (2.5) and `scripts/custom-domains-tls-outage.sh`
-(4.7) run locally against the internal-CA lab tier and pass 3/3 and 8/8 respectively.
+(4.7) run locally against the internal-CA lab tier and pass 3/3 and 8/8;
+`scripts/custom-domains-tls-ari.sh` (4.6 local half) runs against a local Pebble ARI CA
+(`Caddyfile.ari`, `docker-compose.ari-lab.yaml`, `ari-lab/`) and observes ARI-driven
+advance renewal.

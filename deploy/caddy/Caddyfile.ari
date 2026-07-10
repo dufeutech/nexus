@@ -1,0 +1,40 @@
+# LAB-ONLY variant of ./Caddyfile for task 4.6 (ARI renewal OBSERVATION). Identical to the
+# production on-demand + `ask` + Postgres-storage path, but the ACME issuer is a LOCAL
+# Pebble test CA that implements ACME Renewal Information (ARI, draft-ietf-acme-ari). This
+# lets us OBSERVE, without the real Let's Encrypt account, that certmagic:
+#   * obtains a real ACME cert (not the internal CA), and
+#   * uses ARI (fetches the CA's renewalInfo) to decide WHEN to renew — i.e. renewal is
+#     ARI-window-driven, which is the mechanism behind LE's rate-limit exemption.
+#
+# The rate-limit-EXEMPTION itself (that renewals do not consume net-new order budget) is a
+# Let's-Encrypt-account property and is NOT reproducible against Pebble; only the ARI
+# protocol path is. Do NOT ship this file. Trust for Pebble's ACME HTTPS endpoint is
+# supplied to certmagic's ACME client via SSL_CERT_FILE=<pebble.minica.pem> (see compose).
+
+{
+	key_type p256
+	email {$ACME_EMAIL}
+
+	storage postgres {
+		connection_string {$CADDY_STORAGE_PG_URL}
+		disable_ddl true
+	}
+
+	on_demand_tls {
+		ask {$AUTHORIZE_URL}
+	}
+
+	# ACME issuer = the local Pebble directory (ARI-capable). ARI is automatic on Caddy
+	# 2.8+ (do not disable). Pebble's ACME endpoint is HTTPS with a cert chained to
+	# pebble.minica.pem, which the container trusts via SSL_CERT_FILE.
+	cert_issuer acme {$ACME_CA_DIR}
+
+	skip_install_trust
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy {$EDGE_UPSTREAM}
+}
