@@ -1,0 +1,31 @@
+# LAB-ONLY: task 4.7 issuer-DOWN front tier. Same image/store/ask/upstream as the normal
+# lab tier (docker-compose.lab.yaml) but mounts Caddyfile.outage, whose ACME issuer points
+# at a refused port (ACME_CA_DIR) — a stand-in for "the CA is down". Runs as its own
+# compose project on the running zitadel-lab network, alongside (not replacing) any normal
+# tier. Tear down with:
+#   docker compose -f deploy/caddy/docker-compose.outage-lab.yaml down
+name: caddy-outage-lab
+
+services:
+  caddy-outage:
+    image: caddy-front/caddy:lab           # reuse the image already built for the lab tier
+    container_name: caddy-outage-lab
+    restart: "no"
+    environment:
+      CADDY_STORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/routing?sslmode=disable
+      AUTHORIZE_URL: http://tenant-router:9300/authorize
+      EDGE_UPSTREAM: envoy:10000
+      # "Down issuer": a refused port on loopback inside the container. certmagic gets an
+      # immediate connection-refused when it tries to reach the CA directory.
+      ACME_CA_DIR: https://127.0.0.1:1/directory
+    volumes:
+      - ./Caddyfile.outage:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8444:443"   # distinct from the normal lab tier's 8443
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: zitadel-lab_default
+    external: true

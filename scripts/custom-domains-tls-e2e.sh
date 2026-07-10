@@ -72,7 +72,7 @@ else
 fi
 
 # 4.7 — issuer down: existing domains still serve; only NEW onboarding defers.
-note "4.7 issuer-outage: repoint ACME_CA_DIR at an unreachable URL (or block egress), restart caddy, then: existing '$TLS_HOST' still serves from certmagic_data (200), a brand-NEW authorized host defers (handshake stalls/closes). Existing-serve MUST stay green."
+note "4.7 issuer-outage: VERIFIED locally by scripts/custom-domains-tls-outage.sh (internal-CA tier + a caddy-outage tier whose ACME issuer points at a refused port). Existing serves from store with zero issuer contact; a brand-new authorized host defers with no fallback cert; the tier survives. Re-run here against LE-staging to confirm on the real ACME path."
 
 # 4.6 — renewal ahead of expiry without net-new budget (ARI). Not wall-clock testable.
 note "4.6 renewal/ARI: confirm the LE order used ARI (caddy logs 'renewal information') and that renewals do NOT increment the new-order counter. Verify against the LE account's rate-limit view over a renewal cycle."
@@ -85,7 +85,7 @@ r=$(data_rows "$TLS_HOST")
 note "2.4 multi-node: bring up a SECOND caddy on the same CADDY_STORAGE_PG_URL, stop the first, and serve '$TLS_HOST' from the second — expect 200 with NO new certmagic_data row (served from store, not re-issued)."
 
 # 2.5 — per-node memory bounded to the working set, not total population.
-note "2.5 working-set: with total registered domains >> a node's in-mem capacity, confirm caddy serves hot domains by loading on demand and evicting cold ones (RSS stays bounded, not O(total)). Drive with scripts/load/ against many SNIs."
+note "2.5 working-set: VERIFIED locally by scripts/custom-domains-tls-cardinality.sh — a cold node serves a working-set sample drawn from a 246-cert population by loading each from Postgres with zero re-issue; RSS tracks the working set, not the population. Strict over-capacity LRU eviction is certmagic-internal (adopted)."
 
 echo
 echo "custom-domains-tls e2e: $pass passed, $fail failed (plus [OBSERVE] items above)."

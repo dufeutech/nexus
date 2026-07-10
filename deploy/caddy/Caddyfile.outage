@@ -1,0 +1,40 @@
+# LAB-ONLY variant of ./Caddyfile for task 4.7 (issuer-DOWN resilience). Identical to
+# the production on-demand + `ask` + Postgres-storage path, except the ACME issuer points
+# at a DELIBERATELY DEAD directory (a refused port) — standing in for "the CA is down".
+#
+# Purpose: prove that with the issuer unreachable, a brand-NEW authorized domain cannot
+# onboard (its handshake defers, no fallback cert is presented) while the tier itself
+# stays up. The complementary half — an EXISTING valid stored cert keeps serving with the
+# issuer down — is proven on Caddyfile.lab (internal CA): serving a cached valid cert is a
+# pure storage read that makes ZERO issuer calls, so it is issuer-independent by
+# construction (see scripts/custom-domains-tls-outage.sh). Do NOT ship this file.
+
+{
+	key_type p256
+
+	# Same shared, durable Postgres store as production/lab (we own the schema).
+	storage postgres {
+		connection_string {$CADDY_STORAGE_PG_URL}
+		disable_ddl true
+	}
+
+	# On-demand issuance, authorization-gated by nexus /authorize (fail-closed) — the ask
+	# gate still AUTHORIZES the new host; issuance then fails only because the CA is down.
+	on_demand_tls {
+		ask {$AUTHORIZE_URL}
+	}
+
+	# The "down issuer": an ACME directory at a refused port. certmagic authorizes via the
+	# ask gate, then cannot reach the CA to place the order -> onboarding defers. This is a
+	# connection-REFUSED (fast) rather than a blackhole (slow) so the deferral is prompt.
+	cert_issuer acme {$ACME_CA_DIR}
+
+	skip_install_trust
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy {$EDGE_UPSTREAM}
+}

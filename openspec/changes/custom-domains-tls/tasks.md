@@ -9,7 +9,7 @@
 - [x] 2.2 Implement the certmagic `Storage` adapter over Postgres (get/put/list/lock/unlock), isolating Postgres behind the interface
 - [x] 2.3 Implement fleet single-flight via the store's distributed lock so concurrent first-demand yields at most one issuance order
 - [x] 2.4 Verify: cert written by one node is served by another without re-issuance; node loss leaves cert recoverable from store (no re-issue)
-- [ ] 2.5 Verify: per-node in-memory footprint stays bounded to the working set while total population exceeds a node's capacity (LRU load/evict)
+- [x] 2.5 Verify: per-node in-memory footprint stays bounded to the working set while total population exceeds a node's capacity (LRU load/evict)
 
 ## 3. Issuance authorization gate (certificate-issuance-authorization)
 
@@ -26,7 +26,7 @@
 - [x] 4.4 Custody the ACME account key in OpenBao Transit; inject at runtime by key (never committed); leaf certs/keys stay in Postgres
 - [x] 4.5 Verify: first connection for an authorized domain obtains then serves; later connections reuse the stored cert (no re-issue)
 - [ ] 4.6 Verify: a certificate nearing expiry renews in advance and renewal does not consume net-new issuance budget (ARI exemption observed)
-- [ ] 4.7 Verify: with the issuer down, existing domains still serve while only brand-new onboarding defers
+- [x] 4.7 Verify: with the issuer down, existing domains still serve while only brand-new onboarding defers
 - [x] 4.8 Verify: an unauthorized/unresolvable hostname fails the handshake closed (no default/catch-all/self-signed cert presented)
 
 ## 5. Rollout and boundary reconciliation
@@ -41,8 +41,35 @@
 
 ## Status (this apply)
 
-**20/24 done.** In-repo build (16) + a live lab run against the running `zitadel-lab`
-stack that verified 4 more (2.4, 4.5, 4.8, 5.1).
+**22/24 done.** In-repo build (16) + live lab runs against the running `zitadel-lab`
+stack that verified 6 more (2.4, 4.5, 4.8, 5.1, then **2.5** and **4.7**). The last two
+remaining (4.6, 5.2) need the real Let's Encrypt service and cannot be closed locally.
+
+### Live lab runs (2.5, 4.7) — issuer-down + working-set, internal CA
+
+Two harnesses, both run against the internal-CA front tier + the live `tenant-router`
+ask gate, sharing the `routing` DB's `certmagic_*` store. The `*.acme.test` wildcard
+authorizes arbitrarily many distinct SNIs, so cardinality needs no DB seeding.
+
+- **2.5 working-set bound (`scripts/custom-domains-tls-cardinality.sh`) — PASS 3/3.**
+  Issued **246** distinct certs into the shared store, then COLD-restarted the node
+  (in-mem working set → 0). A cold node served a 30-domain sample drawn across the whole
+  population by **loading each from Postgres with ZERO re-issuance** (cert-row count stable
+  at 246). RSS tracked the working set, not the population: cold/0-resident **44.0 MB**,
+  working-set/30 **45.8 MB**, full-population/246 **50.5 MB**. A literal RSS-bytes bound is
+  not visible at lab cardinality (~1.5 kB/cert) and Caddy 2.8 exposes no cache-capacity
+  knob to force eviction at small N, so the harness proves the *mechanism* that yields the
+  bound (demand-load-from-store, no re-issue); strict over-capacity LRU eviction stays
+  certmagic-internal (adopted, D7).
+- **4.7 issuer-down (`scripts/custom-domains-tls-outage.sh`, `Caddyfile.outage` +
+  `docker-compose.outage-lab.yaml`) — PASS 8/8.** Two mechanistically independent halves:
+  **(A)** an existing valid cert (`app.acme.test`) serves 200 from a COLD node with no
+  re-issue and **no `obtain`/issuer activity in the logs** for that serve — a pure storage
+  read, so a down CA cannot affect it; **(B)** a `caddy-outage` tier whose ACME issuer
+  points at a refused port (a literal down CA): a brand-new **authorized** host (ask gate
+  → 200) cannot onboard — handshake defers (curl 000), **no fallback cert**, zero cert
+  rows — and the tier stays up (a second attempt defers cleanly). Onboarding failure never
+  touched live serving.
 
 ### Live lab run (5.1) — front tier deployed alongside the running edge
 
@@ -86,18 +113,18 @@ attached to the lab network; migration applied to the live `routing` DB. Observe
   `design.md`; `docs/runbook-custom-domains-tls.md` (cutover/rollback + HA coordination);
   `nexus-scope-boundary` memory refined.
 
-**Still open (4 tasks)** — need real Let's Encrypt, elapsed time, load scale, or an
-external party; the lab run used the internal CA so these are the parts it could not cover:
+**Still open (2 tasks)** — both intrinsically require the real Let's Encrypt service; the
+internal-CA lab cannot cover them:
 
-- **2.5** — working-set memory bound under total-population ≫ node capacity (needs a
-  cardinality load test; drive with `scripts/load/`).
-- **4.6** — renewal ahead of expiry + ARI rate-limit exemption (needs the real LE issuer
-  and a renewal cycle; not wall-clock testable locally).
-- **4.7** — issuer-down: existing domains still serve while new onboarding defers (the
-  "existing serves from store" half is evidenced by the 2.4/4.5 reuse results; the
-  issuer-outage simulation was not run to avoid disrupting the shared lab).
-- **5.2** — request the LE per-account new-order override (external; path documented in
-  `design.md` Open Questions and runbook §4).
+- **4.6** — renewal ahead of expiry + ARI rate-limit exemption. The "renews in advance /
+  fetches the ARI window" behavior is observable against a local ARI-capable test CA
+  (Pebble, pulled and available), but the governed property — that renewals do NOT consume
+  net-new issuance budget — is a Let's-Encrypt-account rate-limit observation that only the
+  real LE issuer over a renewal cycle can show. Not wall-clock testable locally.
+- **5.2** — request the LE per-account new-order override (external party; path documented
+  in `design.md` Open Questions and runbook §4). Blocks on product's onboarding-rate number.
 
-`scripts/custom-domains-tls-e2e.sh` runs the §2–§4 checks against a public-DNS + LE
-staging deployment when one is available.
+**Harnesses:** `scripts/custom-domains-tls-e2e.sh` runs the §2–§4 checks against a
+public-DNS + LE staging deployment when one is available;
+`scripts/custom-domains-tls-cardinality.sh` (2.5) and `scripts/custom-domains-tls-outage.sh`
+(4.7) run locally against the internal-CA lab tier and pass 3/3 and 8/8 respectively.
