@@ -43,6 +43,39 @@ Hard rejects (override score): active security risk · incompatible license · a
 
 Evaluate **lifecycle** cost (integration, upgrades, patching, ops), not just first build. Revisit decisions every 6–12 months — none are permanent.
 
+### Never hand-roll (mandatory adopt)
+
+Some concerns are a defect the moment they are hand-written, regardless of score — the failure modes are subtle, security- or correctness-critical, and mature standards already exist. For these, `/opsx:decide` records _which_ tool, never _whether_ to build:
+
+- **Cryptography & hashing** — vetted libraries only; never invent ciphers, token signing/verification, or password hashing.
+- **Authentication & authorization** — adopt a mature engine/policy layer; no bespoke session, token, or access-control logic.
+- **Secrets management** — a secret manager or injected env, never a home-grown store.
+- **Observability & telemetry** — emit through OpenTelemetry, not a bespoke tracing/metrics/logging stack. See below.
+- **Standard-format parsing/serialization** — use the format's mature parser (JSON, YAML, TOML, Protobuf…); don't write your own.
+- **Time, locale, and money** — established libraries; never ad-hoc date math or float currency.
+
+Domain models stay tool-agnostic: instrumentation, auth, and persistence live in the adapter/service layers, never inside entities.
+
+## Observability model (adopt OpenTelemetry)
+
+Telemetry is an **adapter concern**. Application code emits signals through the OpenTelemetry **API**; the **SDK**, exporter, and collector/backend are wired once at the composition root. Libraries depend on the API only (vendor-neutral); the application owns export. Guiding principle: production services should emit telemetry, but application code must not be tightly coupled to telemetry APIs.
+
+**Signals** — Traces (request lifecycle, latency, dependency mapping), Metrics (time-series: counters, up/down counters, gauges, histograms), Logs (structured records), plus Events (milestones embedded in a span) and Profiles (emerging: CPU/heap/lock sampling). The correlation chain `log → span → trace` turns an error into an exact request path; context propagation (trace/span IDs + baggage) carries it across service boundaries. Follow the semantic conventions (`http.*`, `db.*`, `service.name`, `deployment.environment`) so every tool reads the data the same way.
+
+**Where to instrument** — high value at the edges, none in the core:
+
+| Layer                                                   | Instrumentation                                       |
+| ------------------------------------------------------- | ----------------------------------------------------- |
+| HTTP / gRPC / DB / broker / cache clients               | Automatic — broad coverage, minimal code              |
+| Middleware / pipelines / auth / retries / rate limiting | High value — cross-cutting spans                      |
+| Service layer                                           | Selective — meaningful operations (checkout, payment) |
+| Repository layer                                        | DB spans                                              |
+| Domain models / entities                                | **None** — stay telemetry-agnostic                    |
+
+- **Business logic**: instrument meaningful operations only — not utility functions, pure transformations, or low-level helpers.
+- **Metrics**: business-relevant only (orders processed, payment failures, queue depth, cache efficiency, request latency). Don't meter internal computations.
+- **Errors**: capture operationally relevant failures (exceptions, timeouts, external failures, retries, critical validation) once — avoid duplicate reporting across layers.
+
 ## Abstraction layers
 
 | Layer | Artifact              | Holds                                                      | Never holds           |
@@ -54,6 +87,14 @@ Evaluate **lifecycle** cost (integration, upgrades, patching, ops), not just fir
 - One canonical design — decide, don't list variants.
 - Composable core; every surface is a thin adapter (no logic, no state).
 - Dependencies point **inward**: adapters → application → domain core. Core runs with no surface present.
+
+## File size guidelines
+
+A file's line count is a proxy for whether it holds a single clear responsibility. Treat these as review thresholds, not hard limits:
+
+- **< 300 LOC** — Excellent. Clear, focused, and easy for humans and AI to understand.
+- **300–600 LOC** — Generally acceptable. Ensure the file still has a single clear responsibility.
+- **> 600 LOC** — Review required. Prefer splitting into smaller modules unless there is a strong reason to keep it together.
 
 ## Externalize native-format content (data is not code)
 
