@@ -33,9 +33,10 @@ use identity_core::store::{BoxError, Change, WatchToken};
 use identity_core::{Authority, PlatformScope, PrincipalKind, ScopeIntersectionResolver};
 use store_postgres::{PgPlatformServiceReader, PgWorkspacePlanReader};
 
+use crate::authz::decide_route_requirements;
 use crate::enrich::{
-    decide_route_requirements, enrich_response, forbidden_403, hide_nonmember_as_404,
-    not_found_404, unavailable_503, warming_503, Acting, Enriched, SignContext,
+    enrich_response, forbidden_403, hide_nonmember_as_404, not_found_404, unavailable_503,
+    warming_503, Acting, Enriched, SignContext,
 };
 use crate::extract::{
     extract_acting_workspace, extract_api_key, extract_identity, extract_requirements,

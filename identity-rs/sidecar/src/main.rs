@@ -59,6 +59,7 @@ mod transit;
 mod state;
 mod extract;
 mod enrich;
+mod authz;
 mod serve;
 mod api;
 mod bootstrap;
