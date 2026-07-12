@@ -39,6 +39,12 @@ pub(crate) struct Metrics {
     /// sign) vs a mint (cache miss or expiry-safe re-mint). The hit-rate is the RPS win.
     pub(crate) contract_cache_hits: Counter<u64>,
     pub(crate) contract_cache_mints: Counter<u64>,
+    /// apikey-resolve-cache: the opt-in working-set cache on the api-key resolve path.
+    /// `hits`/`misses` are the effectiveness signal (a hit is a skipped live SELECT);
+    /// `evictions` counts change-feed-driven targeted invalidations (revoke/rotate).
+    pub(crate) apikey_resolve_cache_hits: Counter<u64>,
+    pub(crate) apikey_resolve_cache_misses: Counter<u64>,
+    pub(crate) apikey_resolve_cache_evictions: Counter<u64>,
     pub(crate) kv_updates: Counter<u64>,
     pub(crate) cache_entries: Gauge<u64>,
     pub(crate) ready: Gauge<u64>,
@@ -62,6 +68,11 @@ pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         cache_misses: meter.u64_counter("sidecar_cache_misses").build(),
         contract_cache_hits: meter.u64_counter("sidecar_contract_cache_hits").build(),
         contract_cache_mints: meter.u64_counter("sidecar_contract_cache_mints").build(),
+        apikey_resolve_cache_hits: meter.u64_counter("sidecar_apikey_resolve_cache_hits").build(),
+        apikey_resolve_cache_misses: meter.u64_counter("sidecar_apikey_resolve_cache_misses").build(),
+        apikey_resolve_cache_evictions: meter
+            .u64_counter("sidecar_apikey_resolve_cache_evictions")
+            .build(),
         kv_updates: meter.u64_counter("sidecar_kv_updates").build(),
         cache_entries: meter.u64_gauge("sidecar_cache_entries").build(),
         ready: meter.u64_gauge("sidecar_ready").build(),
@@ -396,6 +407,7 @@ mod tests {
                     key_id: "pak_1".to_owned(),
                     creator_sub: "u-creator".to_owned(),
                     scope: ApiKeyScope::new(vec!["ws-1".to_owned()]),
+                    expires_at: None,
                 }))
             }
         }

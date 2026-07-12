@@ -50,7 +50,9 @@ mod hasher;
 mod platform_services;
 mod source_memberships;
 mod workspace_plans;
-pub use api_keys::{IssuedKey, PgApiKeyReader, PgApiKeyStore, API_KEY_CHANGE_CHANNEL};
+pub use api_keys::{
+    ApiKeyChangeFeed, IssuedKey, PgApiKeyReader, PgApiKeyStore, API_KEY_CHANGE_CHANNEL,
+};
 pub use hasher::HmacSecretHasher;
 pub use platform_services::{PgPlatformServiceReader, PlatformFeed, PLATFORM_CHANGE_CHANNEL};
 pub use source_memberships::PgSourceMembershipReader;

@@ -361,6 +361,15 @@ services:
       CONTRACT_CACHE_ENABLED: ${CONTRACT_CACHE_ENABLED:-true}
       CONTRACT_CACHE_TTL_SECONDS: ${CONTRACT_CACHE_TTL_SECONDS:-5}
       CONTRACT_CACHE_MAX_CAPACITY: ${CONTRACT_CACHE_MAX_CAPACITY:-100000}
+      # apikey-resolve-cache: OPT-IN (default OFF) bounded working-set cache for the api-key
+      # resolve SELECT. Off => a live, fail-closed resolve per request (revoke effective on
+      # the next request). On => repeat requests for one key skip the DB; revoke/rotate stay
+      # live within seconds via the api_key_changes feed, and the TTL bounds staleness if a
+      # NOTIFY is dropped. Requires api-key auth (APIKEY_PG_RO_URL) to be on.
+      APIKEY_RESOLVE_CACHE_ENABLED: ${APIKEY_RESOLVE_CACHE_ENABLED:-false}
+      APIKEY_RESOLVE_CACHE_TTL_SECONDS: ${APIKEY_RESOLVE_CACHE_TTL_SECONDS:-5}
+      APIKEY_RESOLVE_CACHE_MAX_CAPACITY: ${APIKEY_RESOLVE_CACHE_MAX_CAPACITY:-100000}
+      APIKEY_RESOLVE_CACHE_POLL_SECONDS: ${APIKEY_RESOLVE_CACHE_POLL_SECONDS:-30}
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)

@@ -31,8 +31,9 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
 use identity_core::telemetry;
 use identity_core::store::{BoxError, Change, WatchToken};
 use identity_core::{Authority, PlatformScope, PrincipalKind, ScopeIntersectionResolver};
-use store_postgres::{PgPlatformServiceReader, PgWorkspacePlanReader};
+use store_postgres::{PgApiKeyReader, PgPlatformServiceReader, PgWorkspacePlanReader};
 
+use crate::api_key_cache::ApiKeyResolveCache;
 use crate::authz::decide_route_requirements;
 use crate::enrich::{
     enrich_response, forbidden_403, hide_nonmember_as_404, not_found_404, unavailable_503,
@@ -519,6 +520,40 @@ pub(crate) async fn watch_workspace_plans(
                 }
             }
             Err(e) => warn!(error = %e, "workspace-plan watch failed; retrying"),
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// API-key resolve-cache eviction listener (apikey-resolve-cache task 4.x): consume the
+// `api_key_changes` feed and evict ONLY the affected key's cached resolution on a
+// revoke/rotate, so revocation stays live within seconds while the cache is enabled. The
+// keyspace is unbounded, so — unlike the platform/plan watchers — this NEVER reloads a
+// whole set: each signal targets one entry via the cache's key_id→key_hash reverse index,
+// and the cache's own TTL is the self-heal ceiling for any dropped NOTIFY. Constructed
+// only when the resolve cache is enabled (default OFF).
+// --------------------------------------------------------------------------- //
+pub(crate) async fn watch_api_key_changes(url: String, poll: Duration, cache: ApiKeyResolveCache) {
+    loop {
+        match PgApiKeyReader::watch_changes(&url, poll).await {
+            Ok(mut feed) => {
+                info!("watching api-key change feed (resolve-cache eviction)");
+                while let Some(item) = feed.next().await {
+                    match item {
+                        // The payload is the affected key_id; evict just that entry.
+                        Ok(Some(key_id)) => cache.invalidate_key_id(&key_id),
+                        // A poll heartbeat — nothing to evict; the TTL is the staleness
+                        // ceiling, so a missed NOTIFY still self-heals within it.
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(error = %e, "api-key change feed error; reconnecting");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "api-key change-feed listen failed; retrying"),
         }
         sleep(Duration::from_secs(2)).await;
     }

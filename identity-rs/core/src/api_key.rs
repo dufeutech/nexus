@@ -67,6 +67,12 @@ pub struct ApiKeyCandidate {
     pub creator_sub: String,
     /// The key's scopes.
     pub scope: ApiKeyScope,
+    /// The key's absolute expiry as epoch seconds; `None` when the key does not expire. An
+    /// intrinsic property of the resolved key (the live store already filters on it), NOT a
+    /// caching concern — it is surfaced so a resolve *cache* adapter can honor expiry on a
+    /// hit (`apikey-resolve-cache`) without extending a key's usable life past expiration.
+    /// The live path ignores it (the DB `expires_at > now()` filter is the enforcement).
+    pub expires_at: Option<i64>,
 }
 
 /// Composes a key's scopes with the **creator's live membership** to produce the
@@ -160,6 +166,7 @@ mod tests {
             key_id: "pak-1".to_owned(),
             creator_sub: "u-creator".to_owned(),
             scope: ApiKeyScope::new(scopes.iter().map(|s| (*s).to_owned()).collect()),
+            expires_at: None,
         }
     }
 
@@ -208,6 +215,7 @@ mod tests {
             key_id: "pak-1".to_owned(),
             creator_sub: "u-creator".to_owned(),
             scope: ApiKeyScope::default(),
+            expires_at: None,
         };
         assert!(empty.scope.is_empty());
         assert!(ScopeIntersectionResolver::resolve(&empty, "ws-1", Some(membership("ws-1"))).is_none());

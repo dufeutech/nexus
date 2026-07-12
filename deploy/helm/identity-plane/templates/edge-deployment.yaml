@@ -47,6 +47,17 @@ spec:
               value: {{ .Values.sidecar.rustLog | quote }}
             - name: LOG_FORMAT
               value: {{ .Values.sidecar.logFormat | quote }}
+            {{- with .Values.sidecar.apiKeyResolveCache }}
+            {{- if .enabled }}
+            # apikey-resolve-cache: opt-in bounded working-set cache for the api-key resolve
+            # SELECT. Targeted eviction on the api_key_changes feed keeps revoke/rotate live
+            # within seconds; ttlSeconds is the staleness ceiling for a dropped NOTIFY.
+            - { name: APIKEY_RESOLVE_CACHE_ENABLED, value: "true" }
+            - { name: APIKEY_RESOLVE_CACHE_TTL_SECONDS, value: {{ .ttlSeconds | quote }} }
+            - { name: APIKEY_RESOLVE_CACHE_MAX_CAPACITY, value: {{ .maxCapacity | quote }} }
+            - { name: APIKEY_RESOLVE_CACHE_POLL_SECONDS, value: {{ .pollSeconds | quote }} }
+            {{- end }}
+            {{- end }}
             {{- $otlp := include "identity-plane.otlpEndpoint" . }}
             {{- if $otlp }}
             # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
