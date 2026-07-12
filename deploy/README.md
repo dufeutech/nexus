@@ -515,6 +515,11 @@ staging first (`EDGE=… AUTHZ=… CONTROL_PLANE=… PROM_URL=… scripts/go-liv
 A green run proves the mechanics are wired; the human still signs off what no
 script can judge (backend stamp enforcement, store HA/backups, capacity).
 
+For the end-to-end sequence (staging → deploy → harness → sign-offs → authz
+provisioning → rollout), follow the ordered runbook
+[`../docs/go-live-walkthrough.md`](../docs/go-live-walkthrough.md); the list
+below is the authoritative per-item detail it points back to.
+
 ### Security invariants
 
 - [ ] **Origin enforcement is real, not just asserted.**
