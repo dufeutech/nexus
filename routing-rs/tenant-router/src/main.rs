@@ -28,6 +28,7 @@ mod serve;
 mod api;
 
 use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use std::env::var;
 
 use moka::future::Cache;
 use tokio::net::TcpListener;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -52,8 +54,28 @@ use store_postgres::{PgInvalidations, PgRoutingStore};
 use crate::state::{AppState, METRICS};
 use crate::serve::{env, shutdown_signal, watch_invalidations, Router};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// Build the Tokio runtime, sizing the worker pool from `TOKIO_WORKER_THREADS`
+/// (hot-path-rps-optimization). Unset keeps Tokio's default of one worker per logical core,
+/// which oversubscribes CPU when this plane is co-located with the edge and the identity
+/// plane; set it to the container's core allotment so the runtimes stop fighting for cores.
+fn build_runtime() -> io::Result<Runtime> {
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(threads) = var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        builder.worker_threads(threads);
+    }
+    builder.build()
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    build_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     // Shared telemetry (first-party-telemetry): stdout logs exactly as before, plus
     // OTLP traces/logs/metrics when OTEL_EXPORTER_OTLP_ENDPOINT is set. Hold the
     // guard for the process lifetime so it flushes on shutdown.

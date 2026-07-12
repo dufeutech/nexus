@@ -26,7 +26,9 @@ envoy-types = "0.7"
 tokio.workspace = true
 tokio-stream = "0.1"
 futures.workspace = true
-moka = { version = "0.12", features = ["future"] }
+# `future` for the async profile cache (miss-load via try_get_with); `sync` for the
+# hot-path-rps-optimization contract reuse cache, which lives on the SYNC enrich path.
+moka = { version = "0.12", features = ["future", "sync"] }
 serde_json.workspace = true
 # identity-contract-signing: ES256 signer for the x-identity-contract token. The
 # ONLY crate that touches jsonwebtoken — isolated in `signer.rs` behind the

@@ -264,6 +264,11 @@ services:
       - /etc/envoy/envoy.yaml
       - --log-level
       - info
+      # hot-path-rps-optimization: Envoy worker-thread count. 0 (default) = auto (one
+      # per core, Envoy's default — unchanged when unset). Pin ENVOY_CONCURRENCY to the
+      # edge's core allotment when co-located so workers stop oversubscribing CPU.
+      - --concurrency
+      - "${ENVOY_CONCURRENCY:-0}"
       # N6 head-sampling knob, env-driven without templating the mounted
       # config: the runtime key tracing.random_sampling overrides the
       # stanza's random_sampling default. Whole percent, 0-100 (an integer

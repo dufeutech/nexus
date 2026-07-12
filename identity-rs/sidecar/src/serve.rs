@@ -309,6 +309,7 @@ impl Sidecar {
                         acting_plan.as_deref(),
                         &SignContext {
                             signer: active_signer.as_deref(),
+                            cache: self.state.contract_cache.as_ref(),
                             route_pool: route_pool.as_deref(),
                             now: now_secs(),
                         },
@@ -636,6 +637,7 @@ mod tests {
             aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
             pdp: test_pdp(),
             signer: None,
+            contract_cache: None,
             platform: None,
             plans: None,
             api_keys: None,

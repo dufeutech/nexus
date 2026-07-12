@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use moka::future::Cache;
 use rustls::crypto::ring;
 use tokio::net::TcpListener;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tonic::transport::Server;
@@ -43,6 +45,10 @@ use store_postgres::PgProfileStore;
 // public keys for boxes to verify against.
 mod jwks;
 mod signer;
+// hot-path-rps-optimization: in-process reuse cache for the signed x-identity-contract
+// (skips the per-request ES256 sign on repeat identities). moka in-process, rotation-safe
+// by keying on the active kid — never Redis (decide gate). Isolated in `token_cache`.
+mod token_cache;
 // automate-signing-key-rotation: managed key custody + automated rotation. The
 // `KeyProvider` port (keyprovider) isolates where signing keys come from; the OpenBao
 // Transit adapter (transit, Mode B local signing) is the production source; the rotation
@@ -70,8 +76,28 @@ use crate::serve::{
 };
 use crate::bootstrap::{build_api_key_auth, build_policy_pdp, build_signing};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// Build the Tokio runtime, sizing the worker pool from `TOKIO_WORKER_THREADS`
+/// (hot-path-rps-optimization). Unset keeps Tokio's default of one worker per logical core,
+/// which oversubscribes CPU when this sidecar is co-located with the edge and the other
+/// plane; set it to the container's core allotment so the runtimes stop fighting for cores.
+fn build_runtime() -> io::Result<Runtime> {
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(threads) = env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        builder.worker_threads(threads);
+    }
+    builder.build()
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    build_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     // automate-signing-key-rotation: the OpenBao Transit client (vaultrs) uses rustls
     // WITHOUT a bundled crypto provider (so we don't pull aws-lc-sys / cmake), so install
     // the in-tree `ring` provider as the process default before any TLS is built. `Err`
@@ -186,6 +212,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // off). Fails fast only on a genuine misconfiguration of the break-glass PEM itself.
     let signing = build_signing().await?;
 
+    // hot-path-rps-optimization: the signed-contract reuse cache. Enabled by default when
+    // signing is on; CONTRACT_CACHE_ENABLED=false disables it (sign-per-request, the prior
+    // behavior). The reuse window (CONTRACT_CACHE_TTL_SECONDS, default 5s) MUST stay << the
+    // contract TTL, and the 5s remaining-validity floor keeps a reused token from ever being
+    // served near expiry (identity-contract-signing ADDED delta).
+    let contract_cache = if signing.signer.is_some()
+        && env::var("CONTRACT_CACHE_ENABLED").map_or(true, |v| v != "false")
+    {
+        let reuse_ttl: u64 = env::var("CONTRACT_CACHE_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let capacity: u64 = env::var("CONTRACT_CACHE_MAX_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        info!(reuse_ttl_secs = reuse_ttl, capacity, "x-identity-contract reuse cache ON");
+        Some(token_cache::ContractTokenCache::new(
+            capacity,
+            Duration::from_secs(reuse_ttl),
+            5,
+        ))
+    } else {
+        info!("x-identity-contract reuse cache OFF (signing off or CONTRACT_CACHE_ENABLED=false)");
+        None
+    };
+
     let state = AppState {
         // max_capacity is the WORKING-SET bound (RFC §6.3 revised), not the
         // population; cold subjects load on demand and evict normally.
@@ -203,6 +256,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // The swap-able active signer resolved above (Transit-managed or break-glass
         // PEM); `None` when signing is deliberately off (anonymous still served).
         signer: signing.signer,
+        contract_cache,
         platform,
         plans,
         api_keys,

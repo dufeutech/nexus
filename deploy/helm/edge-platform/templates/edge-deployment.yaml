@@ -142,7 +142,9 @@ spec:
           image: {{ include "edge-platform.image" (dict "repo" $rv.images.envoy.repository "tag" $rv.images.envoy.tag "ctx" .) }}
           imagePullPolicy: {{ $rv.images.envoy.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
-          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          # hot-path-rps-optimization: --concurrency sizes Envoy's worker pool. 0 = auto
+          # (one per core); pin it (edge.concurrency) to the edge's CPU limit when co-located.
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info", "--concurrency", {{ .Values.edge.concurrency | default 0 | quote }}]
           ports:
             - { name: http, containerPort: 10000 }
             - { name: admin, containerPort: 9901 }

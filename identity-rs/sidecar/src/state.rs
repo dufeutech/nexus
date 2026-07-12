@@ -21,6 +21,7 @@ use identity_core::{
 };
 
 use crate::signer;
+use crate::token_cache::ContractTokenCache;
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): the RED baseline + operational gauges, emitted
@@ -34,6 +35,10 @@ pub(crate) struct Metrics {
     pub(crate) ext_proc_requests: Counter<u64>,
     pub(crate) cache_hits: Counter<u64>,
     pub(crate) cache_misses: Counter<u64>,
+    /// hot-path-rps-optimization: reuse of a cached signed contract (a skipped ES256
+    /// sign) vs a mint (cache miss or expiry-safe re-mint). The hit-rate is the RPS win.
+    pub(crate) contract_cache_hits: Counter<u64>,
+    pub(crate) contract_cache_mints: Counter<u64>,
     pub(crate) kv_updates: Counter<u64>,
     pub(crate) cache_entries: Gauge<u64>,
     pub(crate) ready: Gauge<u64>,
@@ -55,6 +60,8 @@ pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         ext_proc_requests: meter.u64_counter("sidecar_ext_proc_requests").build(),
         cache_hits: meter.u64_counter("sidecar_cache_hits").build(),
         cache_misses: meter.u64_counter("sidecar_cache_misses").build(),
+        contract_cache_hits: meter.u64_counter("sidecar_contract_cache_hits").build(),
+        contract_cache_mints: meter.u64_counter("sidecar_contract_cache_mints").build(),
         kv_updates: meter.u64_counter("sidecar_kv_updates").build(),
         cache_entries: meter.u64_gauge("sidecar_cache_entries").build(),
         ready: meter.u64_gauge("sidecar_ready").build(),
@@ -162,6 +169,12 @@ pub(crate) struct AppState {
     /// `None` when signing is not configured — then no token is minted and any client copy
     /// is stripped, so a verifying box fails closed.
     pub(crate) signer: Option<watch::Receiver<Arc<signer::Signer>>>,
+    /// hot-path-rps-optimization: the in-process reuse cache for the signed
+    /// `x-identity-contract`. A hit skips the ES256 signature entirely. `None` disables
+    /// reuse (sign-per-request) — set when signing is off or `CONTRACT_CACHE_ENABLED=false`.
+    /// Rotation-safe by construction (the active `kid` is part of its key), so it needs no
+    /// coordination with the signer `watch` swap. See [`crate::token_cache`].
+    pub(crate) contract_cache: Option<ContractTokenCache>,
     /// The RESIDENT active platform-service registry (`service_id` → its least-privilege
     /// [`PlatformScope`]), refreshed LIVE off the `platform.services` change feed
     /// (normalized-principal ADR-7). `None` when platform-service auth is not configured

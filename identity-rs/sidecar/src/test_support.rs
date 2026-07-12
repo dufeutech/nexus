@@ -78,7 +78,7 @@ pub(crate) fn enrich_response(
             acting,
         },
         None,
-        &SignContext { signer: None, route_pool: None, now: 0 },
+        &SignContext { signer: None, cache: None, route_pool: None, now: 0 },
     )
 }
 
@@ -148,7 +148,7 @@ pub(crate) fn api_key_enriched<'a>(key_id: &'a str, creator: &'a str, acting: Op
 
 /// Build a `SignContext` wired to the embedded test signer, aud `evenout`.
 pub(crate) fn signed_ctx(signer: &signer::Signer) -> SignContext<'_> {
-    SignContext { signer: Some(signer), route_pool: Some("evenout"), now: 1_000_000 }
+    SignContext { signer: Some(signer), cache: None, route_pool: Some("evenout"), now: 1_000_000 }
 }
 
 /// A Profile holding one workspace membership, for the resolution matrix.
@@ -259,6 +259,7 @@ pub(crate) fn state_with_platform(
         aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
         pdp: test_pdp(),
         signer: None,
+        contract_cache: None,
         platform,
         plans: None,
         api_keys: None,
@@ -279,6 +280,7 @@ pub(crate) fn state_with_plans(plans: Option<watch::Receiver<Arc<HashMap<String,
         aal_levels: Arc::new(parse_aal_levels(DEFAULT_AAL_LEVELS)),
         pdp: test_pdp(),
         signer: None,
+        contract_cache: None,
         platform: None,
         plans,
         api_keys: None,

@@ -186,6 +186,26 @@ only the collector's config knows the trace store (Tempo → Grafana). Export is
   and Tempo are EXTERNAL to the charts, exactly like Prometheus
   (ServiceMonitors → your operator). Enable it: a topology that can trace,
   should.
+### Hot-path throughput knobs (hot-path-rps-optimization)
+
+Per-request CPU tunables — all optional, with defaults that preserve prior behavior.
+Size the worker pools to each container's CPU limit when planes are co-located, so the
+runtimes stop oversubscribing cores (the largest co-located RPS win — see the
+`edge-load-capacity` ramp, `scripts/load/run-ramp.sh`).
+
+- **Worker threads (both Rust planes):** `TOKIO_WORKER_THREADS` on `identity-sidecar` and
+  `tenant-router`. Unset = one worker per core (Tokio default). Set it to the pod's CPU
+  allotment.
+- **Envoy workers:** `ENVOY_CONCURRENCY` (compose) / `edge.concurrency` (Helm
+  `edge-platform`). `0` = auto (one per core, default). Pin to the edge's CPU limit.
+- **Signed-contract reuse cache (identity sidecar):** reuses a signed `x-identity-contract`
+  for identical resolved identities within a short window, skipping the per-request ES256
+  sign. `CONTRACT_CACHE_ENABLED` (default `true`; `false` = sign per request),
+  `CONTRACT_CACHE_TTL_SECONDS` (default `5`, MUST stay ≪ `CONTRACT_TOKEN_TTL_SECONDS`),
+  `CONTRACT_CACHE_MAX_CAPACITY` (default `100000`). Rotation-safe (keyed on the active
+  signing-key id) and expiry-safe (a near-expiry token is re-minted). Consumers must not
+  treat the contract `jti` as a per-request nonce — see `docs/box-consumer-contract.md`.
+
 - **Hygiene is enforced in the stanza, not by policy:** span attributes are the
   access-log-allowed set only (method/path/status/durations, route pool,
   workspace id). Adding a `custom_tags` entry for a credential or `x-user-*`

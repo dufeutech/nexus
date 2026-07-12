@@ -119,6 +119,20 @@ impl Signer {
         })
     }
 
+    /// The active key id this signer stamps into the JWS header. Part of the
+    /// contract-token cache key so a cached token is never reused across a rotation:
+    /// after cut-over the current signer's `kid` differs, so lookups miss and re-mint
+    /// (hot-path-rps-optimization design Decision 4).
+    pub(crate) fn kid(&self) -> &str {
+        self.header.kid.as_deref().unwrap_or("")
+    }
+
+    /// The token TTL in seconds (`exp = iat + ttl`). The cache stores each token's `exp`
+    /// so it can enforce the expiry-safe reuse floor without re-parsing the token.
+    pub(crate) const fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     /// Assemble the claims for a resolved identity and mint a signed compact token.
     ///
     /// # Errors

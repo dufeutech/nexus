@@ -89,9 +89,14 @@ token minted **only** for a resolved identity (§1a-bis).
      e.g. `evenout`). This scopes the token to you; a token minted for another box will not
      match. Reject on mismatch.
    - `exp` — MUST be in the future (allow a small clock-skew leeway, e.g. 60s). Tokens are
-     short-lived and minted per request.
+     short-lived; replay is defeated by `aud` + `exp`.
    - `ctr` — the contract version (replaces the old `vN` string). Reject a version you do not
      understand — this is the drift tripwire for the whole `x-user-*`/`x-workspace-*` shape.
+   - `jti` — present for audit correlation, but **NOT a per-request nonce.** nexus may reuse one
+     signed contract across several requests within a short window (well under `exp`) as a
+     performance optimization, so the **same `jti` (and `iat`/`exp`) can legitimately appear on
+     more than one request.** Do **not** treat a repeated `jti` as a replay or an error, and do
+     not rely on `jti` for per-request idempotency — use your own request id for that.
 4. **Read identity from the verified claims:** `sub`, `workspace_id`, `principal_kind`, `role`,
    `roles` (these mirror `x-user-id` / `x-workspace-id` / `x-user-type` / `x-user-role`; the bare
    `x-user-roles` mirror is **retired**, so `roles` is read from the claim only). For an **`apikey`**

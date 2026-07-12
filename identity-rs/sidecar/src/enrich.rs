@@ -21,6 +21,7 @@ use identity_core::{PrincipalKind, Profile, ResolvedMembership};
 
 use crate::signer;
 use crate::state::{HDR_MIN_AAL, HDR_REQUIRES_ENTITLEMENT, HDR_REQUIRES_ROLE};
+use crate::token_cache::ContractTokenCache;
 
 // --------------------------------------------------------------------------- //
 // ext_proc response builders.
@@ -82,6 +83,10 @@ pub(crate) struct Enriched<'a> {
 /// the destination box (`aud`, from `x-route-pool`), and the current epoch seconds.
 pub(crate) struct SignContext<'a> {
     pub(crate) signer: Option<&'a signer::Signer>,
+    /// hot-path-rps-optimization: the contract reuse cache. When `Some`, a resolved mint
+    /// goes through it (reuse a cached token or mint+cache); when `None`, sign per request
+    /// (cache disabled, or the enrich unit tests). Sign-per-request behavior is unchanged.
+    pub(crate) cache: Option<&'a ContractTokenCache>,
     pub(crate) route_pool: Option<&'a str>,
     pub(crate) now: u64,
 }
@@ -252,8 +257,14 @@ pub(crate) fn enrich_response(
                     now: sign_ctx.now,
                 },
             };
-            active_signer
-                .mint(&input)
+            // hot-path-rps-optimization: reuse a cached signed contract when the cache is
+            // enabled (a skipped ES256 sign); otherwise sign per request. Both paths mint
+            // the identical claims — the cache only changes WHETHER we re-sign.
+            let signed = match sign_ctx.cache {
+                Some(cache) => cache.get_or_mint(active_signer, &input, sign_ctx.now),
+                None => active_signer.mint(&input),
+            };
+            signed
                 .map_err(|e| {
                     warn!(error = %e, "contract signing failed -> no token stamped (fail-closed)");
                 })
@@ -445,7 +456,7 @@ mod tests {
         // entitlements), while the bare x-user-suspended/x-user-entitlements are RETIRED
         // (never emitted, always stripped).
         let signer = test_signer();
-        let ctx = SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() };
+        let ctx = SignContext { signer: Some(&signer), cache: None, route_pool: Some("evenout"), now: now_secs() };
         let suspended = Arc::new(Profile {
             sub: "u1".into(),
             is_suspended: true,
@@ -542,7 +553,7 @@ mod tests {
         let resp = super::enrich_response(
             &service_enriched("system:serviceaccount:nexus:events-writer", Some(acting)),
             None,
-            &SignContext { signer: None, route_pool: None, now: 0 },
+            &SignContext { signer: None, cache: None, route_pool: None, now: 0 },
         );
         let h = set_headers(&resp);
         assert_eq!(
@@ -566,7 +577,7 @@ mod tests {
         // (absent from the registry, or no acting workspace) mints nothing and strips
         // the acting scope, exactly like a non-member user (fail closed).
         let signer = test_signer();
-        let ctx = || SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: 1_000_000 };
+        let ctx = || SignContext { signer: Some(&signer), cache: None, route_pool: Some("evenout"), now: 1_000_000 };
 
         let acting = service_acting("ws-acting", &["events:write"]);
         let resolved = super::enrich_response(&service_enriched("svc-1", Some(acting)), None, &ctx());
@@ -608,7 +619,7 @@ mod tests {
             },
             Some("pro"),
             // Real-clock `now` so the minted token verifies (decode_contract validates exp).
-            &SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() },
+            &SignContext { signer: Some(&signer), cache: None, route_pool: Some("evenout"), now: now_secs() },
         );
         let h = set_headers(&resp);
         assert_eq!(h.get("x-workspace-plan").map(String::as_str), Some("pro"));
@@ -643,7 +654,7 @@ mod tests {
                 acting: Some(acting),
             },
             None,
-            &SignContext { signer: Some(&signer), route_pool: Some("evenout"), now: now_secs() },
+            &SignContext { signer: Some(&signer), cache: None, route_pool: Some("evenout"), now: now_secs() },
         );
         assert!(!set_headers(&resp).contains_key("x-workspace-plan"), "unresolved plan is omitted");
         assert!(

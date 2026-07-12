@@ -105,6 +105,10 @@ edge:
     minReplicas: 2
     maxReplicas: 20
     targetCPUUtilizationPercentage: 70
+  # hot-path-rps-optimization: Envoy worker-thread count. 0 = auto (one worker per core,
+  # Envoy's default). Set it to the edge container's CPU limit (see resources.limits.envoy)
+  # so the worker pool matches its allotment instead of the node's full core count.
+  concurrency: 0
   # ------------------------------------------------------------------------ #
   # N6 edge-rooted tracing. The edge is the SOLE root of trace context: client
   # traceparent/tracestate are stripped before the tracing decision (early
