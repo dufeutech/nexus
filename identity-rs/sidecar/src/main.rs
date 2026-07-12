@@ -49,6 +49,11 @@ mod signer;
 // (skips the per-request ES256 sign on repeat identities). moka in-process, rotation-safe
 // by keying on the active kid — never Redis (decide gate). Isolated in `token_cache`.
 mod token_cache;
+// apikey-resolve-cache: opt-in, default-OFF bounded working-set cache for the api-key
+// resolve SELECT (moka in-process, decorator behind the `ApiKeyReader` port). Change-feed
+// driven targeted eviction keeps revocation live; disabled ⇒ never constructed. Isolated
+// in `api_key_cache`; the eviction listener lives in `serve`.
+mod api_key_cache;
 // automate-signing-key-rotation: managed key custody + automated rotation. The
 // `KeyProvider` port (keyprovider) isolates where signing keys come from; the OpenBao
 // Transit adapter (transit, Mode B local signing) is the production source; the rotation
@@ -70,9 +75,11 @@ mod serve;
 mod api;
 mod bootstrap;
 
-use crate::state::{parse_aal_levels, AppState, DEFAULT_AAL_LEVELS, METRICS};
+use crate::api_key_cache::{ApiKeyResolveCache, CachingApiKeyReader};
+use crate::state::{parse_aal_levels, ApiKeyAuth, AppState, DEFAULT_AAL_LEVELS, METRICS};
 use crate::serve::{
-    shutdown_signal, watch_platform_services, watch_store, watch_workspace_plans, Sidecar,
+    shutdown_signal, watch_api_key_changes, watch_platform_services, watch_store,
+    watch_workspace_plans, Sidecar,
 };
 use crate::bootstrap::{build_api_key_auth, build_policy_pdp, build_signing};
 
@@ -206,6 +213,50 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if api_keys.is_none() {
         info!("customer-api-key authentication OFF (APIKEY_PG_RO_URL/APIKEY_HMAC_PEPPER unset)");
     }
+
+    // apikey-resolve-cache: an OPT-IN, default-OFF bounded working-set cache for the
+    // api-key resolve SELECT. When enabled (and api-key auth is on), wrap the live reader
+    // with a moka-backed decorator behind the same `ApiKeyReader` port, and spawn a
+    // change-feed listener that evicts the single affected entry on revoke/rotate; the TTL
+    // is the staleness ceiling that self-heals a dropped NOTIFY. Disabled ⇒ neither the
+    // decorator nor the listener is constructed — byte-for-byte the live-resolve status quo.
+    let api_keys = api_keys.map(|auth| {
+        let enabled = env::var("APIKEY_RESOLVE_CACHE_ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        if !enabled {
+            info!("api-key resolve cache OFF (default; live resolve per request, revoke effective next request)");
+            return auth;
+        }
+        let cache_ttl: u64 = env::var("APIKEY_RESOLVE_CACHE_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let cache_capacity: u64 = env::var("APIKEY_RESOLVE_CACHE_MAX_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let cache_poll: u64 = env::var("APIKEY_RESOLVE_CACHE_POLL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let cache = ApiKeyResolveCache::new(cache_capacity, Duration::from_secs(cache_ttl));
+        // The eviction listener LISTENs on the same api-key store the reader resolves
+        // against (present because api-key auth is on). Its own session connection must
+        // reach the primary — a txn-mode pooler swallows LISTEN (see deploy/README.md).
+        if let Some(url) = env::var("APIKEY_PG_RO_URL").ok().filter(|u| !u.is_empty()) {
+            tokio::spawn(watch_api_key_changes(url, Duration::from_secs(cache_poll), cache.clone()));
+        }
+        info!(
+            ttl_secs = cache_ttl,
+            capacity = cache_capacity,
+            poll_secs = cache_poll,
+            "api-key resolve cache ON (opt-in working-set cache)"
+        );
+        ApiKeyAuth {
+            reader: Arc::new(CachingApiKeyReader::new(auth.reader, cache)),
+            hasher: auth.hasher,
+        }
+    });
 
     // identity-contract-signing + automate-signing-key-rotation: resolve the signer +
     // JWKS publication once (OpenBao Transit managed rotation, else break-glass PEM, else

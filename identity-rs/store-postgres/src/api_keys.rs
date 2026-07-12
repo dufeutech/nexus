@@ -18,8 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use futures::stream::{unfold, BoxStream, StreamExt};
+use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
+use tokio::time::timeout;
 
 use identity_core::api_key::{ApiKeyCandidate, ApiKeyReader, ApiKeyScope};
 use identity_core::store::BoxError;
@@ -67,7 +69,43 @@ impl PgApiKeyReader {
     pub async fn connect(url: &str) -> Result<Self, BoxError> {
         Ok(Self { pool: connect_pool(url, 4).await? })
     }
+
+    /// Open a live feed of `api_key_changes` for **targeted** cache eviction
+    /// (`apikey-resolve-cache`): LISTEN on [`API_KEY_CHANGE_CHANNEL`] and yield each
+    /// mutation's `key_id` (the trigger's payload). `url` MUST reach the primary on a
+    /// session connection — a transaction-mode pooler silently swallows `LISTEN`.
+    ///
+    /// Unlike the platform-service feed, this NEVER reloads a whole set (the keyspace is
+    /// unbounded): the consumer evicts the single affected entry per signal, and leans on
+    /// the cache's own TTL as the self-heal ceiling for any dropped NOTIFY. It therefore
+    /// needs no pool — only the dedicated LISTEN connection — so it is an associated
+    /// function.
+    ///
+    /// # Errors
+    /// Returns an error if the LISTEN connection cannot be opened; a later `recv` failure
+    /// surfaces as an `Err` item on the stream (the caller reconnects).
+    pub async fn watch_changes(url: &str, poll: Duration) -> Result<ApiKeyChangeFeed, BoxError> {
+        let mut listener = PgListener::connect(url).await?;
+        listener.listen(API_KEY_CHANGE_CHANNEL).await?;
+        let stream = unfold(listener, move |mut listener| async move {
+            // A poll-bounded recv so a wedged connection is noticed within `poll` and a
+            // dropped NOTIFY cannot block the feed forever; the emitted `None` is a
+            // self-heal heartbeat (the cache TTL is the actual staleness ceiling).
+            let item = match timeout(poll, listener.recv()).await {
+                Ok(Ok(notif)) => Ok(Some(notif.payload().to_owned())),
+                Ok(Err(e)) => Err(Box::new(e) as BoxError),
+                Err(_elapsed) => Ok(None),
+            };
+            Some((item, listener))
+        });
+        Ok(stream.boxed())
+    }
 }
+
+/// A live feed of api-key change signals for targeted resolve-cache eviction. Each ready
+/// item is the affected `key_id` (`Ok(Some)`) to evict, or `Ok(None)` on a periodic poll
+/// heartbeat; an `Err` is a feed failure the caller reconnects from.
+pub type ApiKeyChangeFeed = BoxStream<'static, Result<Option<String>, BoxError>>;
 
 #[async_trait]
 impl ApiKeyReader for PgApiKeyReader {
@@ -76,7 +114,9 @@ impl ApiKeyReader for PgApiKeyReader {
         // unknown key simply matches no row. now() is the DB clock, so expiry needs no
         // Rust time type (this crate builds without sqlx's chrono/time feature).
         let row = sqlx::query(
-            "SELECT key_id, creator_sub, scopes::text AS scopes \
+            "SELECT key_id, creator_sub, scopes::text AS scopes, \
+                    (CASE WHEN expires_at IS NULL THEN NULL \
+                          ELSE extract(epoch FROM expires_at)::bigint END) AS expires_at \
              FROM identity.api_keys \
              WHERE key_hash = $1 AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now())",
@@ -89,6 +129,10 @@ impl ApiKeyReader for PgApiKeyReader {
                 key_id: r.try_get("key_id")?,
                 creator_sub: r.try_get("creator_sub")?,
                 scope: parse_scopes(&r.try_get::<String, _>("scopes")?),
+                // Surfaced so a resolve cache can honor the key's own expiry on a hit; the
+                // WHERE clause above is the live-path enforcement (a resolve only ever
+                // returns an unexpired key, so this is always in the future or NULL here).
+                expires_at: r.try_get("expires_at")?,
             })),
             None => Ok(None),
         }

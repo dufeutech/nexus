@@ -211,6 +211,16 @@ sidecar:
   readinessDelaySeconds: 0
   logFormat: "json"             # json | text
   rustLog: "info"
+  # apikey-resolve-cache: OPT-IN (default OFF) bounded in-process working-set cache for the
+  # api-key resolve SELECT. Off => a fail-closed live resolve per request (revoke effective
+  # next request) — byte-for-byte the status quo. On => repeat requests for one key skip the
+  # DB; revoke/rotate stay live within seconds via the api_key_changes feed, with `ttlSeconds`
+  # as the staleness ceiling if a NOTIFY is dropped. Requires api-key auth to be configured.
+  apiKeyResolveCache:
+    enabled: false
+    ttlSeconds: 5             # staleness ceiling (single-digit seconds ~ "within seconds")
+    maxCapacity: 100000       # working-set bound; scales with active traffic, not keyspace
+    pollSeconds: 30           # change-feed self-heal poll
   # identity-contract-signing: ES256 signing of the x-identity-contract token (the ONLY
   # form of the contract — there is no plain-string fallback) + the public JWKS listener
   # (:9210) boxes verify against. Any real deployment MUST provision this.

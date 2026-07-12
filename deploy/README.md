@@ -205,6 +205,20 @@ runtimes stop oversubscribing cores (the largest co-located RPS win — see the
   `CONTRACT_CACHE_MAX_CAPACITY` (default `100000`). Rotation-safe (keyed on the active
   signing-key id) and expiry-safe (a near-expiry token is re-minted). Consumers must not
   treat the contract `jti` as a per-request nonce — see `docs/box-consumer-contract.md`.
+- **API-key resolve cache (identity sidecar) — OPT-IN, default OFF:** a bounded in-process
+  working-set cache for the api-key resolve SELECT, so an app hammering one key stops hitting
+  the read-only pool every request. `APIKEY_RESOLVE_CACHE_ENABLED` (default `false`; `1`/
+  `true`/`yes` enables), `APIKEY_RESOLVE_CACHE_TTL_SECONDS` (default `5` — the staleness
+  ceiling), `APIKEY_RESOLVE_CACHE_MAX_CAPACITY` (default `100000`, the working-set bound),
+  `APIKEY_RESOLVE_CACHE_POLL_SECONDS` (default `30`, the change-feed self-heal poll). Requires
+  api-key auth on (`APIKEY_PG_RO_URL`); the listener's session connection MUST reach the
+  primary (a txn-mode pooler swallows `LISTEN`). **When disabled, behavior is byte-for-byte
+  the status quo:** a fail-closed live resolve per request, revocation effective on the next
+  request. When enabled, only positive resolves of currently-valid keys are cached (fail-
+  closed, no negative cache); expiry is always enforced; and revoke/rotate take effect within
+  seconds via targeted eviction on the `api_key_changes` feed, with the TTL bounding staleness
+  if a NOTIFY is dropped. Metrics: `sidecar_apikey_resolve_cache_hits` / `_misses` /
+  `_evictions`.
 
 - **Hygiene is enforced in the stanza, not by policy:** span attributes are the
   access-log-allowed set only (method/path/status/durations, route pool,

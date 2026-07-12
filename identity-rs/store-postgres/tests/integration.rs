@@ -438,3 +438,60 @@ async fn watch_token_resumes_without_duplicates() {
         "resume skips the already-seen u1 and continues at u2"
     );
 }
+
+/// Pull the next real change signal (a `key_id`) off the api-key eviction feed, skipping
+/// the periodic `Ok(None)` poll heartbeats.
+async fn next_key_id(feed: &mut store_postgres::ApiKeyChangeFeed) -> String {
+    loop {
+        let item = timeout(Duration::from_secs(5), feed.next())
+            .await
+            .expect("api-key feed yields within 5s")
+            .expect("stream not ended")
+            .expect("feed item ok");
+        if let Some(id) = item {
+            return id;
+        }
+        // Ok(None) = poll heartbeat; keep waiting for the real signal.
+    }
+}
+
+#[tokio::test]
+async fn api_key_change_feed_delivers_affected_key_id_on_mutation() {
+    // apikey-resolve-cache tasks 6.3/6.4/6.6 (mechanism): the `api_key_changes` feed the
+    // resolve-cache evicts on MUST deliver the affected key_id for a live mutation, so a
+    // revoke/rotate drives targeted single-entry eviction within seconds (a dropped signal
+    // otherwise self-heals via the cache TTL, exercised in the sidecar unit tests).
+    use std::sync::Arc;
+    // Share the process-wide DB lock + identity-schema bootstrap; the api-key table is set
+    // up below on the same URL.
+    let (_store, _guard) = skip_if_no_db!(store);
+    let url = env::var("STORE_PG_TEST_URL").expect("checked by skip_if_no_db");
+
+    // The api-key WRITER owns the api_keys table + its change-notify trigger.
+    let hasher: Arc<dyn identity_core::SecretHasher> =
+        Arc::new(store_postgres::HmacSecretHasher::new(b"test-pepper".to_vec()));
+    let keys = store_postgres::PgApiKeyStore::connect(&url, hasher)
+        .await
+        .expect("connect api-key store");
+    keys.init_schema().await.expect("init api_keys schema");
+    // Clean slate so the first post-open signal is deterministic.
+    let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("aux pool");
+    sqlx::query("TRUNCATE identity.api_keys").execute(&pool).await.expect("truncate api_keys");
+
+    // Open the eviction feed FROM NOW, then let the LISTEN establish.
+    let mut feed = store_postgres::PgApiKeyReader::watch_changes(&url, Duration::from_secs(5))
+        .await
+        .expect("open api-key change feed");
+    sleep(Duration::from_millis(200)).await;
+
+    // Issue → the INSERT fires a NOTIFY carrying the new key_id.
+    let issued = keys
+        .issue("u-creator", &["ws-1".to_owned()], None, 0)
+        .await
+        .expect("issue key");
+    assert_eq!(next_key_id(&mut feed).await, issued.key_id, "the INSERT signal carries the new key_id");
+
+    // Revoke → the UPDATE fires a NOTIFY carrying the SAME key_id (targeted eviction).
+    assert!(keys.revoke(&issued.key_id).await.expect("revoke"));
+    assert_eq!(next_key_id(&mut feed).await, issued.key_id, "the revoke signal carries the affected key_id");
+}
