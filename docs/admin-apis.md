@@ -23,6 +23,10 @@ Two admin concerns are deliberately **not** HTTP APIs:
 Related runbooks: [`customer-api-keys-runbook.md`](customer-api-keys-runbook.md),
 [`runbook-custom-domains-tls.md`](runbook-custom-domains-tls.md).
 
+Machine-readable specs (OpenAPI 3.1) mirror these routes for generating clients/docs:
+[`openapi/authz-admin.yaml`](openapi/authz-admin.yaml),
+[`openapi/control-plane.yaml`](openapi/control-plane.yaml).
+
 ---
 
 ## Conventions

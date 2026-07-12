@@ -1,0 +1,292 @@
+openapi: 3.1.0
+info:
+  title: nexus authz-admin API
+  version: "1.0.0"
+  description: |
+    Identity-plane administration surface. Authors a subject's authorization
+    (roles, entitlements, suspension) and issues/rotates/revokes customer API keys.
+
+    Fail-closed: every `/authz/*` and `/apikeys/*` route requires a bearer token
+    (`IDENTITY_ADMIN_TOKEN`); the process refuses to start without it unless
+    `IDENTITY_ADMIN_AUTH_DISABLED=true`. There is no workspace header.
+
+    Prose reference: `docs/admin-apis.md`. Schemas mirror the handler structs in
+    `identity-rs/authz-admin/src/main.rs`. This spec is a descriptive artifact of the
+    live routes, not a source of truth for behavior.
+servers:
+  - url: http://localhost:9303
+    description: local compose lab (host port; the container listens on :9300)
+  - url: https://authz.internal:9300
+    description: in-cluster
+security:
+  - bearerAuth: []
+tags:
+  - name: authz
+    description: Subject authorization facts
+  - name: api-keys
+    description: Customer API-key lifecycle (requires APIKEY_HMAC_PEPPER)
+  - name: health
+paths:
+  /authz/{sub}:
+    get:
+      tags: [authz]
+      summary: Read a subject's effective authorization facts
+      operationId: getAuthzFacts
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+      responses:
+        '200':
+          description: Effective facts. Deny-by-default — an unknown subject returns the zero value, never 404.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthzFacts' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/roles:
+    put:
+      tags: [authz]
+      summary: Assign a role
+      operationId: assignRole
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoleBody' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/roles/{role}:
+    delete:
+      tags: [authz]
+      summary: Revoke a role
+      operationId: revokeRole
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+        - name: role
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/entitlements:
+    put:
+      tags: [authz]
+      summary: Grant an entitlement
+      operationId: grantEntitlement
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EntitlementBody' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/entitlements/{entitlement}:
+    delete:
+      tags: [authz]
+      summary: Revoke an entitlement
+      operationId: revokeEntitlement
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+        - name: entitlement
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/suspend:
+    post:
+      tags: [authz]
+      summary: Suspend a subject
+      operationId: suspendSubject
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /authz/{sub}/reactivate:
+    post:
+      tags: [authz]
+      summary: Reactivate a suspended subject
+      operationId: reactivateSubject
+      parameters:
+        - $ref: '#/components/parameters/Sub'
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /apikeys:
+    post:
+      tags: [api-keys]
+      summary: Issue a customer API key
+      description: The plaintext secret is returned ONCE in `secret`. Requires APIKEY_HMAC_PEPPER (else 503).
+      operationId: issueApiKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueKeyBody' }
+      responses:
+        '201':
+          description: Key issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedKey' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/KeyMgmtUnconfigured' }
+  /apikeys/{key_id}/rotate:
+    post:
+      tags: [api-keys]
+      summary: Rotate a customer API key
+      description: Issues a new secret, revokes the old, preserves scopes. No request body.
+      operationId: rotateApiKey
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '201':
+          description: Key rotated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedKey' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No active key with that id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/KeyMgmtUnconfigured' }
+  /apikeys/{key_id}/revoke:
+    post:
+      tags: [api-keys]
+      summary: Revoke a customer API key
+      description: Idempotent. No request body.
+      operationId: revokeApiKey
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '200':
+          description: Revoked (idempotent)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevokeResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/KeyMgmtUnconfigured' }
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe (open, no auth)
+      operationId: authzHealthz
+      security: []
+      responses:
+        '200':
+          description: OK
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: IDENTITY_ADMIN_TOKEN
+  parameters:
+    Sub:
+      name: sub
+      in: path
+      required: true
+      description: Subject identifier (the OIDC `sub`)
+      schema: { type: string }
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Ok:
+      description: Success
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OkResult' }
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Invalid request (e.g. missing creator_sub, or no scopes)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    KeyMgmtUnconfigured:
+      description: API-key management not configured (APIKEY_HMAC_PEPPER unset)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    OkResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+      required: [result]
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+    AuthzFacts:
+      type: object
+      properties:
+        sub: { type: string }
+        roles:
+          type: array
+          items: { type: string }
+        entitlements:
+          type: array
+          items: { type: string }
+        is_suspended: { type: boolean }
+      required: [sub, roles, entitlements, is_suspended]
+    RoleBody:
+      type: object
+      properties:
+        role: { type: string }
+      required: [role]
+    EntitlementBody:
+      type: object
+      properties:
+        entitlement: { type: string }
+      required: [entitlement]
+    IssueKeyBody:
+      type: object
+      properties:
+        creator_sub:
+          type: string
+          description: Required; the subject the key acts as.
+        scopes:
+          type: array
+          description: Workspace ids the key may act on. Effectively required (empty → 400); each must be a workspace the creator is a live member of.
+          items: { type: string }
+        expires_in_seconds:
+          type: [integer, "null"]
+          description: Optional TTL; omit for a non-expiring key.
+      required: [creator_sub]
+    IssuedKey:
+      type: object
+      properties:
+        key_id: { type: string }
+        secret:
+          type: string
+          description: Plaintext key, returned only once.
+        expires_at:
+          type: [integer, "null"]
+          description: Epoch seconds, or null when non-expiring.
+      required: [key_id, secret]
+    RevokeResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        revoked:
+          type: boolean
+          description: false if the key was already revoked or unknown.
+      required: [result, revoked]

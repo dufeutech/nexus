@@ -1,0 +1,675 @@
+openapi: 3.1.0
+info:
+  title: nexus control-plane API
+  version: "1.0.0"
+  description: |
+    Routing-plane administration surface. Authors tenancy and routing: accounts,
+    workspaces, memberships, per-workspace auth-routes, and custom domains.
+
+    Fail-closed: every data route requires a bearer token (`CONTROL_AUTH_TOKEN`);
+    the process refuses to start without it unless `CONTROL_AUTH_DISABLED=true`.
+    There is no workspace header. Every success body carries `"result":"ok"`.
+
+    Note: the `/tenants*` routes are a DEPRECATED account-less alias of `/workspaces*`
+    and are intentionally omitted here — use `/workspaces*`. A response quirk worth
+    knowing: auth-route and domain responses spell the workspace key as `tenant_id`.
+
+    Prose reference: `docs/admin-apis.md`. Schemas mirror the handlers in
+    `routing-rs/control-plane/src/`. Descriptive artifact of the live routes, not a
+    source of truth for behavior.
+servers:
+  - url: http://localhost:9400
+    description: local compose lab
+  - url: https://control-plane.internal:9400
+    description: in-cluster (admin port; ops /healthz is on :9401)
+security:
+  - bearerAuth: []
+tags:
+  - name: accounts
+  - name: workspaces
+  - name: members
+  - name: auth-routes
+  - name: domains
+  - name: health
+paths:
+  /accounts:
+    post:
+      tags: [accounts]
+      summary: Provision an account
+      operationId: provisionAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountBody' }
+      responses:
+        '200':
+          description: Provisioned (idempotent)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountUpsertResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /accounts/{id}:
+    get:
+      tags: [accounts]
+      summary: Read an account and its members
+      operationId: getAccount
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      responses:
+        '200':
+          description: Account with members
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountRead' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotFoundAccount' }
+  /workspaces:
+    post:
+      tags: [workspaces]
+      summary: Upsert a workspace
+      operationId: upsertWorkspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceBody' }
+      responses:
+        '200':
+          description: Upserted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceUpsertResult' }
+        '400':
+          description: Invalid target_pool (not in the allow-list)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown owning account (when account_id is supplied)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /workspaces/{id}:
+    get:
+      tags: [workspaces]
+      summary: Read a workspace config
+      operationId: getWorkspace
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '200':
+          description: Workspace config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceConfig' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown workspace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotFoundWorkspace' }
+  /workspaces/{id}/transfer:
+    post:
+      tags: [workspaces]
+      summary: Transfer a workspace to another account
+      operationId: transferWorkspace
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferBody' }
+      responses:
+        '200':
+          description: Transferred
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown target account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /workspaces/{id}/members:
+    get:
+      tags: [members]
+      summary: List workspace memberships
+      operationId: listMemberships
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '200':
+          description: Memberships
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MembershipList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [members]
+      summary: Upsert a membership
+      operationId: upsertMembership
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MembershipBody' }
+      responses:
+        '200':
+          description: Upserted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MembershipUpsertResult' }
+        '400':
+          description: Invalid member_type (not staff/customer)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown workspace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /workspaces/{id}/members/{sub}:
+    delete:
+      tags: [members]
+      summary: Remove a membership
+      operationId: deleteMembership
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+        - name: sub
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MembershipUpsertResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /workspaces/{id}/auth-routes:
+    get:
+      tags: [auth-routes]
+      summary: List auth-route rules
+      operationId: listAuthRoutes
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '200':
+          description: Rules (note the wrapper key is `tenant_id`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthRouteList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [auth-routes]
+      summary: Upsert an auth-route rule
+      operationId: upsertAuthRoute
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthRouteBody' }
+      responses:
+        '200':
+          description: Stored rule (echoed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthRouteUpsertResult' }
+        '400':
+          description: invalid_prefix, or requirements set with auth_required=false (requirements_need_auth)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Unknown workspace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [auth-routes]
+      summary: Delete an auth-route rule
+      operationId: deleteAuthRoute
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthRouteDelete' }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthRouteDeleteResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /domains:
+    post:
+      tags: [domains]
+      summary: Upsert a domain
+      description: Always created verified=false; use declare→verify to make it route.
+      operationId: upsertDomain
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DomainBody' }
+      responses:
+        '200':
+          description: Upserted (unverified)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DomainUpsertResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /domains/declare:
+    post:
+      tags: [domains]
+      summary: Declare a custom domain and start verification
+      operationId: declareDomain
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeclareBody' }
+      responses:
+        '200':
+          description: Declared; returns the DNS proof record to publish (absent if already verified)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeclareResult' }
+        '400':
+          description: invalid_domain
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: quota_exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaExceeded' }
+        '404':
+          description: unknown_tenant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: domain_taken
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /domains/{domain}/verify:
+    post:
+      tags: [domains]
+      summary: Trigger DNS-ownership verification
+      description: No request body.
+      operationId: verifyDomain
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: no_challenge
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: challenge_expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: proof_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: resolution_failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /domains/{domain}:
+    delete:
+      tags: [domains]
+      summary: Delete a domain
+      operationId: deleteDomain
+      parameters:
+        - $ref: '#/components/parameters/Domain'
+        - name: wildcard
+          in: query
+          required: false
+          description: Selects which row to drop; does not change the response shape.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DomainDeleteResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe (open, no auth). Also served on the ops port :9401.
+      operationId: controlHealthz
+      security: []
+      responses:
+        '200':
+          description: OK
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: CONTROL_AUTH_TOKEN
+  parameters:
+    AccountId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    WorkspaceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Domain:
+      name: domain
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+    NotFoundAccount:
+      type: object
+      properties:
+        error: { type: string, const: not found }
+        account_id: { type: string }
+      required: [error, account_id]
+    NotFoundWorkspace:
+      type: object
+      properties:
+        error: { type: string, const: not found }
+        workspace_id: { type: string }
+      required: [error, workspace_id]
+    QuotaExceeded:
+      type: object
+      properties:
+        error: { type: string, const: quota_exceeded }
+        plan: { type: string }
+        limit: { type: integer }
+        used: { type: integer }
+      required: [error]
+    AccountBody:
+      type: object
+      properties:
+        account_id: { type: string }
+        owner_sub:
+          type: string
+          description: Becomes the account's first (owner) member.
+        name: { type: string, default: "" }
+        payer_ref: { type: [string, "null"] }
+      required: [account_id, owner_sub]
+    AccountUpsertResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        account_id: { type: string }
+        created:
+          type: boolean
+          description: false on an idempotent repeat.
+      required: [result, account_id, created]
+    Account:
+      type: object
+      properties:
+        account_id: { type: string }
+        name: { type: string }
+        payer_ref: { type: [string, "null"] }
+        updated_at: { type: [string, "null"] }
+      required: [account_id, name]
+    AccountMember:
+      type: object
+      properties:
+        account_id: { type: string }
+        user_sub: { type: string }
+        role: { type: string }
+      required: [account_id, user_sub, role]
+    AccountRead:
+      type: object
+      properties:
+        account: { $ref: '#/components/schemas/Account' }
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/AccountMember' }
+      required: [account, members]
+    WorkspaceBody:
+      type: object
+      properties:
+        workspace_id: { type: string }
+        account_id:
+          type: [string, "null"]
+          description: Owning account (must exist). Omit on a config-only update to leave ownership unchanged.
+        plan: { type: string, default: free }
+        target_pool:
+          type: string
+          description: Required; must be in the pool allow-list.
+        features:
+          type: array
+          items: { type: string }
+      required: [workspace_id, target_pool]
+    WorkspaceUpsertResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        workspace_id: { type: string }
+      required: [result, workspace_id]
+    WorkspaceConfig:
+      type: object
+      properties:
+        workspace_id: { type: string }
+        plan: { type: string }
+        target_pool: { type: string }
+        features:
+          type: array
+          items: { type: string }
+        updated_at: { type: [string, "null"] }
+      required: [workspace_id, plan, target_pool, features]
+    TransferBody:
+      type: object
+      properties:
+        account_id:
+          type: string
+          description: New owning account (must exist).
+      required: [account_id]
+    TransferResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        workspace_id: { type: string }
+        account_id: { type: string }
+        staff_removed:
+          type: integer
+          description: Count of staff memberships dropped by the transfer.
+      required: [result, workspace_id, account_id, staff_removed]
+    Membership:
+      type: object
+      properties:
+        user_sub: { type: string }
+        workspace_id: { type: string }
+        member_type:
+          type: string
+          enum: [staff, customer]
+        role: { type: string }
+        status: { type: string }
+      required: [user_sub, workspace_id, member_type, role, status]
+    MembershipList:
+      type: object
+      properties:
+        workspace_id: { type: string }
+        memberships:
+          type: array
+          items: { $ref: '#/components/schemas/Membership' }
+      required: [workspace_id, memberships]
+    MembershipBody:
+      type: object
+      properties:
+        user_sub: { type: string }
+        member_type:
+          type: string
+          enum: [staff, customer]
+        role: { type: string, default: member }
+        status: { type: string, default: active }
+      required: [user_sub, member_type]
+    MembershipUpsertResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        workspace_id: { type: string }
+        user_sub: { type: string }
+      required: [result, workspace_id, user_sub]
+    AuthRouteBody:
+      type: object
+      properties:
+        path_prefix:
+          type: string
+          description: Must start with '/'.
+        auth_required: { type: boolean }
+        requires_role: { type: [string, "null"] }
+        requires_entitlement: { type: [string, "null"] }
+        min_aal: { type: [integer, "null"], minimum: 0, maximum: 255 }
+        account_scoped:
+          type: boolean
+          default: false
+          description: When true, existence-hides non-members as 404 before the role gate.
+      required: [path_prefix, auth_required]
+    AuthRoute:
+      type: object
+      description: One stored rule. Note the list wrapper uses `tenant_id`, not `workspace_id`.
+      properties:
+        path_prefix: { type: string }
+        auth_required: { type: boolean }
+        requires_role: { type: [string, "null"] }
+        requires_entitlement: { type: [string, "null"] }
+        min_aal: { type: [integer, "null"] }
+        account_scoped: { type: boolean }
+      required: [path_prefix, auth_required, account_scoped]
+    AuthRouteList:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        routes:
+          type: array
+          items: { $ref: '#/components/schemas/AuthRoute' }
+      required: [tenant_id, routes]
+    AuthRouteUpsertResult:
+      type: object
+      description: Echoes the stored rule. Uses `tenant_id`, not `workspace_id`.
+      properties:
+        result: { type: string, const: ok }
+        tenant_id: { type: string }
+        path_prefix: { type: string }
+        auth_required: { type: boolean }
+        requires_role: { type: [string, "null"] }
+        requires_entitlement: { type: [string, "null"] }
+        min_aal: { type: [integer, "null"] }
+        account_scoped: { type: boolean }
+      required: [result, tenant_id, path_prefix, auth_required, account_scoped]
+    AuthRouteDelete:
+      type: object
+      properties:
+        path_prefix: { type: string }
+      required: [path_prefix]
+    AuthRouteDeleteResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        tenant_id: { type: string }
+        path_prefix: { type: string }
+      required: [result, tenant_id, path_prefix]
+    DomainBody:
+      type: object
+      properties:
+        domain: { type: string }
+        tenant_id:
+          type: string
+          description: Owning workspace id.
+        wildcard: { type: boolean, default: false }
+      required: [domain, tenant_id]
+    DomainUpsertResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        domain: { type: string }
+        verified:
+          type: boolean
+          description: Always false here.
+      required: [result, domain, verified]
+    DeclareBody:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        domain: { type: string }
+      required: [tenant_id, domain]
+    DnsRecord:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string, const: TXT }
+        value: { type: string }
+      required: [name, type, value]
+    DeclareResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        domain: { type: string }
+        verified: { type: boolean }
+        dns_record:
+          description: Present only when a challenge was started (absent if already verified).
+          $ref: '#/components/schemas/DnsRecord'
+      required: [result, domain, verified]
+    VerifyResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        domain: { type: string }
+        verified: { type: boolean }
+        already:
+          type: boolean
+          description: Present and true if the domain was already verified.
+      required: [result, domain, verified]
+    DomainDeleteResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        domain: { type: string }
+      required: [result, domain]
