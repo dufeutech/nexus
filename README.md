@@ -105,7 +105,10 @@ Two paths, [`deploy/README.md`](deploy/README.md) has the details:
   charts enforce the *choice*; you supply the *truth* — real origin enforcement, JWKS over
   verified TLS, pinned images, HA stores, capacity validation).
 - **docker-compose** ([`deploy/compose/`](deploy/compose/)) — staging / single-node / dev.
-  See [`TODO.md`](TODO.md) for the items that keep it off the HA-public path.
+  Single-node by design — see
+  [Why no in-app TLS / no bundled stores](deploy/README.md#why-no-in-app-tls--no-bundled-stores)
+  for what keeps it off the HA-public path, and the Helm path plus its
+  [go-live checklist](deploy/README.md#production-deployment-checklist) for production.
 
 ## Consuming Nexus (building a box)
 

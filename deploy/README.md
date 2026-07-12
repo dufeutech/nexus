@@ -502,80 +502,91 @@ reconciler by design: a subject nexus has no opinion about is the safe (absent) 
 The platform itself is gated: every spec-asserted security boundary is enforced
 and regression-tested (render guards, unit/integration, and the CI e2e release
 gate against the reference topology). What the gate can NOT certify is *your*
-deployment of it — these are the operator-owned items to walk before the first
-production rollout. Each is a one-line check; the details live in the section
-or values comment referenced.
+deployment of it. Walk this list top-to-bottom before the first production
+rollout — **every box is a binary check with a `verify` step; do not roll until
+all are ticked, and each box is ticked by someone who ran its `verify`, not
+inherited from staging.** The charts enforce the *choice*; you supply the *truth*.
 
-**Security invariants you must make true (the charts enforce the *choice*, you
-supply the *truth*):**
+### Security invariants
 
-- [ ] **Origin enforcement is real, not asserted.** If the backends run in the
-      chart's namespace, use `originEnforcement.networkPolicy.*` and verify your
-      CNI enforces NetworkPolicy by probing: a direct-to-backend request bearing
-      forged `x-workspace-id`/`x-identity-contract` must be REFUSED (see
-      `../scripts/tenancy-edge-e2e.sh` §6 for the shape of the probe). If you set
-      `originEnforcement.external=true`, that is an assertion — you own the
-      network control (policy/mesh/firewall) that makes it true, and you should
-      run the same probe against it.
-- [ ] **JWKS over verified TLS.** `oidc.jwksTls.enabled=true` with a CA the
-      Envoy pod can read (`jwksTls.caFile`) and the right `jwksTls.sni`. Use
-      `jwksPlaintextTrustedPath=true` ONLY for a genuinely in-cluster hop you
-      have assessed — it is an acknowledgment, not a control.
-- [ ] **Nexus authorization is provisioned (deny-by-default).** The OIDC provider
-      is NOT an authorization source; every privileged subject needs an explicit
-      nexus grant (`nexus-native-authorization`, §3 above). Set the `authz-admin`
-      token (`authzAdmin.adminToken`/`.existingSecret`, fail-closed), bootstrap the
-      first admin (`authzAdmin.bootstrapAdminSub`), and re-author existing users'
-      grants before cutover — until then they are authenticated but unprivileged.
-- [ ] **The consuming backend implements its half of the stamp contract.** Nexus
-      emits `x-identity-contract` and the spec scopes the rule, but rejecting an
-      absent/unknown stamp on identity-enriched routes is the BACKEND's code
-      (deliberately out of this repo's test surface). If you own the backend,
-      that check is its backlog item, not an assumption. The full consumer
-      contract — every injected header and the exact reject rules — is in
-      [`../docs/box-consumer-contract.md`](../docs/box-consumer-contract.md).
-- [ ] **Control-plane reachability matches C16.** Broker-only NetworkPolicy on
-      :9400 (`controlPlane.networkPolicy.*`), scrapers/kubelet on the ops port
-      :9401 only; `CONTROL_AUTH_TOKEN` from a Secret, never `CONTROL_AUTH_DISABLED`.
-- [ ] **N4 phase-2 rollout order: enforcer before emitter.** Roll the identity
-      sidecar (which 403-enforces the `x-auth-requires-*` signals) before or
-      with the tenant-router that emits them. A newer router beside an older
-      sidecar leaves requirement rules silently unenforced; the reverse order is
-      safe (a sidecar that sees no signals enforces nothing).
+- [ ] **Origin enforcement is real, not just asserted.**
+      - verify: from a pod that is NOT the edge, send a direct-to-backend request
+        bearing a forged `x-workspace-id` / `x-identity-contract` — it must be
+        REFUSED (`../scripts/tenancy-edge-e2e.sh` §6 is the probe shape).
+      - In-namespace backends: set `originEnforcement.networkPolicy.*` and confirm
+        your CNI actually enforces NetworkPolicy. `originEnforcement.external=true`
+        is an *assertion* — you own the policy/mesh/firewall that makes it true,
+        and you run the same probe against it.
+- [ ] **JWKS is fetched over verified TLS.**
+      - verify: `oidc.jwksTls.enabled=true`, `jwksTls.caFile` readable by the Envoy
+        pod, `jwksTls.sni` correct. `jwksPlaintextTrustedPath=true` is an
+        acknowledgment (not a control) — use ONLY for an assessed in-cluster hop.
+- [ ] **Nexus authorization is provisioned (deny-by-default).**
+      - verify: `authz-admin` token set (`authzAdmin.adminToken` / `.existingSecret`,
+        fail-closed), first admin bootstrapped (`authzAdmin.bootstrapAdminSub`), and
+        every previously-privileged subject re-granted via `authz-admin` (§3 above).
+        The OIDC provider is NOT an authorization source — until re-granted, users
+        are authenticated but unprivileged.
+- [ ] **The consuming backend enforces its half of the stamp contract.**
+      - verify: on identity-enriched routes the backend REJECTS an absent/unknown
+        `x-identity-contract`. Nexus emits the stamp; rejecting it is the BACKEND's
+        code, deliberately outside this repo's test surface — it is the backend's
+        backlog item, not an assumption. Full contract:
+        [`../docs/box-consumer-contract.md`](../docs/box-consumer-contract.md).
+- [ ] **Control-plane reachability matches C16.**
+      - verify: broker-only NetworkPolicy on :9400 (`controlPlane.networkPolicy.*`),
+        scrapers/kubelet on the ops port :9401 only, `CONTROL_AUTH_TOKEN` from a
+        Secret, `CONTROL_AUTH_DISABLED` never set.
+- [ ] **N4 phase-2 rollout order: enforcer before emitter.**
+      - verify: roll the identity sidecar (which 403-enforces the `x-auth-requires-*`
+        signals) before or with the tenant-router that emits them. A newer router
+        beside an older sidecar leaves requirement rules silently unenforced; the
+        reverse order is safe (a sidecar that sees no signals enforces nothing).
 
-**Config hygiene:**
+### Config hygiene
 
 - [ ] **Secrets via `existingSecret` everywhere** (postgres, routingPg, ZITADEL
-      PAT, control token) — inline `*.url`/`value` land in the release manifest.
-- [ ] **Pin every image.** First-party images to a concrete tag you built. The
-      Envoy image now ships pinned to a concrete patch version + digest
-      (`images.envoy.tag: v1.34.14@sha256:…`); on a bump, re-resolve the digest
-      (`docker buildx imagetools inspect envoyproxy/envoy:<tag> | grep Digest`)
-      and re-verify span export. The lab pins ZITADEL for the same reason (a
-      floating tag broke the CI gate).
-- [ ] **Issuer single-sourced (D7).** `oidc.issuer` must equal the `iss`
-      the provider mints AND the value the workers derive — drift is silent-but-fatal
-      (sync works, every authenticated request 401s). The lab guards this in
-      `../scripts/helm-guards-test.sh`; re-check it for your values file.
-- [ ] **TLS/ingress values are real**: `edge.ingress.host(s)`, cert-manager
+      PAT, control token).
+      - verify: no inline `*.url` / `value` — those land in the release manifest.
+- [ ] **Every image pinned to a concrete tag you built or resolved.**
+      - verify: first-party images on concrete tags; Envoy pinned to patch + digest
+        (`images.envoy.tag: v1.34.14@sha256:…`). On a bump, re-resolve
+        (`docker buildx imagetools inspect envoyproxy/envoy:<tag> | grep Digest`)
+        and re-verify span export. The lab pins ZITADEL for the same reason (a
+        floating tag broke the CI gate).
+- [ ] **Issuer single-sourced (D7).**
+      - verify: `oidc.issuer` equals the `iss` the provider mints AND the value the
+        workers derive. Drift is silent-but-fatal (sync works, every authenticated
+        request 401s); `../scripts/helm-guards-test.sh` guards the lab — re-check it
+        for your values file.
+- [ ] **TLS / ingress values are real**: `edge.ingress.host(s)`, cert-manager
       issuer annotations, TLS secret names.
-- [ ] **Postgres URLs follow the session-connection rules** — see “External
-      Postgres requirements” below (txn-mode poolers silently swallow the
-      LISTEN feeds); `?sslmode=verify-full` on both stores.
+- [ ] **Postgres URLs follow the session-connection rules.**
+      - verify: `?sslmode=verify-full` on both stores; no txn-mode pooler (it
+        silently swallows the LISTEN feeds). See “External Postgres requirements”
+        below.
 
-**Operations (never exercised by the repo's gate):**
+### Operations (never exercised by the repo's gate)
 
-- [ ] **Store lifecycle is owned**: HA, backups, restore-tested, failover for
-      the routing + identity databases (external by design — see below).
-- [ ] **Monitoring wired**: `metrics.serviceMonitor.*` per chart; alert at least
-      on edge 5xx/`ext_proc` failures, sidecar/router invalidation-feed staleness
-      (`*_last_apply` metrics), and control-plane auth failures.
-- [ ] **Load/scale validated for your traffic** — the gate proves correctness,
-      not capacity. Size sidecar memory to the resident profile population and
-      revisit `edge.replicas`/HPA.
-- [ ] **Upgrades from pre-gate versions scheduled** — the fail-closed guards are
-      BREAKING by design; see the section above for the two choices every
+- [ ] **Store lifecycle is owned**: HA, backups, restore-tested, failover for the
+      routing + identity databases (external by design — see below).
+- [ ] **Monitoring wired**: `metrics.serviceMonitor.*` per chart.
+      - verify: alerts at least on edge 5xx / `ext_proc` failures, sidecar/router
+        invalidation-feed staleness (`*_last_apply` metrics), and control-plane
+        auth failures.
+- [ ] **Load / scale validated for your traffic** — the gate proves correctness,
+      not capacity.
+      - verify: size sidecar memory to the resident profile population and revisit
+        `edge.replicas` / HPA. Harness: `../scripts/load/`.
+- [ ] **Pre-gate upgrades scheduled** — the fail-closed guards are BREAKING by
+      design; see the BREAKING upgrade section above for the two choices every
       existing deployment must make before it renders again.
+
+### Sign-off
+
+- [ ] Every box above is ticked, each by someone who ran its `verify` step.
+      Record who signed off and the date/commit rolled — this list is the go-live
+      gate, not a suggestion.
 
 ## Why no in-app TLS / no bundled stores
 
