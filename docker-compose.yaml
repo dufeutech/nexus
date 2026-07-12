@@ -356,6 +356,11 @@ services:
       CONTRACT_TOKEN_TTL_SECONDS: ${CONTRACT_TOKEN_TTL_SECONDS:-60}
       JWKS_FILE: ${JWKS_FILE:-}
       JWKS_LISTEN: ${JWKS_LISTEN:-0.0.0.0:9210}
+      # hot-path-rps-optimization: signed-contract reuse cache (skips the per-request
+      # ES256 sign for identical resolved identities). On by default when signing is on.
+      CONTRACT_CACHE_ENABLED: ${CONTRACT_CACHE_ENABLED:-true}
+      CONTRACT_CACHE_TTL_SECONDS: ${CONTRACT_CACHE_TTL_SECONDS:-5}
+      CONTRACT_CACHE_MAX_CAPACITY: ${CONTRACT_CACHE_MAX_CAPACITY:-100000}
     ports:
       - "9201:9200"   # sidecar profile API
       - "9202:9202"   # metrics (protobuf/native-histogram exposition)

@@ -106,7 +106,16 @@ export const options = {
   summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)', 'count'],
 };
 
-const params = { headers: { Host: HOST } };
+// Optional bearer token: when set, every request carries it, exercising the
+// AUTHENTICATED enriched path (which resolves an authority and mints/reuses a signed
+// x-identity-contract) instead of the anonymous path (which never signs). This is what
+// makes the contract reuse cache observable under load (hot-path-rps-optimization).
+const AUTH_TOKEN = __ENV.AUTH_TOKEN || '';
+const params = {
+  headers: AUTH_TOKEN
+    ? { Host: HOST, Authorization: `Bearer ${AUTH_TOKEN}` }
+    : { Host: HOST },
+};
 
 export function ramp() {
   const step = exec.scenario.name; // e.g. "step_500"
