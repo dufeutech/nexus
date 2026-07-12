@@ -507,6 +507,14 @@ rollout — **every box is a binary check with a `verify` step; do not roll unti
 all are ticked, and each box is ticked by someone who ran its `verify`, not
 inherited from staging.** The charts enforce the *choice*; you supply the *truth*.
 
+Runnable harness: [`../scripts/go-live-smoke.sh`](../scripts/go-live-smoke.sh)
+mechanizes the read-only `verify` steps (reachability, JWKS-over-verified-TLS,
+fail-closed admin auth, metrics-pipeline presence) and, opt-in, the mutating
+ones (origin probe, authz grant→effect→revoke over LISTEN/NOTIFY). Point it at
+staging first (`EDGE=… AUTHZ=… CONTROL_PLANE=… PROM_URL=… scripts/go-live-smoke.sh`).
+A green run proves the mechanics are wired; the human still signs off what no
+script can judge (backend stamp enforcement, store HA/backups, capacity).
+
 ### Security invariants
 
 - [ ] **Origin enforcement is real, not just asserted.**
