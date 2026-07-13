@@ -8,16 +8,19 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
+use router_core::audit::AuditCtx;
 use router_core::domain::WorkspaceConfig;
 use router_core::idempotency::{validate_key, IDEMPOTENCY_KEY_MAX_BYTES};
 use router_core::ids::{mint_account_id, mint_workspace_id};
-use router_core::store::{Membership, MembershipStore, OwnershipStore, RoutingStore, MEMBER_TYPES};
+use router_core::store::{
+    Membership, MembershipStore, NewAccount, OwnershipStore, RoutingStore, MEMBER_TYPES,
+};
 
 use crate::app::{internal, App, METRICS};
 
@@ -69,22 +72,34 @@ pub(crate) struct AccountBody {
 /// replay returns the ORIGINAL account (`created: false`) and only re-asserts
 /// the owner membership, so keyed signup provisioning stays safe to call
 /// unconditionally.
-pub(crate) async fn provision_account(State(s): State<App>, Json(body): Json<AccountBody>) -> Response {
+pub(crate) async fn provision_account(
+    State(s): State<App>,
+    Extension(actx): Extension<AuditCtx>,
+    Json(body): Json<AccountBody>,
+) -> Response {
     if let Some(rejection) = invalid_idempotency_key(body.idempotency_key.as_deref()) {
         return rejection;
     }
     let minted = mint_account_id();
+    // One store call = one transaction: account insert, owner membership, and
+    // the `account.provision` audit event commit together (admin-action-audit).
     let outcome = match s
         .store
-        .create_account(&minted, &body.name, body.payer_ref.as_deref(), body.idempotency_key.as_deref())
+        .provision_account(
+            &NewAccount {
+                account_id: &minted,
+                name: &body.name,
+                payer_ref: body.payer_ref.as_deref(),
+                owner_sub: &body.owner_sub,
+                idempotency_key: body.idempotency_key.as_deref(),
+            },
+            &actx,
+        )
         .await
     {
         Ok(outcome) => outcome,
         Err(e) => return internal(e),
     };
-    if let Err(e) = s.store.add_account_member(&outcome.id, &body.owner_sub, "owner").await {
-        return internal(e);
-    }
     METRICS.mutations.add(1, &[KeyValue::new("op", "provision_account")]);
     info!(account = %outcome.id, owner = %body.owner_sub, created = outcome.created, "account provisioned");
     (
@@ -137,7 +152,11 @@ pub(crate) struct WorkspaceBody {
 /// NEVER overwrites an existing workspace (reconfigure is `PUT
 /// /workspaces/{id}`); with an idempotency key, a replay returns the ORIGINAL
 /// workspace (`created: false`) untouched.
-pub(crate) async fn create_workspace(State(s): State<App>, Json(body): Json<WorkspaceBody>) -> Response {
+pub(crate) async fn create_workspace(
+    State(s): State<App>,
+    Extension(actx): Extension<AuditCtx>,
+    Json(body): Json<WorkspaceBody>,
+) -> Response {
     // Validate against the data-driven pool allow-list (RFC C15, fail-closed).
     let Some(pool) = s.pools.parse(&body.target_pool) else {
         return (
@@ -176,21 +195,17 @@ pub(crate) async fn create_workspace(State(s): State<App>, Json(body): Json<Work
         features: body.features,
         updated_at: None,
     };
-    let outcome = match s.store.create_workspace(&cfg, body.idempotency_key.as_deref()).await {
+    // One store call = one transaction: the insert, the create-time ownership
+    // assignment (real insert only — a replay never re-owns), and the
+    // `workspace.create` audit event commit together (admin-action-audit).
+    let outcome = match s
+        .store
+        .create_workspace(&cfg, body.account_id.as_deref(), body.idempotency_key.as_deref(), &actx)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(e) => return internal(e),
     };
-    // Assign ownership only on a real insert: a replay returns the ORIGINAL
-    // workspace as-is and must not re-own it (ownership changes go through
-    // /transfer, which also resets staff — a brand-new workspace has none).
-    if outcome.created && let Some(account_id) = &body.account_id {
-        match s.store.set_workspace_account(&outcome.id, account_id).await {
-            Ok(true) => {}
-            // We just inserted the row, so a no-match is unexpected — log, don't fail.
-            Ok(false) => warn!(workspace = %outcome.id, "ownership set matched no row"),
-            Err(e) => return internal(e),
-        }
-    }
     // No invalidation on create: a fresh workspace has no domains yet, and a
     // replay changed nothing.
     METRICS.mutations.add(1, &[KeyValue::new("op", "create_workspace")]);
@@ -220,6 +235,7 @@ pub(crate) struct ReconfigureBody {
 pub(crate) async fn update_workspace(
     State(s): State<App>,
     Path(workspace_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<ReconfigureBody>,
 ) -> Response {
     // Same pool allow-list validation as create (RFC C15, fail-closed).
@@ -243,7 +259,7 @@ pub(crate) async fn update_workspace(
         features: body.features,
         updated_at: None,
     };
-    match s.store.update_workspace(&cfg).await {
+    match s.store.update_workspace(&cfg, &actx).await {
         Ok(true) => {}
         Ok(false) => {
             return (
@@ -290,6 +306,7 @@ pub(crate) struct TransferBody {
 pub(crate) async fn transfer_workspace(
     State(s): State<App>,
     Path(workspace_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<TransferBody>,
 ) -> Response {
     // Target account must exist — clean 404 rather than a raw FK 500.
@@ -304,7 +321,7 @@ pub(crate) async fn transfer_workspace(
         }
         Err(e) => return internal(e),
     }
-    let staff_removed = match s.store.transfer_workspace(&workspace_id, &body.account_id).await {
+    let staff_removed = match s.store.transfer_workspace(&workspace_id, &body.account_id, &actx).await {
         Ok(Some(n)) => n,
         Ok(None) => {
             return (
@@ -357,6 +374,7 @@ pub(crate) fn default_status() -> String {
 pub(crate) async fn upsert_membership(
     State(s): State<App>,
     Path(workspace_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<MembershipBody>,
 ) -> Response {
     if !MEMBER_TYPES.contains(&body.member_type.as_str()) {
@@ -385,7 +403,7 @@ pub(crate) async fn upsert_membership(
         role: body.role,
         status: body.status,
     };
-    if let Err(e) = s.store.upsert_membership(&m).await {
+    if let Err(e) = s.store.upsert_membership(&m, &actx).await {
         return internal(e);
     }
     // Best-effort signal to the identity plane's membership-sync worker. A failed
@@ -405,8 +423,9 @@ pub(crate) async fn upsert_membership(
 pub(crate) async fn delete_membership(
     State(s): State<App>,
     Path((workspace_id, user_sub)): Path<(String, String)>,
+    Extension(actx): Extension<AuditCtx>,
 ) -> Response {
-    if let Err(e) = s.store.delete_membership(&user_sub, &workspace_id).await {
+    if let Err(e) = s.store.delete_membership(&user_sub, &workspace_id, &actx).await {
         return internal(e);
     }
     // Best-effort signal (see upsert_membership) — the consumer re-reads the

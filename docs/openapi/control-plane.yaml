@@ -6,9 +6,22 @@ info:
     Routing-plane administration surface. Authors tenancy and routing: accounts,
     workspaces, memberships, per-workspace auth-routes, and custom domains.
 
-    Fail-closed: every data route requires a bearer token (`CONTROL_AUTH_TOKEN`);
-    the process refuses to start without it unless `CONTROL_AUTH_DISABLED=true`.
-    There is no workspace header. Every success body carries `"result":"ok"`.
+    Fail-closed: every data route requires a bearer credential that resolves to
+    an INDIVIDUALLY IDENTIFIABLE admin token (`routing.admin_tokens`, minted via
+    `POST /admin-tokens`; `ADMIN_TOKEN_PEPPER` keys verification). During the
+    token migration only, the legacy shared `CONTROL_AUTH_TOKEN` is accepted iff
+    `ADMIN_LEGACY_TOKEN_OK=true` (attributed `legacy-shared`, deprecation-warned).
+    The process refuses to start without an explicit auth choice
+    (`CONTROL_AUTH_DISABLED=true` is the dev opt-out). There is no workspace
+    header. Every success body carries `"result":"ok"`.
+
+    Admin action audit (admin-action-audit): every mutating call records one
+    audit event ATOMICALLY with the mutation — an unrecorded mutation does not
+    commit — and rejected authentications are recorded as denial events. Every
+    mutating endpoint accepts the optional `x-acting-operator` header (see the
+    ActingOperator parameter): recorded verbatim, marked asserted, never used
+    for authorization. The ledger is queryable at `/audit/events` and
+    exportable at `/audit/events/export`.
 
     Ids are SERVER-MINTED (`acct_<uuidv7>` / `ws_<uuidv7>`): creation returns the id
     and callers never choose one — a create body carrying an id field is rejected
@@ -32,6 +45,10 @@ tags:
   - name: members
   - name: auth-routes
   - name: domains
+  - name: audit
+    description: Admin audit ledger (read-only; append-only by construction)
+  - name: admin-tokens
+    description: Named admin credentials (requires ADMIN_TOKEN_PEPPER)
   - name: health
 paths:
   /accounts:
@@ -399,6 +416,136 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/DomainDeleteResult' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /audit/events:
+    get:
+      tags: [audit]
+      summary: Query the admin audit ledger
+      description: |
+        Read-only, time-ordered (by `event_id` — `aev_<uuidv7>` sorts by event
+        time), cursor-paginated. Filters compose (AND). No mutation endpoint
+        over events exists anywhere (append-only ledger, admin-action-audit).
+      operationId: listAuditEvents
+      parameters:
+        - { name: from, in: query, required: false, description: "Inclusive lower bound on occurred_at (RFC 3339)", schema: { type: string } }
+        - { name: to, in: query, required: false, description: "Exclusive upper bound on occurred_at (RFC 3339)", schema: { type: string } }
+        - { name: actor, in: query, required: false, description: "Exact acting credential id (or a reserved actor id)", schema: { type: string } }
+        - { name: target, in: query, required: false, description: "Exact target resource id", schema: { type: string } }
+        - { name: cursor, in: query, required: false, description: "Resume strictly after this event_id (previous page's next_cursor)", schema: { type: string } }
+        - { name: limit, in: query, required: false, description: "Page size (clamped to 1..=1000; default 100)", schema: { type: integer } }
+      responses:
+        '200':
+          description: One page of events; an empty `events` array means done.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditEventsPage' }
+        '400':
+          description: Malformed from/to bound
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /audit/events/export:
+    get:
+      tags: [audit]
+      summary: Export audit events as NDJSON
+      description: |
+        Streams one JSON event per line for the time range (machine-readable
+        evidence for external audit consumers). Read-only — the ledger is
+        unchanged.
+      operationId: exportAuditEvents
+      parameters:
+        - { name: from, in: query, required: false, description: "Inclusive lower bound on occurred_at (RFC 3339)", schema: { type: string } }
+        - { name: to, in: query, required: false, description: "Exclusive upper bound on occurred_at (RFC 3339)", schema: { type: string } }
+      responses:
+        '200':
+          description: NDJSON stream of AuditEvent lines
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        '400':
+          description: Malformed from/to bound
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /admin-tokens:
+    post:
+      tags: [admin-tokens]
+      summary: Issue a named admin token
+      description: |
+        Mints an individually identifiable admin credential for ONE caller
+        (attribution, not authorization). The plaintext secret is returned ONCE
+        and never persisted — only its peppered HMAC lands in
+        `routing.admin_tokens`. Requires ADMIN_TOKEN_PEPPER (else 503). The
+        issuance itself is audited (`admin_token.issue`). First-token
+        chicken-and-egg: mint it while the legacy shared token
+        (ADMIN_LEGACY_TOKEN_OK=true) still authenticates this call.
+      operationId: issueAdminToken
+      parameters:
+        - { $ref: '#/components/parameters/ActingOperator' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueAdminTokenBody' }
+      responses:
+        '201':
+          description: Token issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedAdminToken' }
+        '400':
+          description: Missing/empty name
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
+  /admin-tokens/{id}/rotate:
+    post:
+      tags: [admin-tokens]
+      summary: Rotate a named admin token
+      description: |
+        Mints a NEW secret under the same name with lineage (`rotated_from`) and
+        revokes the old credential — other callers' tokens are untouched.
+        Audited (`admin_token.rotate`). No request body.
+      operationId: rotateAdminToken
+      parameters:
+        - { $ref: '#/components/parameters/AdminTokenId' }
+        - { $ref: '#/components/parameters/ActingOperator' }
+      responses:
+        '201':
+          description: Token rotated; the NEW token_id + one-time secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedAdminToken' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No active token with that id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
+  /admin-tokens/{id}/revoke:
+    post:
+      tags: [admin-tokens]
+      summary: Revoke a named admin token
+      description: |
+        Status flip; the credential is rejected on subsequent calls while every
+        other caller's keeps working. Idempotent (`revoked:false` when already
+        revoked/unknown). Audited (`admin_token.revoke`). No request body.
+      operationId: revokeAdminToken
+      parameters:
+        - { $ref: '#/components/parameters/AdminTokenId' }
+        - { $ref: '#/components/parameters/ActingOperator' }
+      responses:
+        '200':
+          description: Revoked (idempotent)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminTokenRevokeResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
   /healthz:
     get:
       tags: [health]
@@ -430,9 +577,31 @@ components:
       in: path
       required: true
       schema: { type: string }
+    AdminTokenId:
+      name: id
+      in: path
+      required: true
+      description: The admin token id (`atk_…`)
+      schema: { type: string }
+    ActingOperator:
+      name: x-acting-operator
+      in: header
+      required: false
+      description: |
+        Optional caller-asserted human operator (accepted on EVERY mutating
+        endpoint, not just where listed): recorded VERBATIM in the audit event's
+        `asserted_operator` field, marked as asserted, and NEVER used for
+        authentication or authorization. UTF-8, at most 256 bytes; longer or
+        non-UTF-8 values are rejected (400) after authentication.
+      schema: { type: string, maxLength: 256 }
   responses:
     Unauthorized:
-      description: Missing or invalid bearer token
+      description: Missing or invalid bearer token (a denial event is recorded)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    AdminTokenMgmtUnconfigured:
+      description: Named admin-token management not configured (ADMIN_TOKEN_PEPPER unset)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -747,3 +916,74 @@ components:
         result: { type: string, const: ok }
         domain: { type: string }
       required: [result, domain]
+    AuditEventsPage:
+      type: object
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEvent' }
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` to resume; null only on an empty page.
+      required: [events]
+    AuditEvent:
+      type: object
+      description: |
+        One admin audit ledger record — complete and self-describing (who did
+        what, to what, where, when, with what outcome). Never carries secrets.
+        Control-plane actions: account.provision, workspace.create,
+        workspace.reconfigure, workspace.transfer, membership.upsert,
+        membership.revoke, domain.upsert, domain.declare, domain.verify,
+        domain.delete, auth_route.upsert, auth_route.delete,
+        admin_token.issue, admin_token.rotate, admin_token.revoke, auth.denied.
+      properties:
+        event_id:
+          type: string
+          description: Typed, time-ordered id (`aev_<uuidv7>`); lexicographic order IS time order.
+        occurred_at: { type: string, description: RFC 3339 timestamp (DB clock) }
+        surface: { type: string, const: control-plane }
+        action: { type: string, description: Action name from the closed vocabulary }
+        actor_token_id:
+          type: string
+          description: The acting credential's token id, or a reserved actor id (`legacy-shared`, `auth-disabled`, `unauthenticated`, system actors).
+        asserted_operator:
+          type: [string, "null"]
+          description: Caller-asserted human operator, verbatim; confers nothing.
+        target_kind: { type: [string, "null"] }
+        target_id: { type: [string, "null"] }
+        outcome:
+          type: string
+          description: "`ok`, `replay` (idempotency-key replay), `denied`, or an error class."
+        detail:
+          type: object
+          description: Request semantics minus secrets.
+        trace_id: { type: [string, "null"] }
+        source_ip: { type: [string, "null"] }
+        idempotency_key: { type: [string, "null"] }
+      required: [event_id, occurred_at, surface, action, actor_token_id, outcome, detail]
+    IssueAdminTokenBody:
+      type: object
+      description: No unknown fields accepted.
+      properties:
+        name:
+          type: string
+          description: The named caller this credential identifies (e.g. signup-broker, ops-cli, ci).
+      required: [name]
+    IssuedAdminToken:
+      type: object
+      properties:
+        token_id:
+          type: string
+          description: The public attribution handle (`atk_…`) audit events carry.
+        secret:
+          type: string
+          description: Plaintext bearer secret (`nexus_admin_…`), returned only once.
+      required: [token_id, secret]
+    AdminTokenRevokeResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        revoked:
+          type: boolean
+          description: false if the token was already revoked or unknown.
+      required: [result, revoked]

@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use crate::audit::AuditCtx;
 use crate::profile::Profile;
 use crate::store::BoxError;
 
@@ -89,31 +90,52 @@ pub trait AuthzResolver: Send + Sync {
 /// token, event, or provider action may author them. Domain-language and
 /// storage-agnostic: an adapter maps these to its backend (Model 1 writes the
 /// identity Profile; a future engine writes the engine).
+///
+/// Every mutating method carries an [`AuditCtx`] (admin-action-audit): the
+/// adapter records one audit event atomically with the write — an unrecorded
+/// authoring mutation does not commit (fail-closed, design D1/D2).
 #[async_trait]
 pub trait AuthzAuthoring: Send + Sync {
     /// Assign a global role to the subject (idempotent — assigning an already-held
     /// role is a no-op). Creates the subject's record if absent.
-    async fn assign_role(&self, sub: &str, role: &str) -> Result<(), BoxError>;
+    async fn assign_role(&self, sub: &str, role: &str, actx: &AuditCtx) -> Result<(), BoxError>;
 
     /// Revoke a global role (idempotent — revoking an unheld role is a no-op).
-    async fn revoke_role(&self, sub: &str, role: &str) -> Result<(), BoxError>;
+    async fn revoke_role(&self, sub: &str, role: &str, actx: &AuditCtx) -> Result<(), BoxError>;
 
     /// Grant a global entitlement (idempotent).
-    async fn grant_entitlement(&self, sub: &str, entitlement: &str) -> Result<(), BoxError>;
+    async fn grant_entitlement(
+        &self,
+        sub: &str,
+        entitlement: &str,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError>;
 
     /// Revoke a global entitlement (idempotent).
-    async fn revoke_entitlement(&self, sub: &str, entitlement: &str) -> Result<(), BoxError>;
+    async fn revoke_entitlement(
+        &self,
+        sub: &str,
+        entitlement: &str,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError>;
 
     /// Suspend the subject — subsequent requests are denied within seconds (spec R3),
     /// no re-authentication. Creates the subject's record if absent.
-    async fn suspend(&self, sub: &str) -> Result<(), BoxError>;
+    async fn suspend(&self, sub: &str, actx: &AuditCtx) -> Result<(), BoxError>;
 
     /// Reactivate a suspended subject.
-    async fn reactivate(&self, sub: &str) -> Result<(), BoxError>;
+    async fn reactivate(&self, sub: &str, actx: &AuditCtx) -> Result<(), BoxError>;
 
     /// Whether ANY subject currently holds `role` — the bootstrap gate (spec R4): the
     /// first administrator is seeded only when no administrator exists yet.
     async fn any_subject_has_role(&self, role: &str) -> Result<bool, BoxError>;
+
+    /// The break-glass startup grant (spec R4 + admin-action-audit D8): assign
+    /// the initial admin role, recording a `bootstrap.grant` event attributed to
+    /// the bootstrap mechanism in the same transaction as the grant. The caller
+    /// (the startup gate) fires this ONLY when no administrator exists yet — a
+    /// no-op startup writes nothing.
+    async fn bootstrap_grant(&self, sub: &str, role: &str) -> Result<(), BoxError>;
 }
 
 #[cfg(test)]

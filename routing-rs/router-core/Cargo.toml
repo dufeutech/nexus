@@ -15,6 +15,8 @@ path = "src/lib.rs"
 
 [dependencies]
 serde.workspace = true
+# admin-action-audit: the audit event record carries a JSON `detail` object.
+serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 subtle.workspace = true
@@ -30,10 +32,6 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-appender-tracing.workspace = true
-
-[dev-dependencies]
-# Used only by the serde round-trip tests in auth.rs / domain.rs.
-serde_json.workspace = true
 
 [lints]
 workspace = true

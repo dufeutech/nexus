@@ -105,6 +105,37 @@ traffic. Uses the authz-admin API ([`admin-apis.md`](admin-apis.md)).
       design. Until re-granted, users are authenticated but unprivileged.
 - [ ] Domains (if in scope) declared and **verified** (declare → publish TXT → verify).
 
+## Step 5b — Admin-token migration (admin-action-audit; BREAKING)
+
+The shared admin tokens no longer authenticate by themselves — each caller needs
+its own named token, and every admin mutation lands in the per-surface audit
+ledger. Full detail: [`admin-apis.md`](admin-apis.md) → "Admin credentials & the
+audit ledger". Rollback at any step = re-enable the flag.
+
+- [ ] Deploy with `ADMIN_TOKEN_PEPPER` set (both surfaces; a separate secret from
+      `APIKEY_HMAC_PEPPER`) AND `ADMIN_LEGACY_TOKEN_OK=true` (dual-mode: the shared
+      tokens keep working, attributed `legacy-shared`).
+- [ ] Confirm `AUDIT_RETENTION_DAYS` (default 450; floor 365 — the services refuse
+      to start below it) and decide who runs the retention purge
+      (`AUDIT_MAINTENANCE_PG_URL` in-service, or an external job as the
+      maintenance role).
+- [ ] Apply the ledger migrations' role grants
+      (`routing-rs/store-postgres/migrations/0002_admin_audit.sql`,
+      `identity-rs/store-postgres/migrations/0003_admin_audit.sql`) and point each
+      service's DB user at its `*_service` role (append-only enforcement);
+      enable **pgAudit** on both admin databases (out-of-band access trail).
+- [ ] Mint a named token per real caller on EACH surface (signup broker, ops CLI,
+      CI): `POST /admin-tokens {"name":"…"}` — store each one-time secret in the
+      caller's secret store.
+- [ ] Update every caller to its own token; watch the logs for
+      "legacy shared admin token used" warnings until they stop.
+- [ ] Flip `ADMIN_LEGACY_TOKEN_OK=false` (the default) and redeploy; verify via
+      `GET /audit/events` denial events that nothing still presents the old token;
+      then remove `CONTROL_AUTH_TOKEN`/`IDENTITY_ADMIN_TOKEN` from config.
+- [ ] Spot-check the ledger on both surfaces: a mutation you just made is
+      queryable (`GET /audit/events?actor=<your atk_…>`) and the export streams
+      (`GET /audit/events/export`).
+
 ## Step 6 — Production rollout (N4 order: enforcer before emitter)
 
 > The fail-closed edge guards are **BREAKING** for pre-gate deployments — see
@@ -140,6 +171,7 @@ pinned image tags handy for a fast `helm rollback`.
 | 3 Smoke-test green (+opt-in) | | | |
 | 4 Manual sign-offs | | | |
 | 5 Authz provisioned | | | |
+| 5b Admin tokens migrated, audit live | | | |
 | 6 Production rollout | | | |
 | 7 Post-rollout verified | | | |
 

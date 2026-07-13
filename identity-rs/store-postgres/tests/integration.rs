@@ -23,14 +23,25 @@ use std::env;
 use std::time::Duration;
 
 use futures::StreamExt;
+use identity_core::audit::{AuditCtx, AuditEventRecord, AuditQuery};
 use identity_core::authz::{AuthzAuthoring, AuthzResolver};
 use identity_core::membership::{MemberType, Membership, SourceMembershipReader};
 use identity_core::store::{Change, ProfileStore};
 use identity_core::Profile;
 use sqlx::postgres::PgPoolOptions;
-use store_postgres::{PgProfileStore, PgSourceMembershipReader};
+use store_postgres::{PgAdminAuditStore, PgProfileStore, PgSourceMembershipReader};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, timeout};
+
+/// The audit context every test mutation carries (admin-action-audit).
+fn actx() -> AuditCtx {
+    AuditCtx {
+        actor: "atk_test".to_owned(),
+        asserted_operator: Some("tester@example.com".to_owned()),
+        trace_id: None,
+        source_ip: None,
+    }
+}
 
 /// Serializes the tests: they share one database and truncate shared tables in
 /// their setup, so two running at once would eat each other's rows. tokio's
@@ -46,6 +57,10 @@ async fn setup() -> Option<(PgProfileStore, MutexGuard<'static, ()>)> {
         .await
         .expect("connect to STORE_PG_TEST_URL");
     store.init_schema().await.expect("init_schema");
+    // The authoring writes record audit events in the same transaction
+    // (admin-action-audit), so the ledger schema must exist too.
+    let audit = PgAdminAuditStore::connect(&url).await.expect("connect audit store");
+    audit.init_schema().await.expect("init audit schema");
     // Start every test from a clean slate (and reset the sequence so token math
     // is predictable across runs).
     let pool = PgPoolOptions::new()
@@ -53,7 +68,7 @@ async fn setup() -> Option<(PgProfileStore, MutexGuard<'static, ()>)> {
         .connect(&url)
         .await
         .expect("aux pool");
-    sqlx::query("TRUNCATE identity.profiles")
+    sqlx::query("TRUNCATE identity.profiles, identity.admin_audit_events, identity.admin_tokens")
         .execute(&pool)
         .await
         .expect("truncate");
@@ -328,10 +343,10 @@ async fn authz_authoring_roundtrip_and_facts() {
     assert!(absent.roles.is_empty() && absent.entitlements.is_empty() && !absent.is_suspended);
 
     // Authoring creates the row and reflects each fact (spec R4).
-    store.assign_role("u1", "admin").await.unwrap();
-    store.assign_role("u1", "admin").await.unwrap(); // idempotent — no duplicate
-    store.grant_entitlement("u1", "pro").await.unwrap();
-    store.suspend("u1").await.unwrap();
+    store.assign_role("u1", "admin", &actx()).await.unwrap();
+    store.assign_role("u1", "admin", &actx()).await.unwrap(); // idempotent — no duplicate
+    store.grant_entitlement("u1", "pro", &actx()).await.unwrap();
+    store.suspend("u1", &actx()).await.unwrap();
     let authored = store.facts("u1").await.unwrap();
     assert_eq!(authored.roles, vec!["admin".to_owned()], "role assigned once");
     assert_eq!(authored.entitlements, vec!["pro".to_owned()]);
@@ -340,13 +355,13 @@ async fn authz_authoring_roundtrip_and_facts() {
     assert!(!store.has_role("u1", "viewer").await.unwrap());
 
     // Revocation clears each fact (spec R3: a revoked grant stops being effective).
-    store.revoke_role("u1", "admin").await.unwrap();
-    store.revoke_entitlement("u1", "pro").await.unwrap();
-    store.reactivate("u1").await.unwrap();
+    store.revoke_role("u1", "admin", &actx()).await.unwrap();
+    store.revoke_entitlement("u1", "pro", &actx()).await.unwrap();
+    store.reactivate("u1", &actx()).await.unwrap();
     let cleared = store.facts("u1").await.unwrap();
     assert!(cleared.roles.is_empty() && cleared.entitlements.is_empty() && !cleared.is_suspended);
     // Revoking an unheld role is a no-op (idempotent), not an error.
-    store.revoke_role("u1", "never-held").await.unwrap();
+    store.revoke_role("u1", "never-held", &actx()).await.unwrap();
 }
 
 /// spec R3 mechanism (revocation within seconds) + task 2.3 no-clobber: an authz
@@ -372,7 +387,7 @@ async fn authz_authoring_preserves_memberships_and_emits_feed() {
     // Open the feed from now, then author a role — the sidecar's live-update path.
     let mut feed = store.watch(None).await.unwrap();
     sleep(Duration::from_millis(200)).await;
-    store.suspend("u1").await.unwrap();
+    store.suspend("u1", &actx()).await.unwrap();
 
     let ev = timeout(Duration::from_secs(5), feed.next())
         .await
@@ -398,13 +413,13 @@ async fn authz_authoring_preserves_memberships_and_emits_feed() {
 async fn any_subject_has_role_backs_the_bootstrap_gate() {
     let (store, _guard) = skip_if_no_db!(store);
     assert!(!store.any_subject_has_role("admin").await.unwrap(), "no admin on an empty store");
-    store.assign_role("boot", "admin").await.unwrap();
+    store.assign_role("boot", "admin", &actx()).await.unwrap();
     assert!(store.any_subject_has_role("admin").await.unwrap(), "admin now exists");
     assert!(!store.any_subject_has_role("superuser").await.unwrap(), "only the authored role matches");
     // A suspended admin still counts (present, not deleted); a fully revoked one does not.
-    store.suspend("boot").await.unwrap();
+    store.suspend("boot", &actx()).await.unwrap();
     assert!(store.any_subject_has_role("admin").await.unwrap(), "suspended admin still holds the role");
-    store.revoke_role("boot", "admin").await.unwrap();
+    store.revoke_role("boot", "admin", &actx()).await.unwrap();
     assert!(!store.any_subject_has_role("admin").await.unwrap(), "revoked → no admin remains");
 }
 
@@ -486,12 +501,90 @@ async fn api_key_change_feed_delivers_affected_key_id_on_mutation() {
 
     // Issue → the INSERT fires a NOTIFY carrying the new key_id.
     let issued = keys
-        .issue("u-creator", &["ws-1".to_owned()], None, 0)
+        .issue(
+            &store_postgres::IssueKeyRequest {
+                creator_sub: "u-creator",
+                scopes: &["ws-1".to_owned()],
+                expires_in_seconds: None,
+                now_epoch: 0,
+            },
+            &actx(),
+        )
         .await
         .expect("issue key");
     assert_eq!(next_key_id(&mut feed).await, issued.key_id, "the INSERT signal carries the new key_id");
 
     // Revoke → the UPDATE fires a NOTIFY carrying the SAME key_id (targeted eviction).
-    assert!(keys.revoke(&issued.key_id).await.expect("revoke"));
+    assert!(keys.revoke(&issued.key_id, &actx()).await.expect("revoke"));
     assert_eq!(next_key_id(&mut feed).await, issued.key_id, "the revoke signal carries the affected key_id");
+}
+
+// --------------------------------------------------------------------------- //
+// admin-action-audit: the identity plane's fail-closed ledger contract.
+// --------------------------------------------------------------------------- //
+
+/// Query the identity ledger for one action's events (time-ordered).
+async fn events_for_action(url: &str, action: &str) -> Vec<AuditEventRecord> {
+    let audit = PgAdminAuditStore::connect(url).await.expect("connect audit store");
+    audit
+        .query_audit_events(&AuditQuery::default())
+        .await
+        .expect("query audit events")
+        .into_iter()
+        .filter(|event| event.action == action)
+        .collect()
+}
+
+#[tokio::test]
+async fn authoring_records_events_atomically_and_rolls_back_when_unrecordable() {
+    let (store, _guard) = skip_if_no_db!(store);
+    let url = env::var("STORE_PG_TEST_URL").expect("checked by skip_if_no_db");
+
+    // A grant leaves exactly one complete event, attributed to the acting token.
+    store.assign_role("u-aud", "admin", &actx()).await.unwrap();
+    let events = events_for_action(&url, "role.assign").await;
+    assert_eq!(events.len(), 1, "one grant, one event");
+    let event = &events[0];
+    assert!(event.event_id.starts_with("aev_"), "typed event id: {}", event.event_id);
+    assert_eq!(event.surface, "authz-admin");
+    assert_eq!(event.actor_token_id, "atk_test");
+    assert_eq!(event.asserted_operator.as_deref(), Some("tester@example.com"));
+    assert_eq!(event.target_id.as_deref(), Some("u-aud"));
+    assert_eq!(event.detail["role"], "admin");
+
+    // Spec scenario "A mutation that cannot be audited does not commit": hide
+    // the ledger, attempt a suspension — the profile write must roll back.
+    let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("aux pool");
+    sqlx::query("ALTER TABLE identity.admin_audit_events RENAME TO admin_audit_events_hidden")
+        .execute(&pool)
+        .await
+        .expect("hide ledger");
+    let result = store.suspend("u-aud", &actx()).await;
+    sqlx::query("ALTER TABLE identity.admin_audit_events_hidden RENAME TO admin_audit_events")
+        .execute(&pool)
+        .await
+        .expect("restore ledger");
+    assert!(result.is_err(), "the caller gets an error, never a success with a missing event");
+    assert!(
+        !store.facts("u-aud").await.unwrap().is_suspended,
+        "the suspension rolled back with the failed audit insert (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_grant_is_audited_as_the_bootstrap_actor() {
+    let (store, _guard) = skip_if_no_db!(store);
+    let url = env::var("STORE_PG_TEST_URL").expect("checked by skip_if_no_db");
+
+    // Design D8: the break-glass grant records `bootstrap.grant` with the
+    // reserved bootstrap actor, in the same transaction as the grant.
+    store.bootstrap_grant("u-boot", "admin").await.unwrap();
+    assert!(store.has_role("u-boot", "admin").await.unwrap(), "the grant applied");
+    let events = events_for_action(&url, "bootstrap.grant").await;
+    assert_eq!(events.len(), 1, "break-glass leaves a trace");
+    assert_eq!(events[0].actor_token_id, "bootstrap");
+    assert_eq!(events[0].target_id.as_deref(), Some("u-boot"));
+    assert_eq!(events[0].detail["role"], "admin");
+    // No role.assign event — the bootstrap path is distinguishable.
+    assert!(events_for_action(&url, "role.assign").await.is_empty());
 }

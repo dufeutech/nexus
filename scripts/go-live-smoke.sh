@@ -203,6 +203,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "6. admin action audit — denials and mutations land in the ledger (admin-action-audit)"
+# Section 2's unauthenticated probes were 401'd; each surface records a denial
+# event (actor 'unauthenticated', action 'auth.denied') — and never the
+# presented credential. Read-only: the probes already happened above.
+AZD=$(azcurl --max-time 8 "$AUTHZ/audit/events?actor=unauthenticated&limit=5")
+ok "$(printf '%s' "$AZD" | grep -q '"action":"auth.denied"' && echo 1 || echo 0)" "authz-admin recorded a denial event for the unauthenticated probe"
+CPD=$(cpcurl --max-time 8 "$CONTROL_PLANE/audit/events?actor=unauthenticated&limit=5")
+ok "$(printf '%s' "$CPD" | grep -q '"action":"auth.denied"' && echo 1 || echo 0)" "control-plane recorded a denial event for the unauthenticated probe"
+if [ "$RUN_MUTATING" = "1" ] && [ -n "$TOKEN" ]; then
+  # The section-5 grant/revoke are admin mutations — both must be queryable in
+  # the authz-admin ledger, attributed to the acting credential.
+  AZE=$(azcurl --max-time 8 "$AUTHZ/audit/events?target=$SMOKE_SUB")
+  ok "$(printf '%s' "$AZE" | grep -q '"action":"role.assign"' && echo 1 || echo 0)" "the role grant produced a queryable audit event (role.assign, target $SMOKE_SUB)"
+  ok "$(printf '%s' "$AZE" | grep -q '"action":"role.revoke"' && echo 1 || echo 0)" "the cleanup revoke produced a queryable audit event (role.revoke)"
+else
+  skip "RUN_MUTATING=1 also proves a mutation lands in the ledger (role.assign/revoke events for the smoke sub)"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "RESULT: $pass passed, $fail failed, $skip skipped"
 echo

@@ -102,7 +102,15 @@ services:
       PROFILE_PG_URL: postgres://postgres:postgres@postgres:5432/identitydb
       # Lab dev credential (this file is the deliberately-insecure loopback lab —
       # same posture as the control-plane token). Override beyond loopback.
+      # admin-action-audit migration mode: the shared token is honored ONLY while
+      # ADMIN_LEGACY_TOKEN_OK=true (events attribute it as `legacy-shared`). The
+      # lab keeps the flag ON; production flips it off once every caller holds a
+      # named token minted via POST /admin-tokens.
       IDENTITY_ADMIN_TOKEN: ${IDENTITY_ADMIN_TOKEN:-zitadel-lab-dev-token}
+      ADMIN_LEGACY_TOKEN_OK: ${ADMIN_LEGACY_TOKEN_OK:-true}
+      # Enables named admin tokens (identity.admin_tokens): keys the stored HMAC
+      # of every admin-token secret. A SEPARATE secret from APIKEY_HMAC_PEPPER.
+      ADMIN_TOKEN_PEPPER: ${ADMIN_TOKEN_PEPPER:-zitadel-lab-dev-admin-pepper}
       # Seed the first administrator from an empty store (idempotent break-glass).
       # Empty => no bootstrap seed; author the first grants via the admin API.
       AUTHZ_ADMIN_ROLE: ${AUTHZ_ADMIN_ROLE:-admin}
@@ -212,7 +220,15 @@ services:
       # confidence. The default is a documented lab credential (this file is the
       # deliberately-insecure loopback lab — same posture as Password1! above);
       # override via the CONTROL_AUTH_TOKEN env for anything beyond loopback.
+      # admin-action-audit migration mode: the shared token is honored ONLY while
+      # ADMIN_LEGACY_TOKEN_OK=true (events attribute it as `legacy-shared`). The
+      # lab keeps the flag ON; production flips it off once every caller holds a
+      # named token minted via POST /admin-tokens.
       CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}
+      ADMIN_LEGACY_TOKEN_OK: ${ADMIN_LEGACY_TOKEN_OK:-true}
+      # Enables named admin tokens (routing.admin_tokens): keys the stored HMAC
+      # of every admin-token secret.
+      ADMIN_TOKEN_PEPPER: ${ADMIN_TOKEN_PEPPER:-zitadel-lab-dev-admin-pepper}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:

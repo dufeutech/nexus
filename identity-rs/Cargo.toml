@@ -17,6 +17,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 futures = "0.3"
+# admin-action-audit: `aev_` typed audit-event ids (UUIDv7, RFC 9562) — the same
+# pin as routing-rs; already in the tree transitively via sqlx, the direct dep
+# only enables `v7`. Confined to identity_core::ids.
+uuid = { version = "1.9", features = ["v7"] }
 # Durable store adapter — Postgres (authoritative store + LISTEN/NOTIFY change
 # feed). Feature set matches routing-rs so both planes share one Postgres client
 # surface; the statement cache is disabled per-pool in the adapter for

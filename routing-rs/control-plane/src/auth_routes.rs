@@ -3,12 +3,13 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
+use router_core::audit::AuditCtx;
 use router_core::auth::RouteAuth;
 use router_core::store::RoutingStore;
 
@@ -78,6 +79,7 @@ impl App {
 pub(crate) async fn upsert_auth_route(
     State(s): State<App>,
     Path(workspace_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<AuthRouteBody>,
 ) -> Response {
     if !App::valid_prefix(&body.path_prefix) {
@@ -114,7 +116,7 @@ pub(crate) async fn upsert_auth_route(
         }
         Err(e) => return internal(e),
     }
-    if let Err(e) = s.store.upsert_auth_route(&workspace_id, &body.path_prefix, &auth).await {
+    if let Err(e) = s.store.upsert_auth_route(&workspace_id, &body.path_prefix, &auth, &actx).await {
         return internal(e);
     }
     s.invalidate_tenant(&workspace_id, "upsert_auth_route").await;
@@ -138,9 +140,10 @@ pub(crate) async fn upsert_auth_route(
 pub(crate) async fn delete_auth_route(
     State(s): State<App>,
     Path(workspace_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<AuthRouteDelete>,
 ) -> Response {
-    if let Err(e) = s.store.delete_auth_route(&workspace_id, &body.path_prefix).await {
+    if let Err(e) = s.store.delete_auth_route(&workspace_id, &body.path_prefix, &actx).await {
         return internal(e);
     }
     s.invalidate_tenant(&workspace_id, "delete_auth_route").await;

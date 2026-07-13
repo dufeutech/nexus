@@ -20,6 +20,8 @@ async-trait.workspace = true
 futures.workspace = true
 ring.workspace = true
 hex.workspace = true
+# admin-action-audit: secret-free audit `detail` JSON construction.
+serde_json.workspace = true
 
 [dev-dependencies]
 # Transfer/backfill integration tests (tests/integration.rs), gated on

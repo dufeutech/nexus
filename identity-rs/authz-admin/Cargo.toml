@@ -18,6 +18,8 @@ identity-core = { path = "../core" }
 store-postgres = { path = "../store-postgres" }
 serde.workspace = true
 serde_json.workspace = true
+# admin-action-audit: the NDJSON export streams ledger pages (stream::unfold).
+futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 axum.workspace = true

@@ -10,8 +10,10 @@
 //! provider (`nexus-native-authorization` spec).
 
 pub mod api_key;
+pub mod audit;
 pub mod authz;
 pub mod contract;
+pub mod ids;
 pub mod membership;
 pub mod platform;
 pub mod policy;

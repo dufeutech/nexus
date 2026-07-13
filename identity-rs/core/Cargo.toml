@@ -18,6 +18,9 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+# admin-action-audit: `aev_<uuidv7>` audit event ids — confined to the `ids`
+# module (the identity plane still mints NO actor identity).
+uuid.workspace = true
 # Telemetry (first-party-telemetry): the shared init lives here so all identity-plane
 # binaries wire it identically. tracing/tracing-subscriber move onto the core crate
 # because the telemetry module owns the subscriber stack (previously per-binary).

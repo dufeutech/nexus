@@ -2,10 +2,12 @@
 //!
 //! These exercise the SQL paths the unit tests can't — most importantly the
 //! nexus-owned-workspace-tenancy §6.3 **transfer** contract (repoint ownership +
-//! reset staff atomically, customer memberships and routing/data ride through) and
-//! the provisioning-idempotency create contract (keyed replay returns the ORIGINAL
-//! row, same-key racers resolve to one row, keyless creates never conflict,
-//! reconfigure never creates).
+//! reset staff atomically, customer memberships and routing/data ride through),
+//! the provisioning-idempotency create contract (keyed replay returns the
+//! ORIGINAL row, same-key racers resolve to one row, keyless creates never
+//! conflict, reconfigure never creates), and the admin-action-audit ledger
+//! (every mutation records an event in the SAME transaction — an unrecordable
+//! mutation rolls back — plus named-token issue/rotate/revoke and denials).
 //!
 //! Gated on `STORE_PG_TEST_URL` so `cargo test` stays green on a machine with no
 //! database: unset → each test prints a skip line and returns. Point it at a
@@ -23,15 +25,19 @@
 
 use std::env;
 
+use router_core::audit::{
+    AuditCtx, AuditEventRecord, AuditQuery, DenialEvent, DenialKind, InvalidQueryBound,
+    OUTCOME_OK, OUTCOME_REPLAY,
+};
 use router_core::auth::RouteAuth;
 use router_core::domain::{Pool, WorkspaceConfig};
 use router_core::normalize::{normalize_host, parent_domain};
 use router_core::store::{
-    Membership, MembershipStore, OwnershipStore, RoutingStore,
+    DomainUpsert, Membership, MembershipStore, NewAccount, OwnershipStore, RoutingStore,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
-use store_postgres::PgRoutingStore;
+use store_postgres::{AdminTokenHasher, PgAdminTokenStore, PgRoutingStore};
 use tokio::sync::{Mutex, MutexGuard};
 
 /// Serializes the tests: they share one schema and truncate it in `setup()`, so
@@ -60,7 +66,8 @@ async fn setup() -> Option<(PgRoutingStore, sqlx::PgPool, MutexGuard<'static, ()
     sqlx::query(
         "TRUNCATE routing.accounts, routing.account_members, routing.workspaces, \
          routing.domains, routing.domain_challenges, routing.auth_routes, \
-         routing.memberships RESTART IDENTITY CASCADE",
+         routing.memberships, routing.admin_audit_events, routing.admin_tokens \
+         RESTART IDENTITY CASCADE",
     )
     .execute(&pool)
     .await
@@ -80,6 +87,28 @@ macro_rules! skip_if_no_db {
     };
 }
 
+/// The audit context every test mutation carries (admin-action-audit): a named
+/// token id plus an asserted operator, so the recorded events can be asserted.
+fn actx() -> AuditCtx {
+    AuditCtx {
+        actor: "atk_test".to_owned(),
+        asserted_operator: Some("tester@example.com".to_owned()),
+        trace_id: None,
+        source_ip: Some("127.0.0.1".to_owned()),
+    }
+}
+
+/// Query the ledger for one action's events (time-ordered).
+async fn events_for_action(store: &PgRoutingStore, action: &str) -> Vec<AuditEventRecord> {
+    store
+        .query_audit_events(&AuditQuery::default())
+        .await
+        .expect("query audit events")
+        .into_iter()
+        .filter(|event| event.action == action)
+        .collect()
+}
+
 fn workspace(id: &str) -> WorkspaceConfig {
     WorkspaceConfig {
         workspace_id: id.to_owned(),
@@ -93,9 +122,38 @@ fn workspace(id: &str) -> WorkspaceConfig {
 
 /// Keyless create (the common seed path in these tests): every call inserts.
 async fn seed_workspace(store: &PgRoutingStore, id: &str) {
-    let outcome = store.create_workspace(&workspace(id), None).await.unwrap();
+    let outcome = store.create_workspace(&workspace(id), None, None, &actx()).await.unwrap();
     assert!(outcome.created, "keyless seed create must insert");
     assert_eq!(outcome.id, id, "seed create returns the supplied id");
+}
+
+/// Provision an account owned by `owner` (keyless).
+async fn seed_account(store: &PgRoutingStore, id: &str, name: &str, payer: Option<&str>) {
+    let outcome = store
+        .provision_account(
+            &NewAccount {
+                account_id: id,
+                name,
+                payer_ref: payer,
+                owner_sub: "owner_seed",
+                idempotency_key: None,
+            },
+            &actx(),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.created, "keyless seed provision must insert");
+}
+
+/// Admin domain write shorthand for the resolution tests.
+async fn put_domain(store: &PgRoutingStore, domain: &str, ws: &str, wildcard: bool) {
+    store
+        .upsert_domain(
+            &DomainUpsert { domain, workspace_id: ws, wildcard, verified: true },
+            &actx(),
+        )
+        .await
+        .unwrap();
 }
 
 fn membership(sub: &str, ws: &str, member_type: &str, role: &str) -> Membership {
@@ -149,8 +207,8 @@ async fn apex_and_wildcard_coexist_and_route_to_their_own_workspaces() {
     // (domain, is_wildcard) key lets both exist at once. Seed apex→A, wildcard→B.
     seed_workspace(&store, "ws_apex").await;
     seed_workspace(&store, "ws_wild").await;
-    store.upsert_domain("example.com", "ws_apex", false, true).await.unwrap();
-    store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
+    put_domain(&store, "example.com", "ws_apex", false).await;
+    put_domain(&store, "example.com", "ws_wild", true).await;
 
     // The apex resolves to its exact workspace (A), NOT via the wildcard...
     assert_eq!(
@@ -167,7 +225,7 @@ async fn apex_and_wildcard_coexist_and_route_to_their_own_workspaces() {
 
     // A wildcard alone must never answer the apex: drop the exact row and the
     // apex now fails closed even though the wildcard still covers subdomains.
-    store.delete_domain("example.com", false).await.unwrap();
+    store.delete_domain("example.com", false, &actx()).await.unwrap();
     assert_eq!(
         resolve_via_store(&store, "example.com").await,
         None,
@@ -188,8 +246,8 @@ async fn an_exact_row_beats_a_covering_wildcard() {
     // must take precedence over a wildcard that would otherwise cover it.
     seed_workspace(&store, "ws_exact").await;
     seed_workspace(&store, "ws_wild").await;
-    store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
-    store.upsert_domain("shop.example.com", "ws_exact", false, true).await.unwrap();
+    put_domain(&store, "example.com", "ws_wild", true).await;
+    put_domain(&store, "shop.example.com", "ws_exact", false).await;
 
     // shop.example.com has both an exact row (A) and a covering wildcard (B) —
     // the exact-first read wins and the wildcard hop never runs.
@@ -214,7 +272,7 @@ async fn wildcard_matching_is_single_label_only() {
     // exactly one label below it. `a.b.example.com` is two labels below
     // `example.com`, so the `example.com` wildcard must NOT answer it.
     seed_workspace(&store, "ws_top").await;
-    store.upsert_domain("example.com", "ws_top", true, true).await.unwrap();
+    put_domain(&store, "example.com", "ws_top", true).await;
     assert_eq!(
         resolve_via_store(&store, "a.b.example.com").await,
         None,
@@ -224,7 +282,7 @@ async fn wildcard_matching_is_single_label_only() {
     // Coverage of the deeper host requires a wildcard at ITS OWN parent
     // (`b.example.com`); then the single-label hop resolves it.
     seed_workspace(&store, "ws_deep").await;
-    store.upsert_domain("b.example.com", "ws_deep", true, true).await.unwrap();
+    put_domain(&store, "b.example.com", "ws_deep", true).await;
     assert_eq!(
         resolve_via_store(&store, "a.b.example.com").await.as_deref(),
         Some("ws_deep"),
@@ -241,7 +299,7 @@ async fn an_unknown_host_fails_closed_to_no_tenant() {
     // Seed an unrelated domain so the store is non-empty (a populated store must
     // still refuse an unknown host).
     seed_workspace(&store, "ws_known").await;
-    store.upsert_domain("known.example.com", "ws_known", false, true).await.unwrap();
+    put_domain(&store, "known.example.com", "ws_known", false).await;
 
     assert_eq!(
         resolve_via_store(&store, "unknown.other.com").await,
@@ -261,18 +319,22 @@ async fn transfer_repoints_ownership_and_resets_staff_only() {
     let (store, pool, _guard) = skip_if_no_db!();
 
     // Two owning accounts; ws_1 starts owned by the old account.
-    assert!(store.create_account("acct_old", "Old", None, None).await.unwrap().created);
-    assert!(store.create_account("acct_new", "New", None, None).await.unwrap().created);
-    seed_workspace(&store, "ws_1").await;
-    assert!(store.set_workspace_account("ws_1", "acct_old").await.unwrap());
+    seed_account(&store, "acct_old", "Old", None).await;
+    seed_account(&store, "acct_new", "New", None).await;
+    let outcome = store
+        .create_workspace(&workspace("ws_1"), Some("acct_old"), None, &actx())
+        .await
+        .unwrap();
+    assert!(outcome.created);
+    assert_eq!(workspace_account(&pool, "ws_1").await.as_deref(), Some("acct_old"));
 
     // A verified domain (routing state) + a staff and a customer membership.
-    store.upsert_domain("app.example.com", "ws_1", false, true).await.unwrap();
-    store.upsert_membership(&membership("staff_a", "ws_1", "staff", "admin")).await.unwrap();
-    store.upsert_membership(&membership("cust_b", "ws_1", "customer", "buyer")).await.unwrap();
+    put_domain(&store, "app.example.com", "ws_1", false).await;
+    store.upsert_membership(&membership("staff_a", "ws_1", "staff", "admin"), &actx()).await.unwrap();
+    store.upsert_membership(&membership("cust_b", "ws_1", "customer", "buyer"), &actx()).await.unwrap();
 
     // Transfer to the new account: one staff membership removed.
-    let removed = store.transfer_workspace("ws_1", "acct_new").await.unwrap();
+    let removed = store.transfer_workspace("ws_1", "acct_new", &actx()).await.unwrap();
     assert_eq!(removed, Some(1), "exactly the one staff membership is reset");
 
     // Ownership repointed...
@@ -292,6 +354,18 @@ async fn transfer_repoints_ownership_and_resets_staff_only() {
         .collect();
     left.sort();
     assert_eq!(left, vec![("cust_b".to_owned(), "customer".to_owned())]);
+
+    // admin-action-audit: the transfer left exactly one ledger event, attributed
+    // to the acting token, carrying the target and the staff-reset fact.
+    let events = events_for_action(&store, "workspace.transfer").await;
+    assert_eq!(events.len(), 1, "one transfer, one event");
+    let event = &events[0];
+    assert!(event.event_id.starts_with("aev_"), "typed event id: {}", event.event_id);
+    assert_eq!(event.actor_token_id, "atk_test");
+    assert_eq!(event.asserted_operator.as_deref(), Some("tester@example.com"));
+    assert_eq!(event.target_id.as_deref(), Some("ws_1"));
+    assert_eq!(event.outcome, OUTCOME_OK);
+    assert_eq!(event.detail["staff_removed"], 1, "detail carries the reset count");
 }
 
 #[tokio::test]
@@ -301,14 +375,13 @@ async fn transfer_preserves_plan_and_switches_payer_to_the_new_account() {
     // workspace-tenancy R4: plan lives on the WORKSPACE (it travels with a
     // transfer); payer lives on the ACCOUNT (it switches with a transfer). Two
     // accounts with distinct payers of record; ws_pro starts on the old one.
-    assert!(store.create_account("acct_old", "Old", Some("payer_old"), None).await.unwrap().created);
-    assert!(store.create_account("acct_new", "New", Some("payer_new"), None).await.unwrap().created);
+    seed_account(&store, "acct_old", "Old", Some("payer_old")).await;
+    seed_account(&store, "acct_new", "New", Some("payer_new")).await;
     let mut ws = workspace("ws_pro");
     ws.plan = "pro".to_owned();
-    assert!(store.create_workspace(&ws, None).await.unwrap().created);
-    assert!(store.set_workspace_account("ws_pro", "acct_old").await.unwrap());
+    assert!(store.create_workspace(&ws, Some("acct_old"), None, &actx()).await.unwrap().created);
 
-    store.transfer_workspace("ws_pro", "acct_new").await.unwrap();
+    store.transfer_workspace("ws_pro", "acct_new", &actx()).await.unwrap();
 
     // Plan travels: the workspace still carries `pro` — a transfer must never
     // reset or re-derive it from the receiving account.
@@ -339,15 +412,15 @@ async fn domains_are_aliases_and_removal_leaves_the_workspace_intact() {
     // detachable aliases. Several domains resolve to ONE workspace…
     let mut ws = workspace("ws_alias");
     ws.plan = "pro".to_owned();
-    assert!(store.create_workspace(&ws, None).await.unwrap().created);
-    store.upsert_domain("a.example.com", "ws_alias", false, true).await.unwrap();
-    store.upsert_domain("b.example.com", "ws_alias", false, true).await.unwrap();
+    assert!(store.create_workspace(&ws, None, None, &actx()).await.unwrap().created);
+    put_domain(&store, "a.example.com", "ws_alias", false).await;
+    put_domain(&store, "b.example.com", "ws_alias", false).await;
     assert_eq!(store.lookup_domain("a.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
     assert_eq!(store.lookup_domain("b.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
 
     // …and removing one alias leaves the workspace (and its config) untouched
     // while the other alias keeps resolving.
-    store.delete_domain("a.example.com", false).await.unwrap();
+    store.delete_domain("a.example.com", false, &actx()).await.unwrap();
     assert_eq!(store.lookup_domain("a.example.com", false).await.unwrap(), None, "removed alias stops resolving");
     assert_eq!(store.lookup_domain("b.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
     let survivor = store.get_workspace("ws_alias").await.unwrap().expect("workspace survives alias removal");
@@ -362,7 +435,16 @@ async fn keyed_account_replay_returns_the_original_and_never_clobbers() {
     // account (its id, `created: false`) and never overwrites its name/payer —
     // this is what keeps signup provisioning safe to call unconditionally.
     let first = store
-        .create_account("acct_1", "First", Some("payer_1"), Some("signup:sub-a"))
+        .provision_account(
+            &NewAccount {
+                account_id: "acct_1",
+                name: "First",
+                payer_ref: Some("payer_1"),
+                owner_sub: "sub-a",
+                idempotency_key: Some("signup:sub-a"),
+            },
+            &actx(),
+        )
         .await
         .unwrap();
     assert!(first.created, "first keyed create inserts");
@@ -371,7 +453,16 @@ async fn keyed_account_replay_returns_the_original_and_never_clobbers() {
     // The replay arrives with a FRESH minted id (the handler mints per request) —
     // the key, not the id, is what replays.
     let replay = store
-        .create_account("acct_2", "Imposter", Some("payer_2"), Some("signup:sub-a"))
+        .provision_account(
+            &NewAccount {
+                account_id: "acct_2",
+                name: "Imposter",
+                payer_ref: Some("payer_2"),
+                owner_sub: "sub-a",
+                idempotency_key: Some("signup:sub-a"),
+            },
+            &actx(),
+        )
         .await
         .unwrap();
     assert!(!replay.created, "replay reports no insert");
@@ -381,6 +472,17 @@ async fn keyed_account_replay_returns_the_original_and_never_clobbers() {
     let acct = store.get_account("acct_1").await.unwrap().expect("account exists");
     assert_eq!(acct.name, "First", "name not clobbered by a replay");
     assert_eq!(acct.payer_ref.as_deref(), Some("payer_1"), "payer not clobbered");
+
+    // admin-action-audit spec "Idempotent replays are audited as replays": two
+    // events for the two calls — the original `ok`, the replay `replay`, both
+    // carrying the idempotency key, distinguishable and time-ordered.
+    let events = events_for_action(&store, "account.provision").await;
+    assert_eq!(events.len(), 2, "original AND replay each leave an event");
+    assert_eq!(events[0].outcome, OUTCOME_OK);
+    assert_eq!(events[1].outcome, OUTCOME_REPLAY, "the replay is marked as a replay");
+    assert_eq!(events[1].target_id.as_deref(), Some("acct_1"), "replay targets the ORIGINAL");
+    assert_eq!(events[0].idempotency_key.as_deref(), Some("signup:sub-a"));
+    assert!(events[0].event_id < events[1].event_id, "aev_ ids sort by event time");
 }
 
 #[tokio::test]
@@ -389,9 +491,24 @@ async fn concurrent_same_key_creates_resolve_to_one_account() {
 
     // provisioning-idempotency (race scenario): two same-key creates racing on
     // separate connections yield exactly one row, and BOTH callers receive its id.
+    let left_acct = NewAccount {
+        account_id: "acct_l",
+        name: "Left",
+        payer_ref: None,
+        owner_sub: "racer",
+        idempotency_key: Some("signup:racer"),
+    };
+    let right_acct = NewAccount {
+        account_id: "acct_r",
+        name: "Right",
+        payer_ref: None,
+        owner_sub: "racer",
+        idempotency_key: Some("signup:racer"),
+    };
+    let ctx = actx();
     let (left, right) = tokio::join!(
-        store.create_account("acct_l", "Left", None, Some("signup:racer")),
-        store.create_account("acct_r", "Right", None, Some("signup:racer")),
+        store.provision_account(&left_acct, &ctx),
+        store.provision_account(&right_acct, &ctx),
     );
     let left = left.unwrap();
     let right = right.unwrap();
@@ -409,8 +526,8 @@ async fn keyless_creates_never_conflict() {
 
     // A NULL idempotency key opts out of replay protection: every keyless create
     // inserts (UNIQUE treats NULLs as distinct)...
-    assert!(store.create_account("acct_a", "Same Name", None, None).await.unwrap().created);
-    assert!(store.create_account("acct_b", "Same Name", None, None).await.unwrap().created);
+    seed_account(&store, "acct_a", "Same Name", None).await;
+    seed_account(&store, "acct_b", "Same Name", None).await;
     // ...and creation never overwrites: same display name, two distinct resources
     // (workspace-tenancy: display names carry no identity semantics).
     assert!(store.get_account("acct_a").await.unwrap().is_some());
@@ -420,27 +537,39 @@ async fn keyless_creates_never_conflict() {
     let mut ws_second = workspace("ws_b");
     ws_first.name = "Same Name".to_owned();
     ws_second.name = "Same Name".to_owned();
-    assert!(store.create_workspace(&ws_first, None).await.unwrap().created);
-    assert!(store.create_workspace(&ws_second, None).await.unwrap().created);
+    assert!(store.create_workspace(&ws_first, None, None, &actx()).await.unwrap().created);
+    assert!(store.create_workspace(&ws_second, None, None, &actx()).await.unwrap().created);
 }
 
 #[tokio::test]
 async fn keyed_workspace_replay_returns_the_original_untouched() {
     let (store, _pool, _guard) = skip_if_no_db!();
 
-    let created = store.create_workspace(&workspace("ws_orig"), Some("flow:one")).await.unwrap();
+    let created = store
+        .create_workspace(&workspace("ws_orig"), None, Some("flow:one"), &actx())
+        .await
+        .unwrap();
     assert!(created.created);
 
     // Replay with a fresh minted id AND different config: the original row rides
     // through untouched (create never overwrites).
     let mut differing = workspace("ws_other");
     differing.plan = "pro".to_owned();
-    let replay = store.create_workspace(&differing, Some("flow:one")).await.unwrap();
+    let replay = store
+        .create_workspace(&differing, None, Some("flow:one"), &actx())
+        .await
+        .unwrap();
     assert!(!replay.created, "replay reports no insert");
     assert_eq!(replay.id, "ws_orig", "replay returns the ORIGINAL id");
     let row = store.get_workspace("ws_orig").await.unwrap().expect("original survives");
     assert_eq!(row.plan, "free", "replay must not reconfigure the original");
     assert!(store.get_workspace("ws_other").await.unwrap().is_none(), "no ghost row");
+
+    // The replay is visible in the ledger, distinguishable from the creation.
+    let events = events_for_action(&store, "workspace.create").await;
+    assert_eq!(events.len(), 2, "creation + replay each leave an event");
+    assert_eq!(events[0].outcome, OUTCOME_OK);
+    assert_eq!(events[1].outcome, OUTCOME_REPLAY);
 }
 
 #[tokio::test]
@@ -450,10 +579,14 @@ async fn update_workspace_reconfigures_but_never_creates() {
     // provisioning-idempotency: reconfiguring an unknown id matches nothing —
     // it must NOT create (the caller 404s instead of minting a ghost).
     assert!(
-        !store.update_workspace(&workspace("ws_ghost")).await.unwrap(),
+        !store.update_workspace(&workspace("ws_ghost"), &actx()).await.unwrap(),
         "unknown id matches zero rows"
     );
     assert!(store.get_workspace("ws_ghost").await.unwrap().is_none(), "nothing created");
+    assert!(
+        events_for_action(&store, "workspace.reconfigure").await.is_empty(),
+        "a no-op reconfigure mutates nothing and records nothing"
+    );
 
     // The happy path updates config but leaves the display name alone (name is
     // create-time data; PUT carries no name).
@@ -461,17 +594,26 @@ async fn update_workspace_reconfigures_but_never_creates() {
     let mut next = workspace("ws_cfg");
     next.plan = "pro".to_owned();
     next.name = "ignored by update".to_owned();
-    assert!(store.update_workspace(&next).await.unwrap(), "existing row matched");
+    assert!(store.update_workspace(&next, &actx()).await.unwrap(), "existing row matched");
     let after = store.get_workspace("ws_cfg").await.unwrap().expect("row survives");
     assert_eq!(after.plan, "pro", "plan reconfigured");
     assert_eq!(after.name, "ws_cfg display name", "display name untouched by update");
+    assert_eq!(
+        events_for_action(&store, "workspace.reconfigure").await.len(),
+        1,
+        "the real reconfigure left its event"
+    );
 }
 
 #[tokio::test]
 async fn transfer_of_unknown_workspace_is_none() {
     let (store, _pool, _guard) = skip_if_no_db!();
-    let _ = store.create_account("acct_new", "New", None, None).await.unwrap();
-    assert_eq!(store.transfer_workspace("ghost", "acct_new").await.unwrap(), None);
+    seed_account(&store, "acct_new", "New", None).await;
+    assert_eq!(store.transfer_workspace("ghost", "acct_new", &actx()).await.unwrap(), None);
+    assert!(
+        events_for_action(&store, "workspace.transfer").await.is_empty(),
+        "a failed transfer mutates nothing and records nothing"
+    );
 }
 
 #[tokio::test]
@@ -490,9 +632,9 @@ async fn auth_route_requirement_fields_round_trip() {
     };
     // identity-existence-hiding: an account-scoped protected rule (e.g. /me).
     let account = RouteAuth { required: true, account_scoped: true, ..RouteAuth::PASS_THROUGH };
-    store.upsert_auth_route("ws_auth", "/", &plain).await.unwrap();
-    store.upsert_auth_route("ws_auth", "/admin", &gated).await.unwrap();
-    store.upsert_auth_route("ws_auth", "/me", &account).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/", &plain, &actx()).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/admin", &gated, &actx()).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/me", &account, &actx()).await.unwrap();
 
     let policy = store.get_auth_policy("ws_auth").await.unwrap();
     let hit = policy.resolve("/admin/users");
@@ -507,7 +649,192 @@ async fn auth_route_requirement_fields_round_trip() {
     assert!(!policy.resolve("/pricing").account_scoped, "default is workspace-scoped");
 
     // Upserting the gated rule back to plain clears the requirement columns.
-    store.upsert_auth_route("ws_auth", "/admin", &plain).await.unwrap();
+    store.upsert_auth_route("ws_auth", "/admin", &plain, &actx()).await.unwrap();
     let cleared = store.get_auth_policy("ws_auth").await.unwrap();
     assert!(!cleared.resolve("/admin").has_requirements());
+}
+
+// --------------------------------------------------------------------------- //
+// admin-action-audit: the fail-closed ledger contract.
+// --------------------------------------------------------------------------- //
+
+#[tokio::test]
+async fn a_mutation_that_cannot_be_audited_does_not_commit() {
+    let (store, pool, _guard) = skip_if_no_db!();
+
+    // Spec scenario "A mutation that cannot be audited does not commit": force
+    // the audit insert to fail by hiding the ledger table, then attempt a
+    // mutation. The workspace insert runs FIRST in the same transaction — if
+    // recording were best-effort, the row would survive.
+    sqlx::query("ALTER TABLE routing.admin_audit_events RENAME TO admin_audit_events_hidden")
+        .execute(&pool)
+        .await
+        .expect("hide ledger");
+    let result = store.create_workspace(&workspace("ws_unaudited"), None, None, &actx()).await;
+    // Restore the ledger BEFORE asserting so a failure can't poison later tests.
+    sqlx::query("ALTER TABLE routing.admin_audit_events_hidden RENAME TO admin_audit_events")
+        .execute(&pool)
+        .await
+        .expect("restore ledger");
+
+    assert!(result.is_err(), "the caller gets an error, never a success with a missing event");
+    assert!(
+        store.get_workspace("ws_unaudited").await.unwrap().is_none(),
+        "the mutation rolled back with the failed audit insert (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn events_are_complete_secret_free_and_queryable_by_filter() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // Two actors mutate; the ledger must reconstruct who did what and be
+    // filterable by actor and target (design D6).
+    seed_workspace(&store, "ws_q").await; // actor atk_test
+    let other = AuditCtx {
+        actor: "atk_other".to_owned(),
+        asserted_operator: None,
+        trace_id: Some("00-trace-span-01".to_owned()),
+        source_ip: Some("10.1.1.1".to_owned()),
+    };
+    store
+        .upsert_membership(&membership("user_x", "ws_q", "staff", "admin"), &other)
+        .await
+        .unwrap();
+
+    // Filter by actor: each actor sees exactly their own action.
+    let by_actor = store
+        .query_audit_events(&AuditQuery { actor: Some("atk_other".to_owned()), ..AuditQuery::default() })
+        .await
+        .unwrap();
+    assert_eq!(by_actor.len(), 1, "actor filter scopes the review");
+    let event = &by_actor[0];
+    assert_eq!(event.action, "membership.upsert");
+    assert_eq!(event.surface, "control-plane");
+    assert_eq!(event.target_id.as_deref(), Some("ws_q"));
+    assert_eq!(event.trace_id.as_deref(), Some("00-trace-span-01"));
+    assert_eq!(event.source_ip.as_deref(), Some("10.1.1.1"));
+    assert!(!event.occurred_at.is_empty(), "the event carries its time");
+
+    // Filter by target: both actors' events on ws_q, in time (= id) order.
+    let by_target = store
+        .query_audit_events(&AuditQuery { target: Some("ws_q".to_owned()), ..AuditQuery::default() })
+        .await
+        .unwrap();
+    assert_eq!(by_target.len(), 2, "target filter returns exactly the matching events");
+    assert!(by_target[0].event_id < by_target[1].event_id, "time order");
+
+    // Cursor pagination: resuming after page 1's last id yields page 2 only.
+    let page_one = store
+        .query_audit_events(&AuditQuery {
+            target: Some("ws_q".to_owned()),
+            limit: Some(1),
+            ..AuditQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page_one.len(), 1);
+    let page_two = store
+        .query_audit_events(&AuditQuery {
+            target: Some("ws_q".to_owned()),
+            cursor: Some(page_one[0].event_id.clone()),
+            ..AuditQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page_two.len(), 1, "cursor resumes strictly after the previous page");
+    assert_ne!(page_two[0].event_id, page_one[0].event_id);
+
+    // Malformed time bound → the typed error (the HTTP layer's 400).
+    let bad = store
+        .query_audit_events(&AuditQuery { from: Some("not-a-time".to_owned()), ..AuditQuery::default() })
+        .await;
+    assert!(
+        bad.is_err_and(|e| e.downcast_ref::<InvalidQueryBound>().is_some()),
+        "a malformed bound surfaces as InvalidQueryBound, not an opaque 500"
+    );
+}
+
+#[tokio::test]
+async fn named_tokens_issue_rotate_revoke_with_lineage_and_audit() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+    let tokens = PgAdminTokenStore::new(&store, AdminTokenHasher::new(b"test-pepper"));
+
+    // Two named callers, individually identifiable (spec: two callers are
+    // distinguishable in the ledger — their token ids differ).
+    let broker = tokens.issue("signup-broker", &actx()).await.unwrap();
+    let ci = tokens.issue("ci", &actx()).await.unwrap();
+    assert_ne!(broker.token_id, ci.token_id, "each caller gets its own credential id");
+    assert_ne!(broker.secret, ci.secret);
+
+    // Both secrets resolve to their own ids.
+    assert_eq!(tokens.lookup(&broker.secret).await.unwrap().as_deref(), Some(broker.token_id.as_str()));
+    assert_eq!(tokens.lookup(&ci.secret).await.unwrap().as_deref(), Some(ci.token_id.as_str()));
+    assert_eq!(tokens.lookup("nexus_admin_wrong").await.unwrap(), None, "unknown secret fails closed");
+
+    // Revoking one caller leaves the other working (spec scenario).
+    assert!(tokens.revoke(&ci.token_id, &actx()).await.unwrap());
+    assert_eq!(tokens.lookup(&ci.secret).await.unwrap(), None, "revoked secret is rejected");
+    assert_eq!(
+        tokens.lookup(&broker.secret).await.unwrap().as_deref(),
+        Some(broker.token_id.as_str()),
+        "the other caller's credential keeps working"
+    );
+    assert!(!tokens.revoke(&ci.token_id, &actx()).await.unwrap(), "second revoke is a no-op");
+
+    // Rotation: new secret under the same name, lineage recorded, old one dead.
+    let rotated = tokens.rotate(&broker.token_id, &actx()).await.unwrap().expect("active token rotates");
+    assert_ne!(rotated.token_id, broker.token_id);
+    assert_eq!(tokens.lookup(&broker.secret).await.unwrap(), None, "pre-rotation secret is dead");
+    assert_eq!(
+        tokens.lookup(&rotated.secret).await.unwrap().as_deref(),
+        Some(rotated.token_id.as_str())
+    );
+    assert!(tokens.rotate(&broker.token_id, &actx()).await.unwrap().is_none(), "revoked id can't rotate");
+
+    // The provisioning actions are themselves in the ledger — and no event
+    // anywhere carries a secret (spec: events never leak secrets).
+    assert_eq!(events_for_action(&store, "admin_token.issue").await.len(), 2);
+    assert_eq!(events_for_action(&store, "admin_token.rotate").await.len(), 1);
+    assert_eq!(events_for_action(&store, "admin_token.revoke").await.len(), 1);
+    let all = store.query_audit_events(&AuditQuery::default()).await.unwrap();
+    for event in &all {
+        let serialized = serde_json::to_string(event).unwrap();
+        assert!(
+            !serialized.contains("nexus_admin_"),
+            "no event may carry credential material: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn denials_are_recorded_without_credential_material() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // Spec "A failed authentication leaves a trace": time, surface, source, and
+    // the absent-vs-invalid fact — nothing else.
+    store
+        .record_auth_denial(&DenialEvent {
+            kind: DenialKind::Invalid,
+            source_ip: Some("203.0.113.9".to_owned()),
+            trace_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .record_auth_denial(&DenialEvent {
+            kind: DenialKind::Absent,
+            source_ip: None,
+            trace_id: None,
+        })
+        .await
+        .unwrap();
+
+    let denials = events_for_action(&store, "auth.denied").await;
+    assert_eq!(denials.len(), 2);
+    assert_eq!(denials[0].actor_token_id, "unauthenticated");
+    assert_eq!(denials[0].outcome, "denied");
+    assert_eq!(denials[0].detail["credential"], "invalid");
+    assert_eq!(denials[0].source_ip.as_deref(), Some("203.0.113.9"));
+    assert_eq!(denials[1].detail["credential"], "absent");
 }

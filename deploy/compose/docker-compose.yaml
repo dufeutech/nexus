@@ -83,6 +83,18 @@ services:
       # CONTROL_AUTH_DISABLED=true (trusted network/dev). Set a strong value in .env.
       CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-}
       CONTROL_AUTH_DISABLED: ${CONTROL_AUTH_DISABLED:-}
+      # admin-action-audit (BREAKING): the shared CONTROL_AUTH_TOKEN alone no
+      # longer authenticates — set ADMIN_LEGACY_TOKEN_OK=true during the token
+      # migration (events attribute it as `legacy-shared`), and set
+      # ADMIN_TOKEN_PEPPER to enable named admin tokens (POST /admin-tokens).
+      # Flip the legacy flag off once every caller holds its own token.
+      ADMIN_LEGACY_TOKEN_OK: ${ADMIN_LEGACY_TOKEN_OK:-}
+      ADMIN_TOKEN_PEPPER: ${ADMIN_TOKEN_PEPPER:-}
+      # Audit retention (days; floor 365, default 450) and the OPTIONAL
+      # maintenance-role connection the daily purge runs under. Purge is the
+      # only deleter; unset => purge runs externally.
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-}
+      AUDIT_MAINTENANCE_PG_URL: ${AUDIT_MAINTENANCE_PG_URL:-}
     ports:
       - "127.0.0.1:9400:9400"   # bound to loopback: admin boundary only
       # Ops (/metrics + /healthz) is on :9401 — kept OFF the admin port so a scraper
@@ -201,6 +213,19 @@ services:
       # IDENTITY_ADMIN_TOKEN is set OR IDENTITY_ADMIN_AUTH_DISABLED=true (dev only).
       IDENTITY_ADMIN_TOKEN: ${IDENTITY_ADMIN_TOKEN:-}
       IDENTITY_ADMIN_AUTH_DISABLED: ${IDENTITY_ADMIN_AUTH_DISABLED:-}
+      # admin-action-audit (BREAKING): the shared IDENTITY_ADMIN_TOKEN alone no
+      # longer authenticates — set ADMIN_LEGACY_TOKEN_OK=true during the token
+      # migration (events attribute it as `legacy-shared`), and set
+      # ADMIN_TOKEN_PEPPER (a SEPARATE secret from APIKEY_HMAC_PEPPER) to enable
+      # named admin tokens (POST /admin-tokens). Flip the legacy flag off once
+      # every caller holds its own token.
+      ADMIN_LEGACY_TOKEN_OK: ${ADMIN_LEGACY_TOKEN_OK:-}
+      ADMIN_TOKEN_PEPPER: ${ADMIN_TOKEN_PEPPER:-}
+      # Audit retention (days; floor 365, default 450) and the OPTIONAL
+      # maintenance-role connection the daily purge runs under. Purge is the
+      # only deleter; unset => purge runs externally.
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-}
+      AUDIT_MAINTENANCE_PG_URL: ${AUDIT_MAINTENANCE_PG_URL:-}
       # Bootstrap the first administrator from an empty store (idempotent break-glass).
       # Empty => no seed; author the first grants via the admin API.
       AUTHZ_ADMIN_ROLE: ${AUTHZ_ADMIN_ROLE:-admin}

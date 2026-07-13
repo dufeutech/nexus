@@ -19,6 +19,8 @@ store-postgres = { path = "../store-postgres" }
 invalidations-nats = { path = "../invalidations-nats" }
 dns-resolver = { path = "../dns-resolver" }
 tokio.workspace = true
+# admin-action-audit: the NDJSON export streams ledger pages (stream::unfold).
+futures.workspace = true
 axum.workspace = true
 headers.workspace = true
 tower-http.workspace = true
@@ -31,6 +33,8 @@ opentelemetry.workspace = true
 [dev-dependencies]
 # http-request-resilience tests: oneshot a router without binding a socket.
 tower.workspace = true
+# admin-action-audit 5.2 test: fake publisher/proof port impls.
+async-trait.workspace = true
 
 [lints]
 workspace = true

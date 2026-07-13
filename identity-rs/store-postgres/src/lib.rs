@@ -39,19 +39,25 @@ use sqlx::{PgPool, Row};
 use tokio::time::timeout;
 use tracing::warn;
 
+use identity_core::audit::AuditCtx;
 use identity_core::store::{
     BoxError, Change, ChangeEvent, ChangeFeed, ProfileStore, WatchToken,
 };
 use identity_core::Profile;
 
+mod admin_audit;
 mod api_keys;
 mod authz;
 mod hasher;
 mod platform_services;
 mod source_memberships;
 mod workspace_plans;
+pub use admin_audit::{
+    IssuedAdminToken, PgAdminAuditStore, PgAdminTokenStore, PgAuditMaintenance,
+};
 pub use api_keys::{
-    ApiKeyChangeFeed, IssuedKey, PgApiKeyReader, PgApiKeyStore, API_KEY_CHANGE_CHANNEL,
+    ApiKeyChangeFeed, IssueKeyRequest, IssuedKey, PgApiKeyReader, PgApiKeyStore,
+    API_KEY_CHANGE_CHANNEL,
 };
 pub use hasher::HmacSecretHasher;
 pub use platform_services::{PgPlatformServiceReader, PlatformFeed, PLATFORM_CHANGE_CHANNEL};
@@ -137,6 +143,43 @@ impl PgProfileStore {
             .await?;
         Ok(())
     }
+
+    /// Upsert + NOTIFY — and, when the write is an administrative authoring
+    /// action, its audit event — in ONE transaction (admin-action-audit D1/D2:
+    /// an unrecorded admin mutation does not commit). The wakeup is emitted
+    /// exactly when the new `seq` becomes visible (NOTIFY is delivered on
+    /// commit). `seq` is taken once from the VALUES nextval and reused on the
+    /// conflict path via EXCLUDED.seq, so each write consumes a single sequence
+    /// value. `event: None` is the plain projection write (membership-sync) —
+    /// not an admin action, not audited.
+    pub(crate) async fn put_with_event(
+        &self,
+        profile: &Profile,
+        event: Option<(&admin_audit::NewAuditEvent<'_>, &AuditCtx)>,
+    ) -> Result<(), BoxError> {
+        let json = serde_json::to_string(profile)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO identity.profiles (sub, doc, deleted, seq) \
+             VALUES ($1, $2::jsonb, false, nextval('identity.profile_seq')) \
+             ON CONFLICT (sub) DO UPDATE SET \
+                 doc = EXCLUDED.doc, deleted = false, seq = EXCLUDED.seq",
+        )
+        .bind(&profile.sub)
+        .bind(&json)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(CHANGE_CHANNEL)
+            .bind(&profile.sub)
+            .execute(&mut *tx)
+            .await?;
+        if let Some((new_event, actx)) = event {
+            admin_audit::record(&mut *tx, actx, new_event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -155,29 +198,7 @@ impl ProfileStore for PgProfileStore {
     }
 
     async fn put(&self, profile: &Profile) -> Result<(), BoxError> {
-        let json = serde_json::to_string(profile)?;
-        // Upsert + NOTIFY in one transaction so the wakeup is emitted exactly when
-        // the new `seq` becomes visible (NOTIFY is delivered on commit). `seq` is
-        // taken once from the VALUES nextval and reused on the conflict path via
-        // EXCLUDED.seq, so each write consumes a single sequence value.
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO identity.profiles (sub, doc, deleted, seq) \
-             VALUES ($1, $2::jsonb, false, nextval('identity.profile_seq')) \
-             ON CONFLICT (sub) DO UPDATE SET \
-                 doc = EXCLUDED.doc, deleted = false, seq = EXCLUDED.seq",
-        )
-        .bind(&profile.sub)
-        .bind(&json)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(CHANGE_CHANNEL)
-            .bind(&profile.sub)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+        self.put_with_event(profile, None).await
     }
 
     async fn delete(&self, sub: &str) -> Result<(), BoxError> {

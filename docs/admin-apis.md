@@ -1,14 +1,21 @@
 # Admin APIs
 
-Nexus has **no unified admin console** and **no OpenAPI/Swagger spec**. Administration
-is done through **two independent, token-gated REST surfaces**, each fail-closed on its
-own bearer token (constant-time compared; each process refuses to start without its
-token unless auth is explicitly disabled):
+Nexus has **no unified admin console**. Administration is done through **two
+independent, token-gated REST surfaces**, each fail-closed (each process refuses to
+start without an explicit auth choice):
 
-| Surface | Plane | Port (in-cluster) | Token env | Authors… |
+| Surface | Plane | Port (in-cluster) | Credential | Authors… |
 |---|---|---|---|---|
-| **authz-admin** | identity | `9300` | `IDENTITY_ADMIN_TOKEN` | who a subject is *allowed to be* — roles, entitlements, suspension, customer API keys |
-| **control-plane** | routing | `9400` | `CONTROL_AUTH_TOKEN` | tenancy & routing — accounts, workspaces, members, auth-routes, domains |
+| **authz-admin** | identity | `9300` | named admin token (legacy: `IDENTITY_ADMIN_TOKEN`) | who a subject is *allowed to be* — roles, entitlements, suspension, customer API keys |
+| **control-plane** | routing | `9400` | named admin token (legacy: `CONTROL_AUTH_TOKEN`) | tenancy & routing — accounts, workspaces, members, auth-routes, domains |
+
+**Admin action audit (admin-action-audit).** Every mutating call on either surface
+records one audit event **atomically with the mutation** — an unrecorded mutation
+does not commit — and every rejected authentication is recorded as a denial event.
+Each surface serves its own append-only ledger at `GET /audit/events` (+ NDJSON
+`/audit/events/export`). Credentials are **individually identifiable**: each caller
+(signup broker, ops CLI, CI) holds its own named token, so every event names who
+acted. See [Admin credentials & the audit ledger](#admin-credentials--the-audit-ledger).
 
 Two admin concerns are deliberately **not** HTTP APIs:
 
@@ -51,7 +58,13 @@ CONTROL_AUTH_TOKEN=…                          # control-plane bearer
 - **No workspace header** on either surface.
 - **Response envelope** — every success carries `"result":"ok"`; there are no typed
   response structs (responses are inline JSON), so fields are exactly as shown.
-- **Auth failure** — missing/wrong token → `401 {"error":"unauthorized"}`.
+- **Auth failure** — missing/wrong token → `401 {"error":"unauthorized"}` (and a
+  denial event lands in that surface's audit ledger, rate-limited per source).
+- **Operator assertion** — every mutating call MAY carry `x-acting-operator:
+  <human>`: recorded verbatim in the audit event's `asserted_operator` field,
+  marked asserted, **never** used for authentication or authorization (an invalid
+  credential with an assertion is rejected identically). UTF-8, ≤256 bytes; longer
+  is a `400 invalid_acting_operator`, never a truncation.
 
 ---
 
@@ -268,6 +281,102 @@ curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -X DELETE "$CP/domains/sh
 - **verify** errors: `404 no_challenge`, `410 challenge_expired`, `422 proof_not_found`, `503 resolution_failed`.
 - `POST /domains` (direct upsert) takes `{"domain","workspace_id","wildcard":false}` and always
   returns `verified:false` — declare→verify is what makes a domain route.
+
+---
+
+## Admin credentials & the audit ledger
+
+Both surfaces share this machinery (per plane — two independent ledgers and token
+tables that merge cleanly by event time on export). Everything below works the same
+on `$AUTHZ` and `$CP`; examples use `$CP`.
+
+### Named admin tokens — `POST /admin-tokens`, `…/{id}/rotate`, `…/{id}/revoke`
+
+> Requires `ADMIN_TOKEN_PEPPER` on the service (a separate secret from
+> `APIKEY_HMAC_PEPPER`; generate with `openssl rand -hex 32`). Unset → these three
+> endpoints return `503 admin_token_mgmt_unconfigured`.
+
+Each **caller** gets its own credential — attribution, not authorization (every
+token grants the same admin surface):
+
+```sh
+# issue — the plaintext secret is returned ONCE, in "secret". Store it now.
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -H 'content-type: application/json' \
+  -X POST "$CP/admin-tokens" -d '{"name":"signup-broker"}'
+```
+```json
+{ "token_id": "atk_…", "secret": "nexus_admin_<plaintext-once>" }
+```
+```sh
+# rotate — no body; new secret under the same name (lineage kept), old one dead. 201, same shape.
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -X POST "$CP/admin-tokens/$TOKEN_ID/rotate"
+# revoke — no body; idempotent; every OTHER caller's token keeps working.
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -X POST "$CP/admin-tokens/$TOKEN_ID/revoke"
+```
+
+Only the secret's peppered HMAC is stored; verification is one indexed lookup.
+Issue/rotate/revoke are themselves audited (`admin_token.*`).
+
+**Legacy shared-token migration (BREAKING).** The old single shared token per
+surface no longer authenticates by itself — the service refuses to start unless
+you choose a mode. Migration (rollback at any step = re-enable the flag):
+
+1. Set `ADMIN_LEGACY_TOKEN_OK=true` (keep `CONTROL_AUTH_TOKEN`/`IDENTITY_ADMIN_TOKEN`
+   set) and set `ADMIN_TOKEN_PEPPER`. The shared token still works but every use is
+   attributed `legacy-shared` and logs a deprecation warning.
+2. Mint a named token per real caller (broker, ops CLI, CI) using the legacy token
+   to authenticate the mint; update each caller's secret.
+3. Flip `ADMIN_LEGACY_TOKEN_OK=false` (default). Verify via denial events that no
+   legacy use remains, then remove the env tokens.
+
+### Query the ledger — `GET /audit/events`
+
+```sh
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" \
+  "$CP/audit/events?from=2026-07-01T00:00:00Z&actor=atk_…&target=ws_…&limit=100"
+```
+```json
+{ "events": [ { "event_id": "aev_<uuidv7>", "occurred_at": "…", "surface": "control-plane",
+    "action": "workspace.transfer", "actor_token_id": "atk_…",
+    "asserted_operator": "alice@example.com", "target_kind": "workspace",
+    "target_id": "ws_…", "outcome": "ok", "detail": { "account_id": "acct_…", "staff_removed": 1 },
+    "trace_id": null, "source_ip": "10.0.0.5", "idempotency_key": null } ],
+  "next_cursor": "aev_…" }
+```
+- Filters (all optional, AND-composed): `from`/`to` (RFC 3339; malformed → `400
+  invalid_time_bound`), `actor`, `target`, `cursor`, `limit` (≤1000, default 100).
+- Time-ordered: `aev_` ids are UUIDv7, so id order **is** event order. Page with
+  `cursor=<next_cursor>` until `events` comes back empty.
+- Outcomes: `ok`, `replay` (an idempotency-key replay — recorded, distinguishable
+  from the original), `denied` (auth denials, actor `unauthenticated`,
+  `detail.credential` = `absent`|`invalid`). Reserved actors: `legacy-shared`,
+  `auth-disabled`, `bootstrap` (authz-admin), `system:verify-poll` (control-plane).
+- **Read-only**: no endpoint anywhere updates or deletes an event.
+
+### Export for auditors — `GET /audit/events/export`
+
+```sh
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" \
+  "$CP/audit/events/export?from=2026-01-01T00:00:00Z&to=2027-01-01T00:00:00Z" > cp-audit.ndjson
+```
+One JSON event per line (NDJSON — lossless, SIEM-ingestible). Export both planes and
+merge-sort by `event_id` for a cross-plane view. Exporting changes nothing.
+
+### Retention & append-only enforcement
+
+- Events are immutable: the service DB role is granted INSERT/SELECT only on the
+  ledger (see `migrations/0002_admin_audit.sql` / `0003_admin_audit.sql`); the
+  compose lab connects as the superuser, so the grants bind in locked-down
+  deployments.
+- `AUDIT_RETENTION_DAYS` (default **450**, floor **365** — startup-validated) governs
+  the only permitted deletion: a daily purge of events older than the window,
+  running under the separate maintenance role (`AUDIT_MAINTENANCE_PG_URL`; unset →
+  run the purge externally as that role).
+- Out-of-band DB access (psql bypass) is covered by **pgAudit** at the database
+  layer per the design ADR — configure it in deployment for both admin databases.
+- **Signing-key custody events** are deliberately NOT in these ledgers: OpenBao's
+  own audit device is the record — see
+  [`runbook-contract-signing-keys.md`](runbook-contract-signing-keys.md).
 
 ---
 

@@ -6,15 +6,16 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time::interval;
 use tracing::{info, warn};
 
+use router_core::audit::{AuditCtx, ACTOR_SYSTEM_VERIFY_POLL};
 use router_core::normalize::normalize_host;
-use router_core::store::{BoxError, ChallengeStore, RoutingStore};
+use router_core::store::{BoxError, ChallengeStore, DomainUpsert, RoutingStore};
 use router_core::verify::{challenge_name, token_matches};
 use store_postgres::LeaderLease;
 
@@ -34,7 +35,11 @@ pub(crate) struct DomainBody {
     wildcard: bool,
 }
 
-pub(crate) async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainBody>) -> impl IntoResponse {
+pub(crate) async fn upsert_domain(
+    State(s): State<App>,
+    Extension(actx): Extension<AuditCtx>,
+    Json(body): Json<DomainBody>,
+) -> impl IntoResponse {
     // Normalize at the boundary so the stored key matches the resolver's key.
     let domain = normalize_host(&body.domain);
     // A domain is ALWAYS created unverified here: routing-affecting verification
@@ -45,7 +50,15 @@ pub(crate) async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainB
     const VERIFIED: bool = false;
     if let Err(e) = s
         .store
-        .upsert_domain(&domain, &body.workspace_id, body.wildcard, VERIFIED)
+        .upsert_domain(
+            &DomainUpsert {
+                domain: &domain,
+                workspace_id: &body.workspace_id,
+                wildcard: body.wildcard,
+                verified: VERIFIED,
+            },
+            &actx,
+        )
         .await
     {
         return internal(e);
@@ -72,7 +85,11 @@ pub(crate) struct DeclareBody {
 /// Declare a domain under a tenant (RFC C3 / N2a): quota-gated, creates a pending
 /// row, and returns the DNS record the tenant must publish to prove ownership.
 /// Idempotent: re-declaring a pending domain returns the SAME challenge.
-pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<DeclareBody>) -> Response {
+pub(crate) async fn declare_domain(
+    State(s): State<App>,
+    Extension(actx): Extension<AuditCtx>,
+    Json(body): Json<DeclareBody>,
+) -> Response {
     let domain = normalize_host(&body.domain);
     // Must be a real (sub)domain — a bare label cannot be ownership-proven.
     if domain.is_empty() || !domain.contains('.') {
@@ -135,7 +152,7 @@ pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<Declar
             // if a concurrent declare for the same domain won the race between our
             // ownership check above and here, our insert is a no-op and we resolve
             // the conflict by re-reading the current owner (closes the declare TOCTOU).
-            match s.store.create_pending_domain(&domain, &body.workspace_id).await {
+            match s.store.create_pending_domain(&domain, &body.workspace_id, &actx).await {
                 Ok(true) => {}
                 Ok(false) => {
                     match s.store.get_domain(&domain, false).await {
@@ -192,7 +209,9 @@ enum VerifyOutcome {
 /// Verify a single domain by ownership proof (RFC C4 / N2b): resolve the
 /// challenge TXT, match the live token, then (atomically for observers) set
 /// verified + announce on the one invalidation feed + retire the challenge.
-async fn verify_one(s: &App, domain: &str) -> VerifyOutcome {
+/// `actx` attributes the resulting `domain.verify` audit event — the caller's
+/// token on the endpoint path, the reserved system actor on the poll path.
+async fn verify_one(s: &App, domain: &str, actx: &AuditCtx) -> VerifyOutcome {
     let ch = match s.store.get_challenge(domain).await {
         Ok(Some(c)) => c,
         Ok(None) => {
@@ -216,7 +235,7 @@ async fn verify_one(s: &App, domain: &str) -> VerifyOutcome {
     if !token_matches(&records, &ch.token) {
         return VerifyOutcome::ProofNotFound;
     }
-    if let Err(e) = s.store.set_domain_verified(domain, true).await {
+    if let Err(e) = s.store.set_domain_verified(domain, true, actx).await {
         return VerifyOutcome::Error(e);
     }
     // Now routable → MUST announce on the invalidation feed (RFC C6).
@@ -232,9 +251,13 @@ async fn verify_one(s: &App, domain: &str) -> VerifyOutcome {
 }
 
 /// Tenant-triggered "check now" (RFC C4): verify by ownership proof.
-pub(crate) async fn verify_domain(State(s): State<App>, Path(domain): Path<String>) -> Response {
+pub(crate) async fn verify_domain(
+    State(s): State<App>,
+    Path(domain): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     let domain = normalize_host(&domain);
-    match verify_one(&s, &domain).await {
+    match verify_one(&s, &domain, &actx).await {
         VerifyOutcome::Verified => {
             (StatusCode::OK, Json(json!({ "result": "ok", "domain": domain, "verified": true })))
                 .into_response()
@@ -325,8 +348,11 @@ pub(crate) async fn verification_poll(app: App, interval_secs: u64) {
                 continue;
             }
         };
+        // The poll is a system mutation, not an HTTP caller — its `domain.verify`
+        // events carry the reserved system actor (admin-action-audit).
+        let poll_actx = AuditCtx::system(ACTOR_SYSTEM_VERIFY_POLL);
         for domain in pending {
-            if matches!(verify_one(&app, &domain).await, VerifyOutcome::Verified) {
+            if matches!(verify_one(&app, &domain, &poll_actx).await, VerifyOutcome::Verified) {
                 info!(domain = %domain, "verification poll: domain converged");
             }
         }
@@ -345,9 +371,10 @@ pub(crate) async fn delete_domain(
     State(s): State<App>,
     Path(domain): Path<String>,
     Query(q): Query<DeleteDomainQuery>,
+    Extension(actx): Extension<AuditCtx>,
 ) -> impl IntoResponse {
     let domain = normalize_host(&domain);
-    if let Err(e) = s.store.delete_domain(&domain, q.wildcard).await {
+    if let Err(e) = s.store.delete_domain(&domain, q.wildcard, &actx).await {
         return internal(e);
     }
     s.invalidate(&domain).await;

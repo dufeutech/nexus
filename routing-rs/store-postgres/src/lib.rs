@@ -20,12 +20,14 @@ use sqlx::{PgConnection, PgPool};
 
 use router_core::store::BoxError;
 
+mod admin_audit;
 mod challenge_store;
 mod invalidations;
 mod membership_store;
 mod ownership_store;
 mod routing_store;
 
+pub use admin_audit::{AdminTokenHasher, IssuedAdminToken, PgAdminTokenStore, PgAuditMaintenance};
 pub use invalidations::PgInvalidations;
 
 /// The NOTIFY channel the control plane publishes invalidations on.
@@ -43,29 +45,47 @@ pub struct PgRoutingStore {
     pub(crate) pool: PgPool,
 }
 
+/// Open a pooler-safe pool with `max` connections.
+///
+/// Disables sqlx's prepared-statement cache so the pool is safe through a
+/// transaction-mode pooler (PgBouncer): cached prepared statements break there
+/// ("prepared statement already exists"). The router's read pool may point at
+/// such a pooler (`ROUTING_PG_READ_URL`); the queries here are trivial point
+/// reads, so the cache buys nothing and turning it off makes the pool
+/// pooler-safe everywhere. The LISTEN feed is a separate connection and is
+/// never pooled — see `PgInvalidations`. A server-side statement timeout caps
+/// any single statement so a slow/stuck query can't pin a pooled connection
+/// (and stall every coalesced waiter) forever, and the acquire timeout bounds
+/// the wait for a free connection so pool exhaustion surfaces as a fast error
+/// instead of an unbounded hang.
+pub(crate) async fn connect_pool(url: &str, max: u32) -> Result<PgPool, BoxError> {
+    let opts = url
+        .parse::<PgConnectOptions>()?
+        .statement_cache_capacity(0)
+        .options([("statement_timeout", "5000")]);
+    let pool = PgPoolOptions::new()
+        .max_connections(max)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(opts)
+        .await?;
+    Ok(pool)
+}
+
 impl PgRoutingStore {
     pub async fn connect(url: &str) -> Result<Self, BoxError> {
-        // Disable sqlx's prepared-statement cache so this pool is safe through a
-        // transaction-mode pooler (PgBouncer): cached prepared statements break
-        // there ("prepared statement already exists"). The router's read pool may
-        // point at such a pooler (ROUTING_PG_READ_URL); the queries here are
-        // trivial point reads, so the cache buys nothing and turning it off makes
-        // the pool pooler-safe everywhere (the control plane, direct, is low
-        // volume and unaffected). The LISTEN feed is a separate connection and is
-        // never pooled — see `PgInvalidations`.
-        let opts = url
-            .parse::<PgConnectOptions>()?
-            .statement_cache_capacity(0)
-            // Cap any single statement server-side so a slow/stuck query can't
-            // pin a pooled connection (and stall every coalesced waiter) forever.
-            .options([("statement_timeout", "5000")]);
+        Ok(Self { pool: connect_pool(url, 8).await? })
+    }
+
+    /// Open a handle WITHOUT probing the database (connections are established
+    /// on first use, so every query against an unreachable server errors).
+    /// For tests that must exercise store-failure paths (e.g. "a failed denial
+    /// write still returns 401"); services use [`PgRoutingStore::connect`].
+    pub fn connect_lazy(url: &str) -> Result<Self, BoxError> {
+        let opts = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
         let pool = PgPoolOptions::new()
-            .max_connections(8)
-            // Bound the wait for a free connection so pool exhaustion surfaces as
-            // a fast error instead of an unbounded hang on the request path.
+            .max_connections(1)
             .acquire_timeout(Duration::from_secs(5))
-            .connect_with(opts)
-            .await?;
+            .connect_lazy_with(opts);
         Ok(Self { pool })
     }
 
@@ -223,6 +243,71 @@ impl PgRoutingStore {
                  status       text NOT NULL DEFAULT 'active', \
                  updated_at   timestamptz NOT NULL DEFAULT now(), \
                  PRIMARY KEY (user_sub, workspace_id))",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Admin audit ledger (admin-action-audit D1/D3): every mutating admin
+        // action records one event IN THE SAME TRANSACTION as the mutation.
+        // Append-only: the application has no UPDATE/DELETE over this table, and
+        // migrations/0002_admin_audit.sql withholds those grants from the service
+        // role (this bootstrap mirrors tables only — roles/grants are deployment
+        // DDL). `event_id` is `aev_<uuidv7>`, so PK order IS time order.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.admin_audit_events (\
+                 event_id          text PRIMARY KEY, \
+                 occurred_at       timestamptz NOT NULL DEFAULT now(), \
+                 surface           text NOT NULL, \
+                 action            text NOT NULL, \
+                 actor_token_id    text NOT NULL, \
+                 asserted_operator text, \
+                 target_kind       text, \
+                 target_id         text, \
+                 outcome           text NOT NULL, \
+                 detail            jsonb NOT NULL DEFAULT '{}'::jsonb, \
+                 trace_id          text, \
+                 source_ip         text, \
+                 idempotency_key   text)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // The read surface filters by time, actor, and target (design D6).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS admin_audit_events_time_idx \
+             ON routing.admin_audit_events (occurred_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS admin_audit_events_actor_idx \
+             ON routing.admin_audit_events (actor_token_id, event_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS admin_audit_events_target_idx \
+             ON routing.admin_audit_events (target_id, event_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Named admin credentials (admin-action-audit D4): one row per caller,
+        // peppered-HMAC hash only (never the secret), rotation lineage via
+        // `rotated_from`, revocation as a status flip.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing.admin_tokens (\
+                 token_id     text PRIMARY KEY, \
+                 name         text NOT NULL, \
+                 token_hash   text NOT NULL UNIQUE, \
+                 status       text NOT NULL DEFAULT 'active', \
+                 rotated_from text, \
+                 created_at   timestamptz NOT NULL DEFAULT now(), \
+                 updated_at   timestamptz NOT NULL DEFAULT now())",
+        )
+        .execute(&self.pool)
+        .await?;
+        // The per-request verification lookup: by hash, active only.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS admin_tokens_active_hash_idx \
+             ON routing.admin_tokens (token_hash) WHERE status = 'active'",
         )
         .execute(&self.pool)
         .await?;

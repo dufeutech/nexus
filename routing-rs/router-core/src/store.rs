@@ -10,10 +10,21 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::Serialize;
 
+use crate::audit::AuditCtx;
 use crate::auth::{AuthPolicy, RouteAuth};
 use crate::domain::WorkspaceConfig;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
+
+/// The admin domain-mapping write, bundled (RFC §3.13): which workspace the
+/// domain maps to, whether it is a wildcard row, and the verification flag.
+#[derive(Debug, Clone, Copy)]
+pub struct DomainUpsert<'a> {
+    pub domain: &'a str,
+    pub workspace_id: &'a str,
+    pub wildcard: bool,
+    pub verified: bool,
+}
 
 /// A stored domain mapping as the control plane sees it (RFC §3.13): which
 /// workspace owns it, whether it is a wildcard, and whether it is verified. Unlike
@@ -61,29 +72,33 @@ pub trait RoutingStore: Send + Sync {
     /// `cfg` is server-minted ([`crate::ids`]). With an idempotency key, a replay
     /// returns the ORIGINAL row's id with `created = false` instead of inserting;
     /// two same-key racers resolve to one row, both receiving its id. A `None`
-    /// key opts out of replay protection (every call inserts).
+    /// key opts out of replay protection (every call inserts). When
+    /// `owner_account` is set and THIS call inserted, ownership is assigned in
+    /// the same transaction (a replay never re-owns). Records one
+    /// `workspace.create` audit event atomically with the write
+    /// (admin-action-audit): an unrecorded create does not commit.
     async fn create_workspace(
         &self,
         cfg: &WorkspaceConfig,
+        owner_account: Option<&str>,
         idempotency_key: Option<&str>,
+        actx: &AuditCtx,
     ) -> Result<CreateOutcome, BoxError>;
 
     /// Reconfigure an existing workspace's plan/pool/features — update-only,
     /// NEVER creates (an unknown id is `false`, not a new row). The display name
     /// and ownership are deliberately untouched: name is create-time data,
-    /// ownership changes ride [`OwnershipStore::transfer_workspace`].
-    async fn update_workspace(&self, cfg: &WorkspaceConfig) -> Result<bool, BoxError>;
+    /// ownership changes ride [`OwnershipStore::transfer_workspace`]. Audited
+    /// atomically (`workspace.reconfigure`) when a row matched.
+    async fn update_workspace(&self, cfg: &WorkspaceConfig, actx: &AuditCtx)
+        -> Result<bool, BoxError>;
 
     /// Create or update a domain → workspace mapping. This is the **admin** write
     /// (it may reassign ownership); the self-service declare path uses
-    /// [`RoutingStore::create_pending_domain`], which never reassigns.
-    async fn upsert_domain(
-        &self,
-        domain: &str,
-        workspace_id: &str,
-        wildcard: bool,
-        verified: bool,
-    ) -> Result<(), BoxError>;
+    /// [`RoutingStore::create_pending_domain`], which never reassigns. Audited
+    /// atomically (`domain.upsert`).
+    async fn upsert_domain(&self, up: &DomainUpsert<'_>, actx: &AuditCtx)
+        -> Result<(), BoxError>;
 
     /// Atomically claim a NEW exact (non-wildcard), unverified domain for a
     /// workspace (RFC C3 self-service declare). Returns `true` iff this call
@@ -92,20 +107,32 @@ pub trait RoutingStore: Send + Sync {
     /// `workspace_id` — that closes the declare race where two workspaces claim the
     /// same domain concurrently (the loser gets `false` and is then told
     /// `domain_taken`).
+    /// Audited atomically (`domain.declare`) when THIS call inserted the row; a
+    /// lost race / existing row records nothing (no state changed).
     async fn create_pending_domain(
         &self,
         domain: &str,
         workspace_id: &str,
+        actx: &AuditCtx,
     ) -> Result<bool, BoxError>;
 
     /// Set an exact (non-wildcard) domain's ownership-verification flag (RFC C16:
     /// verify ownership). Keyed on `(domain, is_wildcard=false)` — the lifecycle
     /// only ever verifies exact self-service domains, never a wildcard row.
-    async fn set_domain_verified(&self, domain: &str, verified: bool) -> Result<(), BoxError>;
+    /// Audited atomically (`domain.verify`) when a row changed.
+    async fn set_domain_verified(
+        &self,
+        domain: &str,
+        verified: bool,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError>;
 
     /// Remove a domain mapping (idempotent — missing is not an error). `wildcard`
-    /// selects which row of the `(domain, is_wildcard)` pair to drop.
-    async fn delete_domain(&self, domain: &str, wildcard: bool) -> Result<(), BoxError>;
+    /// selects which row of the `(domain, is_wildcard)` pair to drop. Audited
+    /// atomically (`domain.delete`) when a row was actually removed (a no-op
+    /// delete mutates nothing and records nothing).
+    async fn delete_domain(&self, domain: &str, wildcard: bool, actx: &AuditCtx)
+        -> Result<(), BoxError>;
 
     /// The domains owned by a workspace — used by the control plane to publish the
     /// precise invalidations for a workspace-config change.
@@ -148,16 +175,23 @@ pub trait RoutingStore: Send + Sync {
     /// Create or update one path-prefix rule for a workspace (control-plane write).
     /// The per-workspace default is the rule with `prefix = "/"`. The rule carries
     /// the full protection decision, including the optional phase-2 requirement
-    /// fields (`None` = no requirement).
+    /// fields (`None` = no requirement). Audited atomically (`auth_route.upsert`).
     async fn upsert_auth_route(
         &self,
         workspace_id: &str,
         prefix: &str,
         auth: &RouteAuth,
+        actx: &AuditCtx,
     ) -> Result<(), BoxError>;
 
     /// Remove one path-prefix rule (idempotent — missing is not an error).
-    async fn delete_auth_route(&self, workspace_id: &str, prefix: &str) -> Result<(), BoxError>;
+    /// Audited atomically (`auth_route.delete`).
+    async fn delete_auth_route(
+        &self,
+        workspace_id: &str,
+        prefix: &str,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError>;
 }
 
 /// The ownership-proof challenge store (RFC C4). Kept distinct from the routing
@@ -305,46 +339,40 @@ pub struct CreateOutcome {
     pub created: bool,
 }
 
+/// The account-provisioning write, bundled: create-time account data plus the
+/// owner membership asserted with it. The `account_id` is server-minted
+/// ([`crate::ids`]); `idempotency_key` is the caller's replay guard.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAccount<'a> {
+    pub account_id: &'a str,
+    pub name: &'a str,
+    pub payer_ref: Option<&'a str>,
+    pub owner_sub: &'a str,
+    pub idempotency_key: Option<&'a str>,
+}
+
 /// Account ownership + workspace-transfer surface (control plane, RFC §3.13).
 #[async_trait]
 pub trait OwnershipStore: Send + Sync {
-    /// Create an account with a server-minted id ([`crate::ids`]) — insert-only.
-    /// With an idempotency key, a replay returns the ORIGINAL account's id with
-    /// `created = false` and never clobbers its name/payer — this is what keeps
-    /// signup provisioning safe to call unconditionally (provisioning-idempotency;
-    /// the key replaces the idempotence that used to ride on the caller-supplied
-    /// id being the primary key). Two same-key racers resolve to one row.
-    async fn create_account(
+    /// Provision an account with a server-minted id ([`crate::ids`]) — insert-only
+    /// — and assert its `owner` membership, in ONE transaction. With an
+    /// idempotency key, a replay returns the ORIGINAL account's id with
+    /// `created = false`, never clobbers its name/payer, and only re-asserts the
+    /// owner membership — this is what keeps signup provisioning safe to call
+    /// unconditionally (provisioning-idempotency). Two same-key racers resolve to
+    /// one row. Records one `account.provision` audit event atomically with the
+    /// write (admin-action-audit): an unrecorded provision does not commit.
+    async fn provision_account(
         &self,
-        account_id: &str,
-        name: &str,
-        payer_ref: Option<&str>,
-        idempotency_key: Option<&str>,
+        account: &NewAccount<'_>,
+        actx: &AuditCtx,
     ) -> Result<CreateOutcome, BoxError>;
 
     /// Load an account, `None` if absent.
     async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError>;
 
-    /// Grant (or update the role of) a member of an account. Idempotent upsert.
-    async fn add_account_member(
-        &self,
-        account_id: &str,
-        user_sub: &str,
-        role: &str,
-    ) -> Result<(), BoxError>;
-
     /// The members of an account.
     async fn account_members(&self, account_id: &str) -> Result<Vec<AccountMember>, BoxError>;
-
-    /// Assign a workspace's owning account at CREATE time (no staff reset). Returns
-    /// `true` iff a workspace row matched, `false` if the workspace is unknown. Use
-    /// [`OwnershipStore::transfer_workspace`] for an ownership change (it also resets
-    /// staff atomically).
-    async fn set_workspace_account(
-        &self,
-        workspace_id: &str,
-        account_id: &str,
-    ) -> Result<bool, BoxError>;
 
     /// Transfer a workspace to a different owning account (RFC workspace-tenancy):
     /// repoint `account_id` AND reset staff memberships in ONE transaction, so a
@@ -352,10 +380,12 @@ pub trait OwnershipStore: Send + Sync {
     /// (the security contract of a sale/transfer). The `workspace_id`, its domains,
     /// its data, and its **customer** memberships are untouched. Returns
     /// `Some(staff_removed)` on success, or `None` if the workspace is unknown.
+    /// Audited atomically (`workspace.transfer`).
     async fn transfer_workspace(
         &self,
         workspace_id: &str,
         account_id: &str,
+        actx: &AuditCtx,
     ) -> Result<Option<u64>, BoxError>;
 }
 
@@ -365,11 +395,17 @@ pub trait OwnershipStore: Send + Sync {
 pub trait MembershipStore: Send + Sync {
     /// Grant or update a membership. Idempotent upsert keyed `(user_sub,
     /// workspace_id)` — a user holds at most one membership per workspace.
-    async fn upsert_membership(&self, m: &Membership) -> Result<(), BoxError>;
+    /// Audited atomically (`membership.upsert`).
+    async fn upsert_membership(&self, m: &Membership, actx: &AuditCtx) -> Result<(), BoxError>;
 
-    /// Revoke a membership (idempotent — missing is not an error).
-    async fn delete_membership(&self, user_sub: &str, workspace_id: &str)
-        -> Result<(), BoxError>;
+    /// Revoke a membership (idempotent — missing is not an error). Audited
+    /// atomically (`membership.revoke`).
+    async fn delete_membership(
+        &self,
+        user_sub: &str,
+        workspace_id: &str,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError>;
 
     /// The memberships of a workspace (staff and customer).
     async fn memberships_for_workspace(

@@ -5,12 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::var;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use headers::authorization::Bearer;
 use headers::{Authorization, HeaderMapExt};
 use axum::middleware::Next;
@@ -26,11 +26,15 @@ use opentelemetry::{global, KeyValue};
 use serde_json::json;
 use tracing::{error, warn};
 
+use router_core::audit::{
+    AuditCtx, DenialEvent, DenialKind, ACTOR_AUTH_DISABLED, ACTOR_LEGACY_SHARED,
+    ASSERTED_OPERATOR_MAX_BYTES, TRACE_ID_MAX_BYTES,
+};
 use router_core::domain::PoolSet;
 use router_core::plan::{DomainLimit, PlanLimits};
-use router_core::store::InvalidationPublisher;
+use router_core::store::{BoxError, InvalidationPublisher};
 use router_core::verify::{ct_eq, OwnershipProof};
-use store_postgres::PgRoutingStore;
+use store_postgres::{PgAdminTokenStore, PgRoutingStore};
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): every control mutation is counted through the
@@ -101,12 +105,69 @@ pub(crate) struct App {
     /// How long a domain may stay pending before it expires and frees quota,
     /// seconds (RFC C3). `0` disables expiry.
     pub(crate) pending_ttl: i64,
-    /// Shared admin bearer token required on every data endpoint. `None` ONLY
-    /// when auth is explicitly disabled at startup (`CONTROL_AUTH_DISABLED=true`);
-    /// the server otherwise refuses to start without a token, so it is never
-    /// silently open. The control plane is a trusted-broker admin surface, so a
-    /// single shared secret authenticates the caller; `tenant_id` is then trusted.
-    pub(crate) auth_token: Option<Arc<str>>,
+    /// The admin authentication configuration (admin-action-audit D4/D5):
+    /// individually identifiable named tokens, with an explicit legacy-shared
+    /// migration mode. Fail-closed — the server refuses to start without an
+    /// explicit choice, so it is never silently open.
+    pub(crate) auth: AdminAuth,
+    /// Per-source rate limit for DENIAL ledger writes only (an unauthenticated
+    /// scanner must not flood the ledger); mutation events are never limited.
+    pub(crate) denials: Arc<DenialLimiter>,
+}
+
+/// How admin callers authenticate (admin-action-audit D4/D5). Every accepted
+/// credential resolves to an individually identifiable actor id — a named
+/// token's `token_id`, or the reserved `legacy-shared` / `auth-disabled` ids.
+#[derive(Clone)]
+pub(crate) struct AdminAuth {
+    /// Auth explicitly disabled at startup (`CONTROL_AUTH_DISABLED=true`,
+    /// trusted-network/dev only): requests pass through as `auth-disabled`.
+    pub(crate) disabled: bool,
+    /// The named-token verifier (`ADMIN_TOKEN_PEPPER` set). `None` = named
+    /// tokens unconfigured; provisioning endpoints then answer 503.
+    pub(crate) tokens: Option<Arc<PgAdminTokenStore>>,
+    /// The legacy shared token (`CONTROL_AUTH_TOKEN`), honored ONLY while
+    /// `legacy_ok` (design D5's migration mode).
+    pub(crate) legacy: Option<Arc<str>>,
+    /// `ADMIN_LEGACY_TOKEN_OK=true` — the explicit, deprecation-warned gate for
+    /// the shared token. Default off; flipping it off is the migration's
+    /// completion step (and re-enabling it is the rollback).
+    pub(crate) legacy_ok: bool,
+}
+
+/// Fixed-window per-source counter bounding DENIAL event writes (design risk:
+/// "denial-event flooding of the ledger by an unauthenticated scanner"). Only
+/// the ledger WRITE is limited — the 401 itself and its log line always happen.
+pub(crate) struct DenialLimiter {
+    window: Duration,
+    max_per_window: u32,
+    state: Mutex<BTreeMap<String, (Instant, u32)>>,
+}
+
+impl DenialLimiter {
+    /// At most `max_per_window` recorded denials per source per `window`.
+    pub(crate) const fn new(window: Duration, max_per_window: u32) -> Self {
+        Self { window, max_per_window, state: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// Whether a denial from `source` may be recorded now.
+    pub(crate) fn allow(&self, source: &str) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Opportunistically drop stale windows so a scanner cycling source
+        // addresses cannot grow the map without bound.
+        if state.len() >= 4096 {
+            state.retain(|_, (start, _)| now.duration_since(*start) < self.window);
+        }
+        let entry = state.entry(source.to_owned()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= self.window {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        let allowed = entry.1 <= self.max_per_window;
+        drop(state);
+        allowed
+    }
 }
 
 /// Uniform 500 for an unexpected store/adapter error. The underlying error is
@@ -194,36 +255,270 @@ pub(crate) fn env(key: &str, default: &str) -> String {
     var(key).unwrap_or_else(|_| default.to_owned())
 }
 
-/// Admin-token gate (RFC C16 admin boundary): every DATA endpoint requires
-/// `Authorization: Bearer <CONTROL_AUTH_TOKEN>`. The token is compared in
-/// constant time. `/healthz` is intentionally NOT behind this (liveness). When
-/// `auth_token` is `None` the operator explicitly
-/// disabled auth at startup, so requests pass through.
-pub(crate) async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Response {
-    let Some(expected) = s.auth_token.as_deref() else {
-        return next.run(req).await;
+/// Read a header value if present, valid UTF-8, non-empty, and within `max`
+/// bytes; anything else is treated as absent (correlation data is best-effort).
+fn header_capped(headers: &HeaderMap, name: &str, max: usize) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= max)
+        .map(str::to_owned)
+}
+
+/// The caller-asserted operator (`x-acting-operator`, spec: recorded verbatim,
+/// confers nothing). Over-long or non-UTF-8 values are REJECTED (400) rather
+/// than truncated — a truncated assertion would not be verbatim. Only ever
+/// evaluated AFTER authentication succeeded, so it cannot influence an auth
+/// outcome.
+fn asserted_operator(headers: &HeaderMap) -> Result<Option<String>, Box<Response>> {
+    let Some(raw) = headers.get("x-acting-operator") else {
+        return Ok(None);
     };
-    // Parse `Authorization: Bearer <token>` with the vetted `headers` typed-header
-    // parser (RFC 7235: case-insensitive scheme, correct whitespace handling)
-    // rather than a hand-rolled split. The token itself is then compared in
-    // constant time; a present-but-wrong or missing/malformed header both 401.
-    let bearer = req.headers().typed_get::<Authorization<Bearer>>();
-    match &bearer {
-        Some(auth) if ct_eq(auth.token(), expected) => next.run(req).await,
-        _ => {
+    let rejection = || {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_acting_operator",
+                    "hint": "UTF-8, non-empty, at most the documented byte length",
+                    "max_bytes": ASSERTED_OPERATOR_MAX_BYTES,
+                })),
+            )
+                .into_response(),
+        )
+    };
+    let Ok(value) = raw.to_str() else {
+        return Err(rejection());
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > ASSERTED_OPERATOR_MAX_BYTES {
+        return Err(rejection());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// Resolve a presented bearer secret to its individually identifiable actor id
+/// (admin-action-audit D4/D5): a named token's id via the peppered-hash lookup,
+/// or the reserved `legacy-shared` id while the migration flag allows the old
+/// shared token (compared in constant time, deprecation-warned per use).
+/// `None` = not authenticated.
+async fn resolve_actor(auth: &AdminAuth, presented: &str) -> Result<Option<String>, BoxError> {
+    if let Some(tokens) = &auth.tokens
+        && let Some(token_id) = tokens.lookup(presented).await?
+    {
+        return Ok(Some(token_id));
+    }
+    if auth.legacy_ok
+        && let Some(legacy) = auth.legacy.as_deref()
+        && ct_eq(presented, legacy)
+    {
+        warn!(
+            "legacy shared admin token used (ADMIN_LEGACY_TOKEN_OK=true) — provision a named \
+             token for this caller and flip the flag off (admin-action-audit migration)"
+        );
+        return Ok(Some(ACTOR_LEGACY_SHARED.to_owned()));
+    }
+    Ok(None)
+}
+
+/// The 401 tail: a best-effort, rate-limited denial ledger event (spec:
+/// "Denied admin access is recorded"). A failed denial write logs an error and
+/// STAYS a denial — it never converts into an acceptance and never 500s.
+/// Never carries the presented credential. (Owned data only, so the middleware
+/// future stays `Send` — the request is not held across this await.)
+async fn deny(state: &App, had_bearer: bool, correlation: (Option<String>, Option<String>)) -> Response {
+    let (source_ip, trace_id) = correlation;
+    let source_key = source_ip.clone().unwrap_or_else(|| "unknown".to_owned());
+    if state.denials.allow(&source_key) {
+        let denial = DenialEvent {
+            kind: if had_bearer { DenialKind::Invalid } else { DenialKind::Absent },
+            source_ip,
+            trace_id,
+        };
+        if let Err(e) = state.store.record_auth_denial(&denial).await {
+            warn!(error = %e, "denial event write failed (still denying)");
+        }
+    }
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
+}
+
+/// Admin-token gate (RFC C16 admin boundary, admin-action-audit D4/D5): every
+/// DATA endpoint requires a bearer credential that resolves to an individually
+/// identifiable actor — a named token from `routing.admin_tokens` (peppered-HMAC
+/// indexed lookup; deterministic HMAC comparison leaks nothing without the
+/// pepper) or, during migration only, the legacy shared token (constant-time
+/// compare preserved). On success the request carries an [`AuditCtx`] with the
+/// actor and transport facts for the store layer's same-transaction audit
+/// recording. `/healthz` is intentionally NOT behind this (liveness). When auth
+/// is explicitly disabled at startup, requests pass through as `auth-disabled`.
+pub(crate) async fn require_auth(State(s): State<App>, mut req: Request, next: Next) -> Response {
+    // Correlation facts ride BOTH paths: the mutation's audit context and the
+    // denial event.
+    let source_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string());
+    let trace_id = header_capped(req.headers(), "traceparent", TRACE_ID_MAX_BYTES);
+
+    let actor = if s.auth.disabled {
+        ACTOR_AUTH_DISABLED.to_owned()
+    } else {
+        // Parse `Authorization: Bearer <token>` with the vetted `headers`
+        // typed-header parser (RFC 7235: case-insensitive scheme, correct
+        // whitespace handling) rather than a hand-rolled split.
+        let bearer = req.headers().typed_get::<Authorization<Bearer>>();
+        let resolved = match &bearer {
+            Some(auth) => match resolve_actor(&s.auth, auth.token()).await {
+                Ok(resolved) => resolved,
+                // A verifier failure (e.g. the token table unreachable) is a
+                // 500, not a 401: fail closed without recording a false denial.
+                Err(e) => return internal(e),
+            },
+            None => None,
+        };
+        if let Some(actor) = resolved {
+            actor
+        } else {
             METRICS.mutations.add(1, &[KeyValue::new("op", "unauthorized")]);
-            // Emit an audit line (not only a metric) so a rejected admin attempt is
-            // visible in the log trail. Method + path only — never the presented
-            // credential. `bearer.is_some()` distinguishes a bad token from a
-            // missing/malformed Authorization header.
+            // Method + path only — never the presented credential. `had_bearer`
+            // distinguishes a bad token from a missing/malformed header.
             warn!(
                 method = %req.method(),
                 path = %req.uri().path(),
                 had_bearer = bearer.is_some(),
                 "unauthorized control-plane request"
             );
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
+            return deny(&s, bearer.is_some(), (source_ip, trace_id)).await;
         }
+    };
+
+    // Validated only after authentication: an assertion can never change an
+    // auth outcome — an invalid credential + assertion is rejected identically.
+    let operator = match asserted_operator(req.headers()) {
+        Ok(operator) => operator,
+        Err(rejection) => return *rejection,
+    };
+    let _prior = req.extensions_mut().insert(AuditCtx {
+        actor,
+        asserted_operator: operator,
+        trace_id,
+        source_ip,
+    });
+    next.run(req).await
+}
+
+// --------------------------------------------------------------------------- //
+// admin-action-audit tests: the operator-assertion boundary and the denial
+// rate limiter (pure pieces; the auth flow itself is driven by the e2e suite).
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+mod audit_gate_tests {
+    use super::{
+        asserted_operator, header_capped, DenialLimiter, Duration, HeaderMap,
+        ASSERTED_OPERATOR_MAX_BYTES,
+    };
+
+    #[test]
+    fn asserted_operator_is_verbatim_or_rejected() {
+        let mut headers = HeaderMap::new();
+        // Absent → None (the assertion is optional).
+        assert_eq!(asserted_operator(&headers).unwrap(), None);
+        // Present → recorded verbatim.
+        headers.insert("x-acting-operator", "alice@example.com".parse().unwrap());
+        assert_eq!(asserted_operator(&headers).unwrap().as_deref(), Some("alice@example.com"));
+        // Over the cap → rejected (400), never truncated (verbatim or nothing).
+        let long = "x".repeat(ASSERTED_OPERATOR_MAX_BYTES.saturating_add(1));
+        headers.insert("x-acting-operator", long.parse().unwrap());
+        assert!(asserted_operator(&headers).is_err(), "over-long assertion is a 400");
+        // Empty → treated as absent, not an error.
+        headers.insert("x-acting-operator", "".parse().unwrap());
+        assert_eq!(asserted_operator(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn correlation_headers_are_capped_best_effort() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(header_capped(&headers, "traceparent", 16), None);
+        headers.insert("traceparent", "00-abc-def-01".parse().unwrap());
+        assert_eq!(header_capped(&headers, "traceparent", 16).as_deref(), Some("00-abc-def-01"));
+        // Over-long correlation is dropped (best-effort), never an error.
+        assert_eq!(header_capped(&headers, "traceparent", 4), None);
+    }
+
+    #[test]
+    fn denial_limiter_bounds_per_source_writes() {
+        let limiter = DenialLimiter::new(Duration::from_mins(1), 3);
+        for _ in 0..3 {
+            assert!(limiter.allow("10.0.0.1"), "under the cap, denials are recorded");
+        }
+        assert!(!limiter.allow("10.0.0.1"), "the cap stops ledger flooding");
+        // Another source has its own window — one scanner can't starve others.
+        assert!(limiter.allow("10.0.0.2"), "sources are limited independently");
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// admin-action-audit 5.2: a FAILED denial ledger write must stay a denial —
+// never convert into an acceptance, never escalate to a 500.
+// --------------------------------------------------------------------------- //
+#[cfg(test)]
+mod denial_write_failure_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use router_core::domain::PoolSet;
+    use router_core::plan::PlanLimits;
+    use router_core::store::{BoxError, InvalidationPublisher};
+    use router_core::verify::OwnershipProof;
+    use store_postgres::PgRoutingStore;
+
+    use super::{deny, AdminAuth, App, DenialLimiter, Duration, StatusCode};
+
+    struct NoopPublisher;
+    #[async_trait]
+    impl InvalidationPublisher for NoopPublisher {
+        async fn publish(&self, _domain: &str) -> Result<(), BoxError> {
+            Ok(())
+        }
+    }
+
+    struct NoProof;
+    #[async_trait]
+    impl OwnershipProof for NoProof {
+        async fn txt_records(&self, _name: &str) -> Result<Vec<String>, BoxError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_denial_write_still_returns_401() {
+        // The ledger is unreachable (lazy pool at a closed port), so the denial
+        // insert fails — the response must still be the 401 the caller earned.
+        let store = Arc::new(
+            PgRoutingStore::connect_lazy("postgres://nobody:nothing@127.0.0.1:1/unreachable")
+                .expect("lazy handle needs no live database"),
+        );
+        let app = App {
+            store,
+            publisher: Arc::new(NoopPublisher),
+            limits: Arc::new(PlanLimits::new(BTreeMap::new())),
+            pools: Arc::new(PoolSet::new(BTreeSet::new())),
+            verifier: Arc::new(NoProof),
+            challenge_ttl: 60,
+            pending_ttl: 0,
+            auth: AdminAuth { disabled: false, tokens: None, legacy: None, legacy_ok: false },
+            denials: Arc::new(DenialLimiter::new(Duration::from_mins(1), 30)),
+        };
+        let response = deny(&app, true, (Some("10.0.0.9".to_owned()), None)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a failed denial write logs and stays a 401 — never accept, never 500"
+        );
     }
 }
 

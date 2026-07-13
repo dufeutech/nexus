@@ -15,6 +15,9 @@ pub const WORKSPACE_ID_PREFIX: &str = "ws_";
 /// Typed prefix carried by every account id.
 pub const ACCOUNT_ID_PREFIX: &str = "acct_";
 
+/// Typed prefix carried by every admin audit event id (admin-action-audit D3).
+pub const AUDIT_EVENT_ID_PREFIX: &str = "aev_";
+
 /// Mint a fresh workspace id (`ws_<uuidv7>`).
 #[must_use]
 pub fn mint_workspace_id() -> String {
@@ -25,6 +28,14 @@ pub fn mint_workspace_id() -> String {
 #[must_use]
 pub fn mint_account_id() -> String {
     mint(ACCOUNT_ID_PREFIX)
+}
+
+/// Mint a fresh admin audit event id (`aev_<uuidv7>`): self-describing in logs
+/// and exports, and lexicographically time-ordered so the ledger's id order IS
+/// its event order (admin-action-audit D3).
+#[must_use]
+pub fn mint_audit_event_id() -> String {
+    mint(AUDIT_EVENT_ID_PREFIX)
 }
 
 /// `Uuid::now_v7()` guarantees in-process monotonic ordering (uuid ≥ 1.9 keeps a
@@ -39,7 +50,10 @@ fn mint(prefix: &str) -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{mint_account_id, mint_workspace_id, ACCOUNT_ID_PREFIX, WORKSPACE_ID_PREFIX};
+    use super::{
+        mint_account_id, mint_audit_event_id, mint_workspace_id, ACCOUNT_ID_PREFIX,
+        AUDIT_EVENT_ID_PREFIX, WORKSPACE_ID_PREFIX,
+    };
 
     #[test]
     fn minted_ids_carry_their_typed_prefix() {
@@ -51,6 +65,18 @@ mod tests {
             mint_account_id().starts_with(ACCOUNT_ID_PREFIX),
             "account ids must be self-describing"
         );
+        assert!(
+            mint_audit_event_id().starts_with(AUDIT_EVENT_ID_PREFIX),
+            "audit event ids must be self-describing"
+        );
+    }
+
+    #[test]
+    fn audit_event_ids_are_time_ordered() {
+        // The spec scenario: lexicographic order of ids follows event time order.
+        let earlier = mint_audit_event_id();
+        let later = mint_audit_event_id();
+        assert!(earlier < later, "aev_ ids must sort by mint order: {earlier} !< {later}");
     }
 
     #[test]

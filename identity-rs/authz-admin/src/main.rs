@@ -16,15 +16,18 @@
 //! role at startup IFF no administrator exists yet — idempotent break-glass, so the
 //! surface is never unreachable from an empty store.
 
+mod audit_api;
+
+use std::collections::BTreeMap;
 use std::env::var;
 use std::error::Error;
 #[cfg(not(unix))]
 use std::future::pending;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::SocketAddr;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -40,11 +43,23 @@ use tokio::time::sleep;
 use tower_http::timeout::TimeoutLayer;
 use tracing::{error, info, warn};
 
+use identity_core::audit::{
+    AuditCtx, DenialEvent, DenialKind, ACTOR_AUTH_DISABLED, ACTOR_LEGACY_SHARED,
+    ASSERTED_OPERATOR_MAX_BYTES, TRACE_ID_MAX_BYTES,
+};
 use identity_core::authz::{AuthzAuthoring, AuthzResolver};
 use identity_core::store::{BoxError, ProfileStore};
 use identity_core::telemetry;
 use identity_core::SecretHasher;
-use store_postgres::{HmacSecretHasher, PgApiKeyStore, PgProfileStore};
+use store_postgres::{
+    HmacSecretHasher, IssueKeyRequest, PgAdminAuditStore, PgAdminTokenStore, PgApiKeyStore,
+    PgAuditMaintenance, PgProfileStore,
+};
+
+use crate::audit_api::{
+    export_audit_events, issue_admin_token, list_audit_events, retention_days_from_env,
+    retention_purge, revoke_admin_token, rotate_admin_token,
+};
 
 // --------------------------------------------------------------------------- //
 // Metrics (first-party-telemetry): every authoring mutation + rejected request is
@@ -86,10 +101,71 @@ struct App {
     /// The api-key store (issue/rotate/revoke). `None` when key management is not
     /// configured (`APIKEY_HMAC_PEPPER` unset) — the `/apikeys` endpoints then 503.
     api_keys: Option<Arc<PgApiKeyStore>>,
-    /// Shared admin bearer token required on every authoring endpoint. `None` ONLY
-    /// when auth is explicitly disabled at startup; the server otherwise refuses to
-    /// start without a token, so it is never silently open.
-    auth_token: Option<Arc<str>>,
+    /// The admin audit ledger's denial/read surface (admin-action-audit).
+    audit: Arc<PgAdminAuditStore>,
+    /// The admin authentication configuration (admin-action-audit D4/D5):
+    /// individually identifiable named tokens, with an explicit legacy-shared
+    /// migration mode. Fail-closed — the server refuses to start without an
+    /// explicit choice, so it is never silently open.
+    auth: AdminAuth,
+    /// Per-source rate limit for DENIAL ledger writes only (an unauthenticated
+    /// scanner must not flood the ledger); mutation events are never limited.
+    denials: Arc<DenialLimiter>,
+}
+
+/// How admin callers authenticate (admin-action-audit D4/D5). Every accepted
+/// credential resolves to an individually identifiable actor id — a named
+/// token's `token_id`, or the reserved `legacy-shared` / `auth-disabled` ids.
+#[derive(Clone)]
+struct AdminAuth {
+    /// Auth explicitly disabled at startup (`IDENTITY_ADMIN_AUTH_DISABLED=true`,
+    /// trusted-network/dev only): requests pass through as `auth-disabled`.
+    disabled: bool,
+    /// The named-token verifier (`ADMIN_TOKEN_PEPPER` set). `None` = named
+    /// tokens unconfigured; provisioning endpoints then answer 503.
+    tokens: Option<Arc<PgAdminTokenStore>>,
+    /// The legacy shared token (`IDENTITY_ADMIN_TOKEN`), honored ONLY while
+    /// `legacy_ok` (design D5's migration mode).
+    legacy: Option<Arc<str>>,
+    /// `ADMIN_LEGACY_TOKEN_OK=true` — the explicit, deprecation-warned gate for
+    /// the shared token. Default off; flipping it off is the migration's
+    /// completion step (and re-enabling it is the rollback).
+    legacy_ok: bool,
+}
+
+/// Fixed-window per-source counter bounding DENIAL event writes (design risk:
+/// "denial-event flooding of the ledger by an unauthenticated scanner"). Only
+/// the ledger WRITE is limited — the 401 itself and its log line always happen.
+struct DenialLimiter {
+    window: Duration,
+    max_per_window: u32,
+    state: Mutex<BTreeMap<String, (Instant, u32)>>,
+}
+
+impl DenialLimiter {
+    /// At most `max_per_window` recorded denials per source per `window`.
+    const fn new(window: Duration, max_per_window: u32) -> Self {
+        Self { window, max_per_window, state: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// Whether a denial from `source` may be recorded now.
+    fn allow(&self, source: &str) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Opportunistically drop stale windows so a scanner cycling source
+        // addresses cannot grow the map without bound.
+        if state.len() >= 4096 {
+            state.retain(|_, (start, _)| now.duration_since(*start) < self.window);
+        }
+        let entry = state.entry(source.to_owned()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= self.window {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        let allowed = entry.1 <= self.max_per_window;
+        drop(state);
+        allowed
+    }
 }
 
 /// Constant-time byte comparison — no early exit on the first differing byte, so a
@@ -111,28 +187,155 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .then(|| token.trim().to_owned())
 }
 
-/// Admin-token gate: every authoring/read endpoint requires a valid bearer token,
-/// compared in constant time. `/healthz` is intentionally NOT behind this (liveness).
-/// When `auth_token` is `None` the operator explicitly disabled auth at startup.
-async fn require_auth(State(s): State<App>, req: Request, next: Next) -> Response {
-    let Some(expected) = s.auth_token.as_deref() else {
-        return next.run(req).await;
+/// Read a header value if present, valid UTF-8, non-empty, and within `max`
+/// bytes; anything else is treated as absent (correlation data is best-effort).
+fn header_capped(headers: &HeaderMap, name: &str, max: usize) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= max)
+        .map(str::to_owned)
+}
+
+/// The caller-asserted operator (`x-acting-operator`, spec: recorded verbatim,
+/// confers nothing). Over-long or non-UTF-8 values are REJECTED (400) rather
+/// than truncated — a truncated assertion would not be verbatim. Only ever
+/// evaluated AFTER authentication succeeded, so it cannot influence an auth
+/// outcome.
+fn asserted_operator(headers: &HeaderMap) -> Result<Option<String>, Box<Response>> {
+    let Some(raw) = headers.get("x-acting-operator") else {
+        return Ok(None);
     };
-    let presented = bearer_token(req.headers());
-    match &presented {
-        Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
-        _ => {
+    let rejection = || {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_acting_operator",
+                    "hint": "UTF-8, non-empty, at most the documented byte length",
+                    "max_bytes": ASSERTED_OPERATOR_MAX_BYTES,
+                })),
+            )
+                .into_response(),
+        )
+    };
+    let Ok(value) = raw.to_str() else {
+        return Err(rejection());
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > ASSERTED_OPERATOR_MAX_BYTES {
+        return Err(rejection());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// Resolve a presented bearer secret to its individually identifiable actor id
+/// (admin-action-audit D4/D5): a named token's id via the peppered-hash lookup,
+/// or the reserved `legacy-shared` id while the migration flag allows the old
+/// shared token (compared in constant time, deprecation-warned per use).
+/// `None` = not authenticated.
+async fn resolve_actor(auth: &AdminAuth, presented: &str) -> Result<Option<String>, BoxError> {
+    if let Some(tokens) = &auth.tokens
+        && let Some(token_id) = tokens.lookup(presented).await?
+    {
+        return Ok(Some(token_id));
+    }
+    if auth.legacy_ok
+        && let Some(legacy) = auth.legacy.as_deref()
+        && ct_eq(presented.as_bytes(), legacy.as_bytes())
+    {
+        warn!(
+            "legacy shared admin token used (ADMIN_LEGACY_TOKEN_OK=true) — provision a named \
+             token for this caller and flip the flag off (admin-action-audit migration)"
+        );
+        return Ok(Some(ACTOR_LEGACY_SHARED.to_owned()));
+    }
+    Ok(None)
+}
+
+/// The 401 tail: a best-effort, rate-limited denial ledger event (spec:
+/// "Denied admin access is recorded"). A failed denial write logs an error and
+/// STAYS a denial — it never converts into an acceptance and never 500s.
+/// Never carries the presented credential. (Owned data only, so the middleware
+/// future stays `Send` — the request is not held across this await.)
+async fn deny(state: &App, had_bearer: bool, correlation: (Option<String>, Option<String>)) -> Response {
+    let (source_ip, trace_id) = correlation;
+    let source_key = source_ip.clone().unwrap_or_else(|| "unknown".to_owned());
+    if state.denials.allow(&source_key) {
+        let denial = DenialEvent {
+            kind: if had_bearer { DenialKind::Invalid } else { DenialKind::Absent },
+            source_ip,
+            trace_id,
+        };
+        if let Err(e) = state.audit.record_auth_denial(&denial).await {
+            warn!(error = %e, "denial event write failed (still denying)");
+        }
+    }
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
+}
+
+/// Admin-token gate (admin-action-audit D4/D5): every authoring/read endpoint
+/// requires a bearer credential that resolves to an individually identifiable
+/// actor — a named token from `identity.admin_tokens` (peppered-HMAC indexed
+/// lookup; deterministic HMAC comparison leaks nothing without the pepper) or,
+/// during migration only, the legacy shared token (constant-time compare
+/// preserved). On success the request carries an [`AuditCtx`] with the actor
+/// and transport facts for the store layer's same-transaction audit recording.
+/// `/healthz` is intentionally NOT behind this (liveness). When auth is
+/// explicitly disabled at startup, requests pass through as `auth-disabled`.
+async fn require_auth(State(s): State<App>, mut req: Request, next: Next) -> Response {
+    // Correlation facts ride BOTH paths: the mutation's audit context and the
+    // denial event.
+    let source_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string());
+    let trace_id = header_capped(req.headers(), "traceparent", TRACE_ID_MAX_BYTES);
+
+    let actor = if s.auth.disabled {
+        ACTOR_AUTH_DISABLED.to_owned()
+    } else {
+        let presented = bearer_token(req.headers());
+        let resolved = match &presented {
+            Some(secret) => match resolve_actor(&s.auth, secret).await {
+                Ok(resolved) => resolved,
+                // A verifier failure (e.g. the token table unreachable) is a
+                // 500, not a 401: fail closed without recording a false denial.
+                Err(e) => return internal(e),
+            },
+            None => None,
+        };
+        if let Some(actor) = resolved {
+            actor
+        } else {
             METRICS.mutations.add(1, &[KeyValue::new("op", "unauthorized")]);
-            // Audit line (method + path only — never the presented credential).
+            // Method + path only — never the presented credential. `had_bearer`
+            // distinguishes a bad token from a missing/malformed header.
             warn!(
                 method = %req.method(),
                 path = %req.uri().path(),
                 had_bearer = presented.is_some(),
                 "unauthorized authz-admin request"
             );
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response()
+            return deny(&s, presented.is_some(), (source_ip, trace_id)).await;
         }
-    }
+    };
+
+    // Validated only after authentication: an assertion can never change an
+    // auth outcome — an invalid credential + assertion is rejected identically.
+    let operator = match asserted_operator(req.headers()) {
+        Ok(operator) => operator,
+        Err(rejection) => return *rejection,
+    };
+    let _prior = req.extensions_mut().insert(AuditCtx {
+        actor,
+        asserted_operator: operator,
+        trace_id,
+        source_ip,
+    });
+    next.run(req).await
 }
 
 /// Uniform 500 for an unexpected store error — LOGGED with detail for operators, but
@@ -166,26 +369,32 @@ struct EntitlementBody {
 async fn assign_role(
     State(s): State<App>,
     Path(sub): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<RoleBody>,
 ) -> Response {
     // `sub` is a user id (PII) — keep it out of info logs.
     info!(op = "assign_role", "authoring");
-    authored(s.authoring.assign_role(&sub, &body.role).await, "assign_role")
+    authored(s.authoring.assign_role(&sub, &body.role, &actx).await, "assign_role")
 }
 
-async fn revoke_role(State(s): State<App>, Path((sub, role)): Path<(String, String)>) -> Response {
+async fn revoke_role(
+    State(s): State<App>,
+    Path((sub, role)): Path<(String, String)>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     info!(op = "revoke_role", "authoring");
-    authored(s.authoring.revoke_role(&sub, &role).await, "revoke_role")
+    authored(s.authoring.revoke_role(&sub, &role, &actx).await, "revoke_role")
 }
 
 async fn grant_entitlement(
     State(s): State<App>,
     Path(sub): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
     Json(body): Json<EntitlementBody>,
 ) -> Response {
     info!(op = "grant_entitlement", "authoring");
     authored(
-        s.authoring.grant_entitlement(&sub, &body.entitlement).await,
+        s.authoring.grant_entitlement(&sub, &body.entitlement, &actx).await,
         "grant_entitlement",
     )
 }
@@ -193,22 +402,31 @@ async fn grant_entitlement(
 async fn revoke_entitlement(
     State(s): State<App>,
     Path((sub, entitlement)): Path<(String, String)>,
+    Extension(actx): Extension<AuditCtx>,
 ) -> Response {
     info!(op = "revoke_entitlement", "authoring");
     authored(
-        s.authoring.revoke_entitlement(&sub, &entitlement).await,
+        s.authoring.revoke_entitlement(&sub, &entitlement, &actx).await,
         "revoke_entitlement",
     )
 }
 
-async fn suspend(State(s): State<App>, Path(sub): Path<String>) -> Response {
+async fn suspend(
+    State(s): State<App>,
+    Path(sub): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     info!(op = "suspend", "authoring");
-    authored(s.authoring.suspend(&sub).await, "suspend")
+    authored(s.authoring.suspend(&sub, &actx).await, "suspend")
 }
 
-async fn reactivate(State(s): State<App>, Path(sub): Path<String>) -> Response {
+async fn reactivate(
+    State(s): State<App>,
+    Path(sub): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     info!(op = "reactivate", "authoring");
-    authored(s.authoring.reactivate(&sub).await, "reactivate")
+    authored(s.authoring.reactivate(&sub, &actx).await, "reactivate")
 }
 
 /// Read a subject's effective facts (ops/audit convenience). Absent subject resolves
@@ -290,7 +508,11 @@ struct IssueKeyBody {
 /// auth); "may not exceed the creator" is enforced HERE against the creator's live
 /// memberships AND again at resolve time in the sidecar (the real guarantee). The secret
 /// is returned exactly once and never persisted in plaintext.
-async fn issue_api_key(State(s): State<App>, Json(body): Json<IssueKeyBody>) -> Response {
+async fn issue_api_key(
+    State(s): State<App>,
+    Extension(actx): Extension<AuditCtx>,
+    Json(body): Json<IssueKeyBody>,
+) -> Response {
     let Some(store) = s.api_keys.as_ref() else {
         return key_mgmt_unconfigured();
     };
@@ -306,7 +528,13 @@ async fn issue_api_key(State(s): State<App>, Json(body): Json<IssueKeyBody>) -> 
     if let Err(msg) = scopes_within_creator(&body.scopes, &member_workspaces) {
         return bad_request(&msg);
     }
-    match store.issue(&body.creator_sub, &body.scopes, body.expires_in_seconds, now_epoch()).await {
+    let request = IssueKeyRequest {
+        creator_sub: &body.creator_sub,
+        scopes: &body.scopes,
+        expires_in_seconds: body.expires_in_seconds,
+        now_epoch: now_epoch(),
+    };
+    match store.issue(&request, &actx).await {
         Ok(issued) => {
             METRICS.mutations.add(1, &[KeyValue::new("op", "issue_api_key")]);
             // Audit (task 7.1): the key id is not PII; the secret is NEVER logged.
@@ -328,11 +556,15 @@ async fn issue_api_key(State(s): State<App>, Json(body): Json<IssueKeyBody>) -> 
 /// Rotate a key (task 6.2): mint a new secret under a preserved lineage with the SAME
 /// scopes (no widening) and revoke the old one. Returns the new secret once, or 404 if
 /// the key id is not an active key.
-async fn rotate_api_key(State(s): State<App>, Path(key_id): Path<String>) -> Response {
+async fn rotate_api_key(
+    State(s): State<App>,
+    Path(key_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     let Some(store) = s.api_keys.as_ref() else {
         return key_mgmt_unconfigured();
     };
-    match store.rotate(&key_id).await {
+    match store.rotate(&key_id, &actx).await {
         Ok(Some(issued)) => {
             METRICS.mutations.add(1, &[KeyValue::new("op", "rotate_api_key")]);
             info!(op = "rotate_api_key", key_id = %issued.key_id, "authoring");
@@ -358,11 +590,15 @@ async fn rotate_api_key(State(s): State<App>, Path(key_id): Path<String>) -> Res
 /// Revoke a key (task 6.2): flip it to `revoked` so the sidecar rejects it on the next
 /// request. Idempotent — revoking an already-revoked/unknown key is a 200 with
 /// `revoked: false`.
-async fn revoke_api_key(State(s): State<App>, Path(key_id): Path<String>) -> Response {
+async fn revoke_api_key(
+    State(s): State<App>,
+    Path(key_id): Path<String>,
+    Extension(actx): Extension<AuditCtx>,
+) -> Response {
     let Some(store) = s.api_keys.as_ref() else {
         return key_mgmt_unconfigured();
     };
-    match store.revoke(&key_id).await {
+    match store.revoke(&key_id, &actx).await {
         Ok(revoked) => {
             METRICS.mutations.add(1, &[KeyValue::new("op", "revoke_api_key")]);
             info!(op = "revoke_api_key", %key_id, revoked, "authoring");
@@ -389,10 +625,14 @@ async fn bootstrap_admin(
         return Ok(());
     };
     if authoring.any_subject_has_role(admin_role).await? {
+        // A no-op startup writes nothing — no grant, no audit event (spec:
+        // "A no-op bootstrap is silent").
         info!(role = %admin_role, "bootstrap: an administrator already exists; skipping seed");
         return Ok(());
     }
-    authoring.assign_role(sub, admin_role).await?;
+    // The grant + its `bootstrap.grant` audit event commit in one transaction
+    // (admin-action-audit D8), attributed to the reserved bootstrap actor.
+    authoring.bootstrap_grant(sub, admin_role).await?;
     warn!(
         role = %admin_role,
         "bootstrap: seeded the initial administrator (break-glass) — rotate/disable the bootstrap secret now that a real admin can author grants"
@@ -428,26 +668,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let admin_role = env("AUTHZ_ADMIN_ROLE", "admin");
     let bootstrap_sub = var("AUTHZ_BOOTSTRAP_ADMIN_SUB").ok().filter(|s| !s.trim().is_empty());
 
-    // Admin-token gate, fail-closed: refuse to start without an explicit choice —
-    // either supply IDENTITY_ADMIN_TOKEN (non-empty) or opt out with
-    // IDENTITY_ADMIN_AUTH_DISABLED=true (trusted-network/dev only).
-    let auth_disabled = matches!(
-        env("IDENTITY_ADMIN_AUTH_DISABLED", "").trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes"
-    );
-    let token = env("IDENTITY_ADMIN_TOKEN", "");
-    let auth_token = match (auth_disabled, token.trim().is_empty()) {
-        (true, _) => {
-            warn!("IDENTITY_ADMIN_AUTH_DISABLED=true — authz-admin endpoints are UNAUTHENTICATED");
-            None
-        }
-        (false, false) => Some(Arc::from(token.as_str())),
-        (false, true) => {
-            error!("IDENTITY_ADMIN_TOKEN is unset; refusing to start open. Set it, or set IDENTITY_ADMIN_AUTH_DISABLED=true to run without auth.");
-            return Err("missing IDENTITY_ADMIN_TOKEN".into());
-        }
-    };
-
     // The authoring surface is an authoritative writer, so it owns idempotent identity
     // schema setup on startup before the first grant.
     let store: Arc<PgProfileStore> = loop {
@@ -464,6 +684,113 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let authoring: Arc<dyn AuthzAuthoring> = store.clone();
     let profiles: Arc<dyn ProfileStore> = store.clone();
     let resolver: Arc<dyn AuthzResolver> = store;
+
+    // Admin audit ledger (admin-action-audit): its schema must exist BEFORE the
+    // first authoring write (the bootstrap grant records an event in the same
+    // transaction), so bootstrap it here, fail-fatal.
+    let audit = match PgAdminAuditStore::connect(&pg_url).await {
+        Ok(audit_store) => match audit_store.init_schema().await {
+            Ok(()) => Arc::new(audit_store),
+            Err(e) => {
+                error!(error = %e, "audit schema init failed; refusing to start unauditable");
+                return Err(e);
+            }
+        },
+        Err(e) => {
+            error!(error = %e, "audit store connect failed; refusing to start unauditable");
+            return Err(e);
+        }
+    };
+
+    // Admin auth (admin-action-audit D4/D5), fail-closed: refuse to start
+    // without an explicit choice. Named tokens are the credential of record
+    // (ADMIN_TOKEN_PEPPER enables verification against identity.admin_tokens);
+    // the legacy shared IDENTITY_ADMIN_TOKEN is honored ONLY behind the
+    // explicit ADMIN_LEGACY_TOKEN_OK migration flag (attributed
+    // `legacy-shared`, deprecation-warned per use). BREAKING: a deployment
+    // that only sets IDENTITY_ADMIN_TOKEN must now also set
+    // ADMIN_LEGACY_TOKEN_OK=true (step 1 of the migration).
+    let auth_disabled = matches!(
+        env("IDENTITY_ADMIN_AUTH_DISABLED", "").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+    let legacy_ok = matches!(
+        env("ADMIN_LEGACY_TOKEN_OK", "").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+    let auth = if auth_disabled {
+        warn!("IDENTITY_ADMIN_AUTH_DISABLED=true — authz-admin endpoints are UNAUTHENTICATED");
+        AdminAuth { disabled: true, tokens: None, legacy: None, legacy_ok: false }
+    } else {
+        let admin_pepper = env("ADMIN_TOKEN_PEPPER", "");
+        let tokens = if admin_pepper.trim().is_empty() {
+            None
+        } else {
+            let hasher: Arc<dyn SecretHasher> =
+                Arc::new(HmacSecretHasher::new(admin_pepper.into_bytes()));
+            Some(Arc::new(PgAdminTokenStore::new(&audit, hasher)))
+        };
+        let legacy_token = env("IDENTITY_ADMIN_TOKEN", "");
+        let legacy: Option<Arc<str>> = if legacy_token.trim().is_empty() {
+            None
+        } else {
+            Some(Arc::from(legacy_token.as_str()))
+        };
+        if legacy_ok && legacy.is_none() {
+            error!("ADMIN_LEGACY_TOKEN_OK=true but IDENTITY_ADMIN_TOKEN is unset; refusing to start.");
+            return Err("missing IDENTITY_ADMIN_TOKEN for legacy mode".into());
+        }
+        if tokens.is_none() && !legacy_ok {
+            error!(
+                "no admin auth configured; refusing to start open. Set ADMIN_TOKEN_PEPPER \
+                 (named admin tokens), or ADMIN_LEGACY_TOKEN_OK=true with IDENTITY_ADMIN_TOKEN \
+                 (migration mode), or IDENTITY_ADMIN_AUTH_DISABLED=true (trusted-network/dev only)."
+            );
+            return Err("missing admin auth configuration".into());
+        }
+        if legacy_ok {
+            warn!(
+                "legacy shared-token mode enabled (ADMIN_LEGACY_TOKEN_OK=true) — provision named \
+                 tokens per caller, then flip this flag off"
+            );
+        }
+        AdminAuth {
+            disabled: false,
+            tokens,
+            legacy: if legacy_ok { legacy } else { None },
+            legacy_ok,
+        }
+    };
+
+    // Audit retention (admin-action-audit D7): startup-validated floor; the
+    // periodic purge — the only deleter — runs under the separate maintenance
+    // role when its connection is configured.
+    let retention_days = match retention_days_from_env(&env("AUDIT_RETENTION_DAYS", "")) {
+        Ok(days) => days,
+        Err(msg) => {
+            error!("{msg}");
+            return Err(msg.into());
+        }
+    };
+    let maintenance_url = env("AUDIT_MAINTENANCE_PG_URL", "");
+    if maintenance_url.trim().is_empty() {
+        info!(
+            retention_days,
+            "AUDIT_MAINTENANCE_PG_URL unset — audit retention purge must run externally under \
+             the maintenance role"
+        );
+    } else {
+        match PgAuditMaintenance::connect(&maintenance_url).await {
+            Ok(maintenance) => {
+                let _task = tokio::spawn(retention_purge(maintenance, retention_days));
+                info!(retention_days, "audit retention purge enabled (maintenance role)");
+            }
+            Err(e) => {
+                error!(error = %e, "audit maintenance connection failed; refusing to start misconfigured");
+                return Err(e);
+            }
+        }
+    }
 
     // customer-api-keys: key management is ENABLED when APIKEY_HMAC_PEPPER is set (the
     // same pepper the sidecar verifies with). The api-key store shares the identity DB
@@ -498,7 +825,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // can see and fix.
     bootstrap_admin(authoring.as_ref(), &admin_role, bootstrap_sub.as_deref()).await?;
 
-    let app = App { authoring, resolver, profiles, api_keys, auth_token };
+    let app = App {
+        authoring,
+        resolver,
+        profiles,
+        api_keys,
+        audit,
+        auth,
+        // Bound DENIAL ledger writes per source (design risk: scanner flooding);
+        // 30/min/source keeps real break-in attempts visible without unbounded growth.
+        denials: Arc::new(DenialLimiter::new(Duration::from_mins(1), 30)),
+    };
 
     // Authoring + read endpoints behind the admin-token gate (route_layer so an
     // unknown path 404s without first demanding a token).
@@ -517,6 +854,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .route("/apikeys", post(issue_api_key))
         .route("/apikeys/{key_id}/rotate", post(rotate_api_key))
         .route("/apikeys/{key_id}/revoke", post(revoke_api_key))
+        // Audit ledger read surface + named-token provisioning (admin-action-audit
+        // D4/D6) — same admin gate; the ledger has NO mutation endpoints.
+        .route("/audit/events", get(list_audit_events))
+        .route("/audit/events/export", get(export_audit_events))
+        .route("/admin-tokens", post(issue_admin_token))
+        .route("/admin-tokens/{id}/rotate", post(rotate_admin_token))
+        .route("/admin-tokens/{id}/revoke", post(revoke_admin_token))
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     let router = data
@@ -528,9 +872,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind("0.0.0.0:9300").await?;
     info!(
         admin_role = %admin_role,
-        "authz-admin on :9300 (/authz/{{sub}}[+/roles,/entitlements,/suspend,/reactivate], /healthz)"
+        "authz-admin on :9300 (/authz/{{sub}}[+/roles,/entitlements,/suspend,/reactivate], \
+         /apikeys, /audit/events[+/export], /admin-tokens, /healthz)"
     );
-    if let Err(e) = axum::serve(listener, router)
+    // ConnectInfo so audit events record the caller network source.
+    if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
     {
@@ -598,27 +944,43 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuthzAuthoring for FakeAuthoring {
-        async fn assign_role(&self, sub: &str, role: &str) -> Result<(), BoxError> {
+        async fn assign_role(&self, sub: &str, role: &str, _actx: &AuditCtx) -> Result<(), BoxError> {
             self.grants.lock().unwrap().push((sub.to_owned(), role.to_owned()));
             Ok(())
         }
-        async fn revoke_role(&self, _sub: &str, _role: &str) -> Result<(), BoxError> {
+        async fn revoke_role(&self, _sub: &str, _role: &str, _actx: &AuditCtx) -> Result<(), BoxError> {
             Ok(())
         }
-        async fn grant_entitlement(&self, _sub: &str, _e: &str) -> Result<(), BoxError> {
+        async fn grant_entitlement(
+            &self,
+            _sub: &str,
+            _e: &str,
+            _actx: &AuditCtx,
+        ) -> Result<(), BoxError> {
             Ok(())
         }
-        async fn revoke_entitlement(&self, _sub: &str, _e: &str) -> Result<(), BoxError> {
+        async fn revoke_entitlement(
+            &self,
+            _sub: &str,
+            _e: &str,
+            _actx: &AuditCtx,
+        ) -> Result<(), BoxError> {
             Ok(())
         }
-        async fn suspend(&self, _sub: &str) -> Result<(), BoxError> {
+        async fn suspend(&self, _sub: &str, _actx: &AuditCtx) -> Result<(), BoxError> {
             Ok(())
         }
-        async fn reactivate(&self, _sub: &str) -> Result<(), BoxError> {
+        async fn reactivate(&self, _sub: &str, _actx: &AuditCtx) -> Result<(), BoxError> {
             Ok(())
         }
         async fn any_subject_has_role(&self, role: &str) -> Result<bool, BoxError> {
             Ok(self.grants.lock().unwrap().iter().any(|(_, r)| r == role))
+        }
+        async fn bootstrap_grant(&self, sub: &str, role: &str) -> Result<(), BoxError> {
+            // The fake records the grant like a normal assign; the real adapter
+            // additionally writes the bootstrap.grant audit event in-tx.
+            self.grants.lock().unwrap().push((sub.to_owned(), role.to_owned()));
+            Ok(())
         }
     }
 

@@ -24,8 +24,14 @@ use sqlx::{PgPool, Row};
 use tokio::time::timeout;
 
 use identity_core::api_key::{ApiKeyCandidate, ApiKeyReader, ApiKeyScope};
+use identity_core::audit::{
+    AuditCtx, ACTION_APIKEY_ISSUE, ACTION_APIKEY_REVOKE, ACTION_APIKEY_ROTATE, OUTCOME_OK,
+};
 use identity_core::store::BoxError;
 use identity_core::SecretHasher;
+use serde_json::json;
+
+use crate::admin_audit::{record, NewAuditEvent};
 
 /// The NOTIFY channel every `identity.api_keys` mutation publishes a wakeup on (kept in
 /// lockstep with the trigger in `migrations/0002_api_keys.sql`). The sidecar resolves keys
@@ -35,7 +41,7 @@ pub const API_KEY_CHANGE_CHANNEL: &str = "api_key_changes";
 
 /// Open a pooler-safe pool with `max` connections (statement cache disabled + a
 /// server-side statement timeout, matching the other identity adapters).
-async fn connect_pool(url: &str, max: u32) -> Result<PgPool, BoxError> {
+pub(crate) async fn connect_pool(url: &str, max: u32) -> Result<PgPool, BoxError> {
     let opts = url
         .parse::<PgConnectOptions>()?
         .statement_cache_capacity(0)
@@ -232,41 +238,56 @@ impl PgApiKeyStore {
         Ok(())
     }
 
-    /// Issue a new key for `creator_sub` scoped to `scopes`, optionally expiring
-    /// `expires_in_seconds` from now. Persists ONLY the secret's hash and returns the
-    /// plaintext once. The caller is responsible for the human-only + "may not exceed the
-    /// creator" issuance checks (authz-admin) — this is the persistence primitive.
-    pub async fn issue(
-        &self,
-        creator_sub: &str,
-        scopes: &[String],
-        expires_in_seconds: Option<i64>,
-        now_epoch: i64,
-    ) -> Result<IssuedKey, BoxError> {
+    /// Issue a new key per `req` (creator, scopes, optional expiry). Persists ONLY the
+    /// secret's hash and returns the plaintext once. The caller is responsible for the
+    /// human-only + "may not exceed the creator" issuance checks (authz-admin) — this is
+    /// the persistence primitive. Records `apikey.issue` in the same transaction
+    /// (admin-action-audit): an unrecorded issuance does not commit.
+    pub async fn issue(&self, req: &IssueKeyRequest<'_>, actx: &AuditCtx) -> Result<IssuedKey, BoxError> {
         let (key_id, secret) = generate_credential()?;
         let key_hash = self.hasher.hash(&secret);
-        let scopes_json = serde_json::to_string(scopes)?;
-        let expires_at = expires_in_seconds.map(|ttl| now_epoch.saturating_add(ttl));
+        let scopes_json = serde_json::to_string(req.scopes)?;
+        let expires_at = req.expires_in_seconds.map(|ttl| req.now_epoch.saturating_add(ttl));
+        let mut tx = self.pool.begin().await?;
         insert_key(
-            &self.pool,
+            &mut *tx,
             &NewKeyRow {
                 key_id: &key_id,
                 key_hash: &key_hash,
-                creator_sub,
+                creator_sub: req.creator_sub,
                 scopes_json: &scopes_json,
                 expires_at,
                 rotated_from: None,
             },
         )
         .await?;
+        // Identifiers and request semantics only — never the secret or its hash.
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_APIKEY_ISSUE,
+                target_kind: "api_key",
+                target_id: &key_id,
+                outcome: OUTCOME_OK,
+                detail: json!({
+                    "creator_sub": req.creator_sub,
+                    "scopes": req.scopes,
+                    "expires_at": expires_at,
+                }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
         Ok(IssuedKey { key_id, secret, expires_at })
     }
 
     /// Rotate `key_id`: mint a NEW active key under the same creator, scopes, and expiry
     /// (no widening), record the lineage (`rotated_from`), and revoke the old key — all in
-    /// one transaction. Returns the new key's one-time secret, or `Ok(None)` if `key_id`
-    /// is not an active key.
-    pub async fn rotate(&self, key_id: &str) -> Result<Option<IssuedKey>, BoxError> {
+    /// one transaction, together with the `apikey.rotate` audit event. Returns the new
+    /// key's one-time secret, or `Ok(None)` if `key_id` is not an active key.
+    pub async fn rotate(&self, key_id: &str, actx: &AuditCtx) -> Result<Option<IssuedKey>, BoxError> {
         let mut tx = self.pool.begin().await?;
         // Read the key being rotated (must be active). Copy its scopes/creator/expiry
         // verbatim so the new key never widens authority.
@@ -306,22 +327,64 @@ impl PgApiKeyStore {
         .bind(key_id)
         .execute(&mut *tx)
         .await?;
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_APIKEY_ROTATE,
+                target_kind: "api_key",
+                target_id: &new_key_id,
+                outcome: OUTCOME_OK,
+                detail: json!({ "rotated_from": key_id }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(IssuedKey { key_id: new_key_id, secret, expires_at }))
     }
 
-    /// Revoke `key_id` (flip to `revoked`). Returns `true` if an active key was revoked,
-    /// `false` if it was already revoked or unknown (idempotent).
-    pub async fn revoke(&self, key_id: &str) -> Result<bool, BoxError> {
+    /// Revoke `key_id` (flip to `revoked`), recording `apikey.revoke` atomically.
+    /// Returns `true` if an active key was revoked, `false` if it was already
+    /// revoked or unknown (idempotent; no state change ⇒ no event).
+    pub async fn revoke(&self, key_id: &str, actx: &AuditCtx) -> Result<bool, BoxError> {
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE identity.api_keys SET status = 'revoked', updated_at = now() \
              WHERE key_id = $1 AND status = 'active'",
         )
         .bind(key_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_APIKEY_REVOKE,
+                target_kind: "api_key",
+                target_id: key_id,
+                outcome: OUTCOME_OK,
+                detail: json!({}),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
+}
+
+/// One issuance request, bundled (creator, scope set, optional relative expiry,
+/// and the caller-supplied wall clock the absolute expiry derives from).
+#[derive(Debug, Clone, Copy)]
+pub struct IssueKeyRequest<'a> {
+    pub creator_sub: &'a str,
+    pub scopes: &'a [String],
+    pub expires_in_seconds: Option<i64>,
+    pub now_epoch: i64,
 }
 
 /// The column values for one inserted key row (bundled so [`insert_key`] stays within the

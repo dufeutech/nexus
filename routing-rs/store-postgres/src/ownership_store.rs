@@ -1,19 +1,26 @@
 use async_trait::async_trait;
+use serde_json::json;
 use sqlx::Row;
 
-use router_core::store::{Account, AccountMember, BoxError, CreateOutcome, OwnershipStore};
+use router_core::audit::{
+    AuditCtx, ACTION_ACCOUNT_PROVISION, ACTION_WORKSPACE_TRANSFER, OUTCOME_OK, OUTCOME_REPLAY,
+};
+use router_core::store::{Account, AccountMember, BoxError, CreateOutcome, NewAccount, OwnershipStore};
 
+use crate::admin_audit::{record, NewAuditEvent};
 use crate::PgRoutingStore;
 
 #[async_trait]
 impl OwnershipStore for PgRoutingStore {
-    async fn create_account(
+    async fn provision_account(
         &self,
-        account_id: &str,
-        name: &str,
-        payer_ref: Option<&str>,
-        idempotency_key: Option<&str>,
+        account: &NewAccount<'_>,
+        actx: &AuditCtx,
     ) -> Result<CreateOutcome, BoxError> {
+        // ONE transaction: the insert-only account create, the owner-membership
+        // assert, and the audit event commit together (admin-action-audit: an
+        // unrecorded provision does not commit).
+        //
         // Insert-only, replay-safe in ONE round trip (server-minted-ids D2): on an
         // idempotency-key conflict the no-op DO UPDATE (the key with itself) locks
         // the existing row so RETURNING yields its ORIGINAL id — no
@@ -21,19 +28,47 @@ impl OwnershipStore for PgRoutingStore {
         // name/payer are never clobbered. `xmax = 0` distinguishes a fresh insert
         // from that replay. A NULL key never conflicts (UNIQUE treats NULLs as
         // distinct), so a keyless create always inserts.
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO routing.accounts (account_id, name, payer_ref, idempotency_key, updated_at) \
              VALUES ($1, $2, $3, $4, now()) \
              ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key \
              RETURNING account_id, (xmax = 0) AS created",
         )
-        .bind(account_id)
-        .bind(name)
-        .bind(payer_ref)
-        .bind(idempotency_key)
-        .fetch_one(&self.pool)
+        .bind(account.account_id)
+        .bind(account.name)
+        .bind(account.payer_ref)
+        .bind(account.idempotency_key)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(CreateOutcome { id: row.get("account_id"), created: row.get("created") })
+        let outcome = CreateOutcome { id: row.get("account_id"), created: row.get("created") };
+        // Assert the owner membership on create AND on replay (a keyed replay
+        // re-asserts, never widens — same row, same role).
+        sqlx::query(
+            "INSERT INTO routing.account_members (account_id, user_sub, role, updated_at) \
+             VALUES ($1, $2, 'owner', now()) \
+             ON CONFLICT (account_id, user_sub) DO UPDATE SET \
+                 role = EXCLUDED.role, updated_at = now()",
+        )
+        .bind(&outcome.id)
+        .bind(account.owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_ACCOUNT_PROVISION,
+                target_kind: "account",
+                target_id: &outcome.id,
+                outcome: if outcome.created { OUTCOME_OK } else { OUTCOME_REPLAY },
+                detail: json!({ "owner_sub": account.owner_sub, "name": account.name }),
+                idempotency_key: account.idempotency_key,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError> {
@@ -50,26 +85,6 @@ impl OwnershipStore for PgRoutingStore {
             payer_ref: r.get::<Option<String>, _>("payer_ref"),
             updated_at: r.get::<Option<String>, _>("updated_at"),
         }))
-    }
-
-    async fn add_account_member(
-        &self,
-        account_id: &str,
-        user_sub: &str,
-        role: &str,
-    ) -> Result<(), BoxError> {
-        sqlx::query(
-            "INSERT INTO routing.account_members (account_id, user_sub, role, updated_at) \
-             VALUES ($1, $2, $3, now()) \
-             ON CONFLICT (account_id, user_sub) DO UPDATE SET \
-                 role = EXCLUDED.role, updated_at = now()",
-        )
-        .bind(account_id)
-        .bind(user_sub)
-        .bind(role)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     async fn account_members(&self, account_id: &str) -> Result<Vec<AccountMember>, BoxError> {
@@ -89,34 +104,18 @@ impl OwnershipStore for PgRoutingStore {
             .collect())
     }
 
-    async fn set_workspace_account(
-        &self,
-        workspace_id: &str,
-        account_id: &str,
-    ) -> Result<bool, BoxError> {
-        // Create-time ownership assignment: repoint ONLY `account_id`, no staff
-        // reset (a brand-new workspace has none). An ownership CHANGE goes through
-        // `transfer_workspace`, which also resets staff atomically.
-        let res = sqlx::query(
-            "UPDATE routing.workspaces SET account_id = $2, updated_at = now() \
-             WHERE workspace_id = $1",
-        )
-        .bind(workspace_id)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     async fn transfer_workspace(
         &self,
         workspace_id: &str,
         account_id: &str,
+        actx: &AuditCtx,
     ) -> Result<Option<u64>, BoxError> {
-        // One transaction: repoint ownership AND reset staff together, so a crash
-        // between the two can never leave the previous owner's staff with access.
-        // Customer memberships (member_type <> 'staff') are deliberately left, and
-        // domains/data ride through on the unchanged workspace_id.
+        // One transaction: repoint ownership, reset staff, AND record the audit
+        // event together, so a crash between the steps can never leave the
+        // previous owner's staff with access — or a committed transfer without
+        // its ledger entry. Customer memberships (member_type <> 'staff') are
+        // deliberately left, and domains/data ride through on the unchanged
+        // workspace_id.
         let mut tx = self.pool.begin().await?;
         let moved = sqlx::query(
             "UPDATE routing.workspaces SET account_id = $2, updated_at = now() \
@@ -136,6 +135,22 @@ impl OwnershipStore for PgRoutingStore {
         )
         .bind(workspace_id)
         .execute(&mut *tx)
+        .await?;
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_WORKSPACE_TRANSFER,
+                target_kind: "workspace",
+                target_id: workspace_id,
+                outcome: OUTCOME_OK,
+                detail: json!({
+                    "account_id": account_id,
+                    "staff_removed": cleared.rows_affected(),
+                }),
+                idempotency_key: None,
+            },
+        )
         .await?;
         tx.commit().await?;
         Ok(Some(cleared.rows_affected()))

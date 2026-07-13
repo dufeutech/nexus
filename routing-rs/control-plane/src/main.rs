@@ -12,6 +12,7 @@
 //! unverified domain never routes.
 
 mod app;
+mod audit_api;
 mod auth_routes;
 mod domains;
 mod tenancy;
@@ -19,6 +20,7 @@ mod tenancy;
 use std::error::Error;
 #[cfg(not(unix))]
 use std::future::pending;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,9 +39,16 @@ use dns_resolver::DnsOwnershipProof;
 use router_core::telemetry;
 use router_core::store::{FanoutPublisher, InvalidationPublisher};
 use invalidations_nats::NatsPublisher;
-use store_postgres::PgRoutingStore;
+use store_postgres::{AdminTokenHasher, PgAdminTokenStore, PgAuditMaintenance, PgRoutingStore};
 
-use crate::app::{env, load_plan_limits, load_pools, request_timeout, require_auth, resilient, App};
+use crate::app::{
+    env, load_plan_limits, load_pools, request_timeout, require_auth, resilient, AdminAuth, App,
+    DenialLimiter,
+};
+use crate::audit_api::{
+    export_audit_events, issue_admin_token, list_audit_events, retention_days_from_env,
+    retention_purge, revoke_admin_token, rotate_admin_token,
+};
 use crate::auth_routes::{delete_auth_route, list_auth_routes, upsert_auth_route};
 use crate::domains::{declare_domain, delete_domain, upsert_domain, verification_poll, verify_domain};
 use crate::tenancy::{
@@ -127,26 +136,96 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Default 7 days; a domain unverified past this expires and frees quota.
     let pending_ttl: i64 = env("ROUTING_PENDING_TTL", "604800").parse().unwrap_or(604800);
 
-    // Admin-token gate, fail-closed: refuse to start without an explicit choice.
-    // Either supply CONTROL_AUTH_TOKEN (non-empty) or opt out with
-    // CONTROL_AUTH_DISABLED=true (trusted-network/dev only). This makes "ran with
-    // no auth" an explicit decision rather than a silent default.
+    // Admin auth (admin-action-audit D4/D5), fail-closed: refuse to start
+    // without an explicit choice. Named tokens are the credential of record
+    // (ADMIN_TOKEN_PEPPER enables verification against routing.admin_tokens);
+    // the legacy shared CONTROL_AUTH_TOKEN is honored ONLY behind the explicit
+    // ADMIN_LEGACY_TOKEN_OK migration flag (attributed `legacy-shared`,
+    // deprecation-warned per use). BREAKING: a deployment that only sets
+    // CONTROL_AUTH_TOKEN must now also set ADMIN_LEGACY_TOKEN_OK=true (step 1
+    // of the migration) — the refusal below names the choices.
     let auth_disabled = matches!(
         env("CONTROL_AUTH_DISABLED", "").trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes"
     );
-    let token = env("CONTROL_AUTH_TOKEN", "");
-    let auth_token = match (auth_disabled, token.trim().is_empty()) {
-        (true, _) => {
-            warn!("CONTROL_AUTH_DISABLED=true — control plane admin endpoints are UNAUTHENTICATED");
+    let legacy_ok = matches!(
+        env("ADMIN_LEGACY_TOKEN_OK", "").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+    let auth = if auth_disabled {
+        warn!("CONTROL_AUTH_DISABLED=true — control plane admin endpoints are UNAUTHENTICATED");
+        AdminAuth { disabled: true, tokens: None, legacy: None, legacy_ok: false }
+    } else {
+        let pepper = env("ADMIN_TOKEN_PEPPER", "");
+        let tokens = if pepper.trim().is_empty() {
             None
+        } else {
+            Some(Arc::new(PgAdminTokenStore::new(
+                &store,
+                AdminTokenHasher::new(pepper.as_bytes()),
+            )))
+        };
+        let legacy_token = env("CONTROL_AUTH_TOKEN", "");
+        let legacy: Option<Arc<str>> = if legacy_token.trim().is_empty() {
+            None
+        } else {
+            Some(Arc::from(legacy_token.as_str()))
+        };
+        if legacy_ok && legacy.is_none() {
+            error!("ADMIN_LEGACY_TOKEN_OK=true but CONTROL_AUTH_TOKEN is unset; refusing to start.");
+            return Err("missing CONTROL_AUTH_TOKEN for legacy mode".into());
         }
-        (false, false) => Some(Arc::from(token.as_str())),
-        (false, true) => {
-            error!("CONTROL_AUTH_TOKEN is unset; refusing to start open. Set it, or set CONTROL_AUTH_DISABLED=true to run without auth.");
-            return Err("missing CONTROL_AUTH_TOKEN".into());
+        if tokens.is_none() && !legacy_ok {
+            error!(
+                "no admin auth configured; refusing to start open. Set ADMIN_TOKEN_PEPPER \
+                 (named admin tokens), or ADMIN_LEGACY_TOKEN_OK=true with CONTROL_AUTH_TOKEN \
+                 (migration mode), or CONTROL_AUTH_DISABLED=true (trusted-network/dev only)."
+            );
+            return Err("missing admin auth configuration".into());
+        }
+        if legacy_ok {
+            warn!(
+                "legacy shared-token mode enabled (ADMIN_LEGACY_TOKEN_OK=true) — provision named \
+                 tokens per caller, then flip this flag off"
+            );
+        }
+        AdminAuth {
+            disabled: false,
+            tokens,
+            legacy: if legacy_ok { legacy } else { None },
+            legacy_ok,
         }
     };
+
+    // Audit retention (admin-action-audit D7): startup-validated floor; the
+    // periodic purge — the only deleter — runs under the separate maintenance
+    // role when its connection is configured.
+    let retention_days = match retention_days_from_env(&env("AUDIT_RETENTION_DAYS", "")) {
+        Ok(days) => days,
+        Err(msg) => {
+            error!("{msg}");
+            return Err(msg.into());
+        }
+    };
+    let maintenance_url = env("AUDIT_MAINTENANCE_PG_URL", "");
+    if maintenance_url.trim().is_empty() {
+        info!(
+            retention_days,
+            "AUDIT_MAINTENANCE_PG_URL unset — audit retention purge must run externally under \
+             the maintenance role"
+        );
+    } else {
+        match PgAuditMaintenance::connect(&maintenance_url).await {
+            Ok(maintenance) => {
+                tokio::spawn(retention_purge(maintenance, retention_days));
+                info!(retention_days, "audit retention purge enabled (maintenance role)");
+            }
+            Err(e) => {
+                error!(error = %e, "audit maintenance connection failed; refusing to start misconfigured");
+                return Err(e);
+            }
+        }
+    }
 
     let app = App {
         store,
@@ -156,7 +235,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         verifier: Arc::new(DnsOwnershipProof::public()),
         challenge_ttl,
         pending_ttl,
-        auth_token,
+        auth,
+        // Bound DENIAL ledger writes per source (design risk: scanner flooding);
+        // 30/min/source keeps real break-in attempts visible without unbounded growth.
+        denials: Arc::new(DenialLimiter::new(Duration::from_mins(1), 30)),
     };
 
     // Background verification poll for pending domains (RFC C4). Disabled when the
@@ -191,6 +273,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .route("/domains/declare", post(declare_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
         .route("/domains/{domain}", delete(delete_domain))
+        // Audit ledger read surface + named-token provisioning (admin-action-audit
+        // D4/D6) — same admin gate; the ledger has NO mutation endpoints.
+        .route("/audit/events", get(list_audit_events))
+        .route("/audit/events/export", get(export_audit_events))
+        .route("/admin-tokens", post(issue_admin_token))
+        .route("/admin-tokens/{id}/rotate", post(rotate_admin_token))
+        .route("/admin-tokens/{id}/revoke", post(revoke_admin_token))
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     // Admin API (:9400) — the data endpoints behind the token gate, plus /healthz
@@ -225,8 +314,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
          ops on :9401 (/healthz)"
     );
     // Serve both concurrently; either erroring (or a shutdown signal) brings the
-    // process down so the kubelet restarts it cleanly.
-    let admin_srv = axum::serve(admin_listener, admin).with_graceful_shutdown(shutdown_signal());
+    // process down so the kubelet restarts it cleanly. The admin server carries
+    // ConnectInfo so audit events record the caller network source.
+    let admin_srv = axum::serve(
+        admin_listener,
+        admin.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
     let ops_srv = axum::serve(ops_listener, ops).with_graceful_shutdown(shutdown_signal());
     if let Err(e) = tokio::try_join!(admin_srv, ops_srv) {
         error!(error = %e, "server error");

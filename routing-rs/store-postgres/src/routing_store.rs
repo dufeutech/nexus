@@ -1,10 +1,17 @@
 use async_trait::async_trait;
+use serde_json::json;
 use sqlx::Row;
 
+use router_core::audit::{
+    AuditCtx, ACTION_AUTH_ROUTE_DELETE, ACTION_AUTH_ROUTE_UPSERT, ACTION_DOMAIN_DECLARE,
+    ACTION_DOMAIN_DELETE, ACTION_DOMAIN_UPSERT, ACTION_DOMAIN_VERIFY, ACTION_WORKSPACE_CREATE,
+    ACTION_WORKSPACE_RECONFIGURE, OUTCOME_OK, OUTCOME_REPLAY,
+};
 use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
 use router_core::domain::{Pool, WorkspaceConfig};
-use router_core::store::{BoxError, CreateOutcome, DomainRecord, RoutingStore};
+use router_core::store::{BoxError, CreateOutcome, DomainRecord, DomainUpsert, RoutingStore};
 
+use crate::admin_audit::{record, NewAuditEvent};
 use crate::PgRoutingStore;
 
 #[async_trait]
@@ -55,14 +62,20 @@ impl RoutingStore for PgRoutingStore {
     async fn create_workspace(
         &self,
         cfg: &WorkspaceConfig,
+        owner_account: Option<&str>,
         idempotency_key: Option<&str>,
+        actx: &AuditCtx,
     ) -> Result<CreateOutcome, BoxError> {
+        // ONE transaction: the insert-only create, the create-time ownership
+        // assignment, and the audit event commit together (admin-action-audit).
+        //
         // Insert-only, replay-safe in ONE round trip (server-minted-ids D2): same
-        // shape as `create_account` — the no-op DO UPDATE locks the conflicting
+        // shape as `provision_account` — the no-op DO UPDATE locks the conflicting
         // row so RETURNING yields the ORIGINAL workspace_id on a key replay, and
         // `xmax = 0` says whether THIS call inserted. A NULL key never conflicts,
         // so a keyless create always inserts. Never touches an existing row's
         // config (create and reconfigure are disjoint).
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO routing.workspaces \
                  (workspace_id, name, plan, target_pool, features, idempotency_key, updated_at) \
@@ -76,15 +89,53 @@ impl RoutingStore for PgRoutingStore {
         .bind(cfg.target_pool.as_str())
         .bind(&cfg.features)
         .bind(idempotency_key)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(CreateOutcome { id: row.get("workspace_id"), created: row.get("created") })
+        let outcome = CreateOutcome { id: row.get("workspace_id"), created: row.get("created") };
+        // Assign ownership only on a real insert: a replay returns the ORIGINAL
+        // workspace as-is and must not re-own it (ownership changes go through
+        // transfer, which also resets staff — a brand-new workspace has none).
+        if outcome.created && let Some(account_id) = owner_account {
+            sqlx::query(
+                "UPDATE routing.workspaces SET account_id = $2, updated_at = now() \
+                 WHERE workspace_id = $1",
+            )
+            .bind(&outcome.id)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_WORKSPACE_CREATE,
+                target_kind: "workspace",
+                target_id: &outcome.id,
+                outcome: if outcome.created { OUTCOME_OK } else { OUTCOME_REPLAY },
+                detail: json!({
+                    "account_id": owner_account,
+                    "plan": cfg.plan,
+                    "target_pool": cfg.target_pool.as_str(),
+                }),
+                idempotency_key,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
-    async fn update_workspace(&self, cfg: &WorkspaceConfig) -> Result<bool, BoxError> {
+    async fn update_workspace(
+        &self,
+        cfg: &WorkspaceConfig,
+        actx: &AuditCtx,
+    ) -> Result<bool, BoxError> {
         // Update-only — never creates: an unknown id matches zero rows and the
-        // caller 404s instead of minting a ghost workspace. Name and ownership are
-        // deliberately not in the SET list (create-time data / transfer's job).
+        // caller 404s instead of minting a ghost workspace (nothing mutated ⇒
+        // nothing audited). Name and ownership are deliberately not in the SET
+        // list (create-time data / transfer's job).
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE routing.workspaces SET \
                  plan = $2, target_pool = $3, features = $4, updated_at = now() \
@@ -94,18 +145,39 @@ impl RoutingStore for PgRoutingStore {
         .bind(&cfg.plan)
         .bind(cfg.target_pool.as_str())
         .bind(&cfg.features)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_WORKSPACE_RECONFIGURE,
+                target_kind: "workspace",
+                target_id: &cfg.workspace_id,
+                outcome: OUTCOME_OK,
+                detail: json!({
+                    "plan": cfg.plan,
+                    "target_pool": cfg.target_pool.as_str(),
+                    "features": cfg.features,
+                }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn upsert_domain(
         &self,
-        domain: &str,
-        workspace_id: &str,
-        wildcard: bool,
-        verified: bool,
+        up: &DomainUpsert<'_>,
+        actx: &AuditCtx,
     ) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO routing.domains (domain, workspace_id, is_wildcard, verified, updated_at) \
              VALUES ($1, $2, $3, $4, now()) \
@@ -113,12 +185,30 @@ impl RoutingStore for PgRoutingStore {
                  workspace_id = EXCLUDED.workspace_id, \
                  verified = EXCLUDED.verified, updated_at = now()",
         )
-        .bind(domain)
-        .bind(workspace_id)
-        .bind(wildcard)
-        .bind(verified)
-        .execute(&self.pool)
+        .bind(up.domain)
+        .bind(up.workspace_id)
+        .bind(up.wildcard)
+        .bind(up.verified)
+        .execute(&mut *tx)
         .await?;
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_DOMAIN_UPSERT,
+                target_kind: "domain",
+                target_id: up.domain,
+                outcome: OUTCOME_OK,
+                detail: json!({
+                    "workspace_id": up.workspace_id,
+                    "wildcard": up.wildcard,
+                    "verified": up.verified,
+                }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -126,11 +216,14 @@ impl RoutingStore for PgRoutingStore {
         &self,
         domain: &str,
         workspace_id: &str,
+        actx: &AuditCtx,
     ) -> Result<bool, BoxError> {
         // INSERT ... ON CONFLICT DO NOTHING never reassigns an existing row's
         // workspace_id, so two workspaces racing the same new domain can't steal it:
         // the loser's insert is a no-op (rows_affected == 0) and the caller resolves
         // it as `domain_taken`. Exact (non-wildcard), unverified by construction.
+        // Only a real insert mutates state, so only a real insert is audited.
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "INSERT INTO routing.domains (domain, workspace_id, is_wildcard, verified, updated_at) \
              VALUES ($1, $2, false, false, now()) \
@@ -138,29 +231,91 @@ impl RoutingStore for PgRoutingStore {
         )
         .bind(domain)
         .bind(workspace_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_DOMAIN_DECLARE,
+                target_kind: "domain",
+                target_id: domain,
+                outcome: OUTCOME_OK,
+                detail: json!({ "workspace_id": workspace_id }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
-    async fn set_domain_verified(&self, domain: &str, verified: bool) -> Result<(), BoxError> {
-        sqlx::query(
+    async fn set_domain_verified(
+        &self,
+        domain: &str,
+        verified: bool,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
             "UPDATE routing.domains SET verified = $2, updated_at = now() \
              WHERE domain = $1 AND is_wildcard = false",
         )
         .bind(domain)
         .bind(verified)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() > 0 {
+            record(
+                &mut *tx,
+                actx,
+                &NewAuditEvent {
+                    action: ACTION_DOMAIN_VERIFY,
+                    target_kind: "domain",
+                    target_id: domain,
+                    outcome: OUTCOME_OK,
+                    detail: json!({ "verified": verified }),
+                    idempotency_key: None,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn delete_domain(&self, domain: &str, wildcard: bool) -> Result<(), BoxError> {
-        sqlx::query("DELETE FROM routing.domains WHERE domain = $1 AND is_wildcard = $2")
+    async fn delete_domain(
+        &self,
+        domain: &str,
+        wildcard: bool,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("DELETE FROM routing.domains WHERE domain = $1 AND is_wildcard = $2")
             .bind(domain)
             .bind(wildcard)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        if res.rows_affected() > 0 {
+            record(
+                &mut *tx,
+                actx,
+                &NewAuditEvent {
+                    action: ACTION_DOMAIN_DELETE,
+                    target_kind: "domain",
+                    target_id: domain,
+                    outcome: OUTCOME_OK,
+                    detail: json!({ "wildcard": wildcard }),
+                    idempotency_key: None,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -212,7 +367,9 @@ impl RoutingStore for PgRoutingStore {
     async fn expire_pending_domains(&self, ttl_secs: i64) -> Result<Vec<String>, BoxError> {
         // `updated_at` for a pending row is its declare time (an idempotent
         // re-declare touches only the challenge, not this row). The challenge
-        // cascades away with the domain.
+        // cascades away with the domain. System lifecycle sweep — deliberately
+        // NOT an audit event: a pending domain never routed, no admin acted, and
+        // the declare that created it is already in the ledger.
         let rows = sqlx::query(
             "DELETE FROM routing.domains \
              WHERE verified = false AND updated_at < now() - make_interval(secs => $1) \
@@ -258,7 +415,9 @@ impl RoutingStore for PgRoutingStore {
         workspace_id: &str,
         prefix: &str,
         auth: &RouteAuth,
+        actx: &AuditCtx,
     ) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO routing.auth_routes \
                  (workspace_id, path_prefix, auth_required, requires_role, requires_entitlement, min_aal, account_scoped, updated_at) \
@@ -278,17 +437,61 @@ impl RoutingStore for PgRoutingStore {
         .bind(auth.requires_entitlement.as_deref())
         .bind(auth.min_aal.map(i16::from))
         .bind(auth.account_scoped)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        record(
+            &mut *tx,
+            actx,
+            &NewAuditEvent {
+                action: ACTION_AUTH_ROUTE_UPSERT,
+                target_kind: "workspace",
+                target_id: workspace_id,
+                outcome: OUTCOME_OK,
+                detail: json!({
+                    "path_prefix": prefix,
+                    "auth_required": auth.required,
+                    "requires_role": auth.requires_role,
+                    "requires_entitlement": auth.requires_entitlement,
+                    "min_aal": auth.min_aal,
+                    "account_scoped": auth.account_scoped,
+                }),
+                idempotency_key: None,
+            },
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn delete_auth_route(&self, workspace_id: &str, prefix: &str) -> Result<(), BoxError> {
-        sqlx::query("DELETE FROM routing.auth_routes WHERE workspace_id = $1 AND path_prefix = $2")
-            .bind(workspace_id)
-            .bind(prefix)
-            .execute(&self.pool)
+    async fn delete_auth_route(
+        &self,
+        workspace_id: &str,
+        prefix: &str,
+        actx: &AuditCtx,
+    ) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
+        let res =
+            sqlx::query("DELETE FROM routing.auth_routes WHERE workspace_id = $1 AND path_prefix = $2")
+                .bind(workspace_id)
+                .bind(prefix)
+                .execute(&mut *tx)
+                .await?;
+        if res.rows_affected() > 0 {
+            record(
+                &mut *tx,
+                actx,
+                &NewAuditEvent {
+                    action: ACTION_AUTH_ROUTE_DELETE,
+                    target_kind: "workspace",
+                    target_id: workspace_id,
+                    outcome: OUTCOME_OK,
+                    detail: json!({ "path_prefix": prefix }),
+                    idempotency_key: None,
+                },
+            )
             .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }

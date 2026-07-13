@@ -151,9 +151,10 @@ mod tests {
     use axum::Router as AxumRouter;
     use moka::future::Cache;
     use tokio::time::sleep;
+    use router_core::audit::AuditCtx;
     use router_core::auth::{AuthPolicy, RouteAuth};
     use router_core::domain::{Pool, WorkspaceConfig};
-    use router_core::store::{BoxError, CreateOutcome, DomainRecord, RoutingStore};
+    use router_core::store::{BoxError, CreateOutcome, DomainRecord, DomainUpsert, RoutingStore};
     use tower::util::ServiceExt;
 
     /// A handler that outlives the timeout must be terminated with 408 rather
@@ -262,23 +263,27 @@ mod tests {
         async fn create_workspace(
             &self,
             _cfg: &WorkspaceConfig,
+            _owner_account: Option<&str>,
             _idempotency_key: Option<&str>,
+            _actx: &AuditCtx,
         ) -> Result<CreateOutcome, BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())
         }
-        async fn update_workspace(&self, _cfg: &WorkspaceConfig) -> Result<bool, BoxError> {
+        async fn update_workspace(
+            &self,
+            _cfg: &WorkspaceConfig,
+            _actx: &AuditCtx,
+        ) -> Result<bool, BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())
         }
         async fn upsert_domain(
             &self,
-            _domain: &str,
-            _workspace_id: &str,
-            _wildcard: bool,
-            _verified: bool,
+            _up: &DomainUpsert<'_>,
+            _actx: &AuditCtx,
         ) -> Result<(), BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
@@ -288,17 +293,28 @@ mod tests {
             &self,
             _domain: &str,
             _workspace_id: &str,
+            _actx: &AuditCtx,
         ) -> Result<bool, BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())
         }
-        async fn set_domain_verified(&self, _domain: &str, _verified: bool) -> Result<(), BoxError> {
+        async fn set_domain_verified(
+            &self,
+            _domain: &str,
+            _verified: bool,
+            _actx: &AuditCtx,
+        ) -> Result<(), BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())
         }
-        async fn delete_domain(&self, _domain: &str, _wildcard: bool) -> Result<(), BoxError> {
+        async fn delete_domain(
+            &self,
+            _domain: &str,
+            _wildcard: bool,
+            _actx: &AuditCtx,
+        ) -> Result<(), BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())
@@ -340,6 +356,7 @@ mod tests {
             _workspace_id: &str,
             _prefix: &str,
             _auth: &RouteAuth,
+            _actx: &AuditCtx,
         ) -> Result<(), BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
@@ -349,6 +366,7 @@ mod tests {
             &self,
             _workspace_id: &str,
             _prefix: &str,
+            _actx: &AuditCtx,
         ) -> Result<(), BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
