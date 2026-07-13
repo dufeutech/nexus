@@ -61,5 +61,5 @@
   if it names these routes): id from request→response, `PUT /workspaces/{id}`, delete
   `/tenants*` paths, rename `tenant_id` properties.
 - [x] 5.3 Update the go-live walkthrough/runbook provisioning steps to the new flow.
-- [ ] 5.4 Validate the change (`openspec validate --change server-minted-ids`) and run
+- [x] 5.4 Validate the change (`openspec validate --change server-minted-ids`) and run
   `/opsx:sync` to fold the delta specs into main specs when implementation completes.
