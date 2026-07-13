@@ -24,6 +24,11 @@ subtle = { version = "2", default-features = false }
 # in security-aware code rather than in SQL. Both already in the tree.
 ring = "0.17"
 hex = "0.4"
+# Server-minted typed ids (`ws_`/`acct_` + UUIDv7, RFC 9562): time-ordered and
+# collision-resistant; now_v7() is monotonic since 1.9. Already in the tree
+# transitively via sqlx — the direct dep only enables `v7`. Confined to
+# router_core::ids (server-minted-ids design D1).
+uuid = { version = "1.9", features = ["v7"] }
 # Routing store adapter (authoritative, control-plane-written) + invalidation feed
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 # Optional shared L2 cache tier

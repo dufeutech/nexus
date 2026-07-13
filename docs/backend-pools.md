@@ -56,7 +56,7 @@ a Rust rebuild**. A pool is usable when both line up:
 |------|-------|----------|
 | **Re-point** an existing pool at your backend | Compose: the `pool_<name>` cluster `socket_address` in `deploy/compose/envoy/envoy.yaml`. K8s: `pools.<name>.host/port` in `values.yaml`. | No |
 | **Tune load balancing** within a pool | Add `lb_endpoints` and/or change `lb_policy` (`ROUND_ROBIN`, `LEAST_REQUEST`, …) in that `pool_<name>` cluster. `STRICT_DNS` already spreads across the hostname's A-records. | No |
-| **Assign a tenant** to a pool | `POST /tenants {…, "target_pool": "api"}` on the control-plane — **data**, not config. | No |
+| **Assign a workspace** to a pool | `PUT /workspaces/{id} {…, "target_pool": "api"}` on the control-plane — **data**, not config. | No |
 | **Add a brand-new pool** | K8s: one edit to `pools:`. Compose: `envoy.yaml` cluster + `ROUTING_POOLS`. See the runbook. | **No** |
 
 ## Runbook: add a new pool (e.g. `media`)
@@ -69,7 +69,7 @@ and the edge routes by the `pool_*` cluster set. No source change, no rebuild.
    `deploy/helm/routing-plane/values.yaml` (and the `edge-platform` umbrella).
 2. `helm upgrade`. The edge gets a `pool_media` cluster + route, and the control
    plane's `ROUTING_POOLS` picks up `media` — both from that one key.
-3. `POST /tenants {"tenant_id": "...", "target_pool": "media", ...}`.
+3. `PUT /workspaces/{id} {"plan": "...", "target_pool": "media", ...}` (or set it at create).
 
 **Compose (two edits, in lockstep):**
 1. Add a `pool_media` cluster (backend address + `lb_policy`) and an
@@ -78,10 +78,10 @@ and the edge routes by the `pool_*` cluster set. No source change, no rebuild.
 2. Set `ROUTING_POOLS=["application","api","checkout","assets","media"]` in `.env`
    (the default omits `media`, so it must be listed explicitly here).
 3. `docker compose up -d`, then
-   `POST /tenants {"tenant_id": "...", "target_pool": "media", ...}`.
+   `PUT /workspaces/{id} {"plan": "...", "target_pool": "media", ...}` (or set it at create).
 
-**Verify:** a request for that tenant's domain lands on the `media` backend; an
-unknown `target_pool` is rejected at `/tenants` with the allowed list (the
+**Verify:** a request for that workspace's domain lands on the `media` backend; an
+unknown `target_pool` is rejected at `/workspaces` with the allowed list (the
 guardrail working).
 
 ## Why the set is finite (but no longer compiled)

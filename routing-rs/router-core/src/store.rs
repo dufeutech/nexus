@@ -56,8 +56,23 @@ pub trait RoutingStore: Send + Sync {
 
     // --- control-plane write surface (RFC §3.13) ---------------------------- //
 
-    /// Create or update a workspace config.
-    async fn upsert_workspace(&self, cfg: &WorkspaceConfig) -> Result<(), BoxError>;
+    /// Create a workspace — insert-only, NEVER touches an existing row
+    /// (provisioning-idempotency: create and reconfigure are disjoint). The id in
+    /// `cfg` is server-minted ([`crate::ids`]). With an idempotency key, a replay
+    /// returns the ORIGINAL row's id with `created = false` instead of inserting;
+    /// two same-key racers resolve to one row, both receiving its id. A `None`
+    /// key opts out of replay protection (every call inserts).
+    async fn create_workspace(
+        &self,
+        cfg: &WorkspaceConfig,
+        idempotency_key: Option<&str>,
+    ) -> Result<CreateOutcome, BoxError>;
+
+    /// Reconfigure an existing workspace's plan/pool/features — update-only,
+    /// NEVER creates (an unknown id is `false`, not a new row). The display name
+    /// and ownership are deliberately untouched: name is create-time data,
+    /// ownership changes ride [`OwnershipStore::transfer_workspace`].
+    async fn update_workspace(&self, cfg: &WorkspaceConfig) -> Result<bool, BoxError>;
 
     /// Create or update a domain → workspace mapping. This is the **admin** write
     /// (it may reassign ownership); the self-service declare path uses
@@ -279,19 +294,33 @@ pub struct Membership {
 /// control plane only needs to validate admin input against this closed set.
 pub const MEMBER_TYPES: [&str; 2] = ["staff", "customer"];
 
+/// Outcome of an idempotent create (provisioning-idempotency): the canonical id —
+/// the freshly minted one, or the ORIGINAL resource's when the idempotency key
+/// replayed — and whether THIS call inserted the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOutcome {
+    /// The id the caller must use from here on.
+    pub id: String,
+    /// `true` iff this call inserted the row (`false` = replay of an earlier one).
+    pub created: bool,
+}
+
 /// Account ownership + workspace-transfer surface (control plane, RFC §3.13).
 #[async_trait]
 pub trait OwnershipStore: Send + Sync {
-    /// Idempotently create an account (RFC C3-style declare idempotence): returns
-    /// `true` iff this call inserted it, `false` if it already existed. Never
-    /// overwrites an existing account's name/payer — provisioning on repeat signup
-    /// is a no-op.
+    /// Create an account with a server-minted id ([`crate::ids`]) — insert-only.
+    /// With an idempotency key, a replay returns the ORIGINAL account's id with
+    /// `created = false` and never clobbers its name/payer — this is what keeps
+    /// signup provisioning safe to call unconditionally (provisioning-idempotency;
+    /// the key replaces the idempotence that used to ride on the caller-supplied
+    /// id being the primary key). Two same-key racers resolve to one row.
     async fn create_account(
         &self,
         account_id: &str,
         name: &str,
         payer_ref: Option<&str>,
-    ) -> Result<bool, BoxError>;
+        idempotency_key: Option<&str>,
+    ) -> Result<CreateOutcome, BoxError>;
 
     /// Load an account, `None` if absent.
     async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError>;

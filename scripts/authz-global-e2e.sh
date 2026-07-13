@@ -44,6 +44,12 @@ IDENTITY_ADMIN_TOKEN="${IDENTITY_ADMIN_TOKEN:-zitadel-lab-dev-token}"
 # curl wrappers carrying each bearer as ONE quoted header arg (an unquoted expansion
 # would word-split "Bearer <token>" and silently send an invalid header -> 401).
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+
+# server-minted-ids: workspace ids are SERVER-MINTED (`ws_<uuidv7>`) — resolve the
+# seeded lab workspace by replaying the seed's idempotency key (the replay returns
+# the ORIGINAL id, so this is a stable lookup handle, never a duplicate create).
+. "$(dirname "$0")/provision-lib.sh"
+nexus_resolve_lab_workspaces
 azcurl() { curl -s -H "authorization: Bearer $IDENTITY_ADMIN_TOKEN" "$@"; }
 pass=0; fail=0
 
@@ -94,7 +100,7 @@ cleanup() {
   # Best-effort teardown: remove the ZITADEL user + the auth-route + reset the authz
   # facts we authored (there is no profile-delete; a per-run-unique inert row is fine).
   curl -sf -X DELETE "$ZITADEL/management/v1/users/$USER_ID" -H "Authorization: Bearer $PAT" >/dev/null 2>&1
-  cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d "{\"path_prefix\":\"$GATE\"}" >/dev/null 2>&1
+  cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d "{\"path_prefix\":\"$GATE\"}" >/dev/null 2>&1
   azcurl -X DELETE "$AUTHZ/authz/$USER_ID/roles/$ROLE" >/dev/null 2>&1
   azcurl -X POST "$AUTHZ/authz/$USER_ID/reactivate" >/dev/null 2>&1
 }
@@ -126,7 +132,7 @@ echo "== 2. gate an ACCOUNT-SCOPED route on the GLOBAL role \"$ROLE\" (control-p
 # role requirement is what decides — isolating global authz from membership exactly as this
 # test intends (see the header comment). The role/AAL gate still applies (account_scoped
 # only suppresses the existence-hiding 404, never the 403 requirement check).
-GRC=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/acme/auth-routes" \
+GRC=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" \
   -d "{\"path_prefix\":\"$GATE\",\"auth_required\":true,\"requires_role\":\"$ROLE\",\"min_aal\":1,\"account_scoped\":true}")
 ok "$([ "$GRC" = "200" ] && echo 1 || echo 0)" "account-scoped auth-route requiring role \"$ROLE\" configured (HTTP $GRC)"
 

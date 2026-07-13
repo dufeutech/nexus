@@ -79,6 +79,11 @@ impl PoolSet {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub workspace_id: String,
+    /// Display name (workspace-tenancy): carries NO identity or uniqueness
+    /// semantics — the caller-facing label, never a key. `default` keeps
+    /// pre-existing cached/stored values (no `name`) deserializable.
+    #[serde(default)]
+    pub name: String,
     pub plan: String,
     pub target_pool: Pool,
     #[serde(default)]

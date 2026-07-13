@@ -16,6 +16,8 @@ pub mod cache;
 pub mod context;
 pub mod domain;
 pub mod geo;
+pub mod idempotency;
+pub mod ids;
 pub mod normalize;
 pub mod plan;
 pub mod store;

@@ -23,6 +23,12 @@ PAT_FILE="${PAT_FILE:-./machinekey/zitadel-admin-sa.pat}"
 JSON='-H content-type:application/json'
 CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+
+# server-minted-ids: workspace ids are SERVER-MINTED (`ws_<uuidv7>`) — resolve the
+# seeded lab workspace by replaying the seed's idempotency key (the replay returns
+# the ORIGINAL id, so this is a stable lookup handle, never a duplicate create).
+. "$(dirname "$0")/provision-lib.sh"
+nexus_resolve_lab_workspaces
 pass=0; fail=0
 ok()  { if [ "$1" = "1" ]; then echo "  PASS  $2"; pass=$((pass+1)); else echo "  FAIL  $2"; fail=$((fail+1)); fi; }
 die() { echo "FATAL: $1" >&2; echo; echo "RESULT: $pass passed, $((fail+1)) failed"; exit 1; }
@@ -77,25 +83,25 @@ mint_token "e2e-outsider-$$"; OUTSIDER_ID=$USER_ID; OUTSIDER_TOKEN=$TOKEN
 cleanup() {
   for u in "$MEMBER_ID" "$OUTSIDER_ID"; do
     curl -sf -X DELETE "$ZITADEL/management/v1/users/$u" -H "Authorization: Bearer $PAT" >/dev/null 2>&1
-    cpcurl $JSON -X DELETE "$CP/workspaces/acme/members/$u" >/dev/null 2>&1
+    cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/members/$u" >/dev/null 2>&1
   done
-  cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/app"}' >/dev/null 2>&1
-  cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/me"}'  >/dev/null 2>&1
+  cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/app"}' >/dev/null 2>&1
+  cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/me"}'  >/dev/null 2>&1
 }
 trap cleanup EXIT
 ok 1 "minted member ($MEMBER_ID) and outsider ($OUTSIDER_ID) tokens"
 
 echo "== 2. seed the member's membership (staff/admin in acme); leave the outsider out =="
-SEED=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/acme/members" \
+SEED=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/$ACME_WS/members" \
   -d "{\"user_sub\":\"$MEMBER_ID\",\"member_type\":\"staff\",\"role\":\"admin\"}")
 ok "$([ "$SEED" = 200 ] || [ "$SEED" = 201 ] || [ "$SEED" = 204 ] && echo 1 || echo 0)" "member seeded (HTTP $SEED)"
 
 echo "== 3. mark /app private+workspace-scoped, /me private+account-scoped =="
-cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/app","auth_required":true}' >/dev/null
-cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/me","auth_required":true,"account_scoped":true}' >/dev/null
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/app","auth_required":true}' >/dev/null
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/me","auth_required":true,"account_scoped":true}' >/dev/null
 settle
 # account_scoped round-trips through the CRUD list surface.
-SNAP=$(cpcurl "$CP/tenants/acme/auth-routes")
+SNAP=$(cpcurl "$CP/workspaces/$ACME_WS/auth-routes")
 case "$SNAP" in *'"account_scoped":true'*) ok 1 "account_scoped round-trips through CRUD list";; *) ok 0 "account_scoped missing from CRUD: $SNAP";; esac
 
 echo "== 4. the core gate: non-member is HIDDEN (404), member is ADMITTED =="

@@ -48,13 +48,13 @@ pub(crate) struct AuthRouteDelete {
 impl App {
     /// Invalidate every domain a tenant owns — the precise convergence signal for
     /// a change that affects all of the tenant's routes (policy or config).
-    async fn invalidate_tenant(&self, tenant_id: &str, op: &'static str) {
-        match self.store.domains_for_workspace(tenant_id).await {
+    async fn invalidate_tenant(&self, workspace_id: &str, op: &'static str) {
+        match self.store.domains_for_workspace(workspace_id).await {
             Ok(domains) => {
                 for d in &domains {
                     self.invalidate(d).await;
                 }
-                info!(tenant = ?tenant_id, op, invalidated = domains.len(), "tenant invalidated");
+                info!(tenant = ?workspace_id, op, invalidated = domains.len(), "tenant invalidated");
             }
             Err(e) => warn!(error = %e, "domains_for_tenant failed; relying on TTL"),
         }
@@ -77,7 +77,7 @@ impl App {
 
 pub(crate) async fn upsert_auth_route(
     State(s): State<App>,
-    Path(tenant_id): Path<String>,
+    Path(workspace_id): Path<String>,
     Json(body): Json<AuthRouteBody>,
 ) -> Response {
     if !App::valid_prefix(&body.path_prefix) {
@@ -106,24 +106,24 @@ pub(crate) async fn upsert_auth_route(
             .into_response();
     }
     // The FK would reject an unknown workspace as a 500; check first for a clean 404.
-    match s.store.get_workspace(&tenant_id).await {
+    match s.store.get_workspace(&workspace_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "error": "unknown_tenant", "tenant_id": tenant_id })))
+            return (StatusCode::NOT_FOUND, Json(json!({ "error": "unknown_workspace", "workspace_id": workspace_id })))
                 .into_response();
         }
         Err(e) => return internal(e),
     }
-    if let Err(e) = s.store.upsert_auth_route(&tenant_id, &body.path_prefix, &auth).await {
+    if let Err(e) = s.store.upsert_auth_route(&workspace_id, &body.path_prefix, &auth).await {
         return internal(e);
     }
-    s.invalidate_tenant(&tenant_id, "upsert_auth_route").await;
+    s.invalidate_tenant(&workspace_id, "upsert_auth_route").await;
     METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_auth_route")]);
     (
         StatusCode::OK,
         Json(json!({
             "result": "ok",
-            "tenant_id": tenant_id,
+            "workspace_id": workspace_id,
             "path_prefix": body.path_prefix,
             "auth_required": auth.required,
             "requires_role": auth.requires_role,
@@ -137,20 +137,20 @@ pub(crate) async fn upsert_auth_route(
 
 pub(crate) async fn delete_auth_route(
     State(s): State<App>,
-    Path(tenant_id): Path<String>,
+    Path(workspace_id): Path<String>,
     Json(body): Json<AuthRouteDelete>,
 ) -> Response {
-    if let Err(e) = s.store.delete_auth_route(&tenant_id, &body.path_prefix).await {
+    if let Err(e) = s.store.delete_auth_route(&workspace_id, &body.path_prefix).await {
         return internal(e);
     }
-    s.invalidate_tenant(&tenant_id, "delete_auth_route").await;
+    s.invalidate_tenant(&workspace_id, "delete_auth_route").await;
     METRICS.mutations.add(1, &[KeyValue::new("op", "delete_auth_route")]);
-    (StatusCode::OK, Json(json!({ "result": "ok", "tenant_id": tenant_id, "path_prefix": body.path_prefix })))
+    (StatusCode::OK, Json(json!({ "result": "ok", "workspace_id": workspace_id, "path_prefix": body.path_prefix })))
         .into_response()
 }
 
-pub(crate) async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path<String>) -> Response {
-    match s.store.get_auth_policy(&tenant_id).await {
+pub(crate) async fn list_auth_routes(State(s): State<App>, Path(workspace_id): Path<String>) -> Response {
+    match s.store.get_auth_policy(&workspace_id).await {
         Ok(policy) => {
             let routes: Vec<_> = policy
                 .rules()
@@ -166,7 +166,7 @@ pub(crate) async fn list_auth_routes(State(s): State<App>, Path(tenant_id): Path
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(json!({ "tenant_id": tenant_id, "routes": routes }))).into_response()
+            (StatusCode::OK, Json(json!({ "workspace_id": workspace_id, "routes": routes }))).into_response()
         }
         Err(e) => internal(e),
     }

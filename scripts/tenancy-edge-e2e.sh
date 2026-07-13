@@ -48,6 +48,12 @@ CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
 # unquoted $CPAUTH-style expansion would word-split "Bearer <token>" into two
 # args and silently send an invalid header (unauthenticated 401s).
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+
+# server-minted-ids: workspace ids are SERVER-MINTED (`ws_<uuidv7>`) — resolve the
+# seeded lab workspace by replaying the seed's idempotency key (the replay returns
+# the ORIGINAL id, so this is a stable lookup handle, never a duplicate create).
+. "$(dirname "$0")/provision-lib.sh"
+nexus_resolve_lab_workspaces
 pass=0; fail=0
 
 # Fetch the whoami echo body for a request carrying the given extra `-H` args.
@@ -60,8 +66,8 @@ ok()   { if [ "$1" = "1" ]; then echo "  PASS  $2"; pass=$((pass+1)); else echo 
 settle() { sleep 2; }   # let an invalidation NOTIFY evict the router's cache
 
 echo "== reset: ensure the site is public (no auth-route) =="
-cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
-  || cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
 settle
 
 echo "== 1. enriched anonymous request carries NO contract, forged copies stripped =="
@@ -97,8 +103,8 @@ echo "== 2. public route: the anonymous request passes through (200) =="
 ok "$([ "$(code)" = "200" ] && echo 1 || echo 0)" "anonymous / is public -> 200"
 
 echo "== 3. protected route: a non-member (anonymous) is fail-closed BEFORE the backend =="
-cpcurl $JSON -X PUT "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1 \
-  || cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null 2>&1
 # Poll rather than a fixed settle: the invalidation NOTIFY usually evicts the
 # router's cached decision within a beat, but the assertion must not race it.
 i=0; C=$(code)
@@ -106,8 +112,8 @@ while [ "$C" != "401" ] && [ "$i" -lt 10 ]; do sleep 1; C=$(code); i=$((i+1)); d
 ok "$([ "$C" = "401" ] && echo 1 || echo 0)" "anonymous non-member on a protected route -> 401 (fail-closed, got $C)"
 
 echo "== cleanup =="
-cpcurl $JSON -X DELETE "$CP/workspaces/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
-  || cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1 \
+  || cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}' >/dev/null 2>&1
 settle
 
 echo "== 4. explicitly designated non-enriched route: unstamped + anonymous BY DESIGN =="

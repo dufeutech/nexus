@@ -74,63 +74,28 @@ impl PgRoutingStore {
     ///
     /// There is no migration framework here (RFC decision 14: the routing plane
     /// reuses a store the control plane bootstraps): schema is created idempotently
-    /// with `CREATE ... IF NOT EXISTS`. The BREAKING `tenant_id → workspace_id`
-    /// rename (nexus-owned-workspace-tenancy) therefore ships as an explicit,
-    /// guarded in-place migration for already-provisioned databases — `CREATE TABLE
-    /// IF NOT EXISTS` alone would never alter an existing table — followed by the
-    /// new-shape `CREATE`s that a fresh database gets directly.
+    /// with `CREATE ... IF NOT EXISTS`. A pre-server-minted-ids lab database (old
+    /// column set) is NOT migrated in place — recreate it via the compose stack's
+    /// normal volume reset (greenfield: 0 deployments, server-minted-ids design).
     pub async fn init_schema(&self) -> Result<(), BoxError> {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS routing")
             .execute(&self.pool)
             .await?;
-        // --- BREAKING migration: tenant_id → workspace_id (guarded, idempotent).
-        // Renames the pre-existing `tenants` table and every `tenant_id` column to
-        // the workspace vocabulary. Postgres carries FK/PK constraints across a
-        // RENAME automatically, so the FKs below need no rebuild. Each step is
-        // guarded on the OLD name still existing, so this whole block is a no-op on
-        // a fresh database (new-shape `CREATE`s below make it) and on an
-        // already-migrated one (the old names are gone).
-        sqlx::query(
-            "DO $$ \
-             BEGIN \
-                 IF to_regclass('routing.tenants') IS NOT NULL THEN \
-                     ALTER TABLE routing.tenants RENAME TO workspaces; \
-                 END IF; \
-                 IF EXISTS (SELECT 1 FROM information_schema.columns \
-                            WHERE table_schema='routing' AND table_name='workspaces' \
-                              AND column_name='tenant_id') THEN \
-                     ALTER TABLE routing.workspaces RENAME COLUMN tenant_id TO workspace_id; \
-                 END IF; \
-                 IF EXISTS (SELECT 1 FROM information_schema.columns \
-                            WHERE table_schema='routing' AND table_name='domains' \
-                              AND column_name='tenant_id') THEN \
-                     ALTER TABLE routing.domains RENAME COLUMN tenant_id TO workspace_id; \
-                 END IF; \
-                 IF EXISTS (SELECT 1 FROM information_schema.columns \
-                            WHERE table_schema='routing' AND table_name='domain_challenges' \
-                              AND column_name='tenant_id') THEN \
-                     ALTER TABLE routing.domain_challenges RENAME COLUMN tenant_id TO workspace_id; \
-                 END IF; \
-                 IF EXISTS (SELECT 1 FROM information_schema.columns \
-                            WHERE table_schema='routing' AND table_name='auth_routes' \
-                              AND column_name='tenant_id') THEN \
-                     ALTER TABLE routing.auth_routes RENAME COLUMN tenant_id TO workspace_id; \
-                 END IF; \
-             END $$",
-        )
-        .execute(&self.pool)
-        .await?;
         // --- Ownership: an Account owns Workspaces and is a member container
         // (nexus-owned-workspace-tenancy). Created before `workspaces` so the
         // `workspace.account_id` FK resolves. `payer_ref` is the billing/payer of
         // record, which switches on a transfer (plan travels with the workspace,
         // payer travels with the account); nullable until billing is wired.
+        // `idempotency_key` is the caller's replay guard (provisioning-idempotency):
+        // UNIQUE but nullable — Postgres treats NULLs as distinct, so a keyless
+        // create never conflicts and the key stays genuinely optional.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.accounts (\
-                 account_id text PRIMARY KEY, \
-                 name       text NOT NULL DEFAULT '', \
-                 payer_ref  text, \
-                 updated_at timestamptz NOT NULL DEFAULT now())",
+                 account_id      text PRIMARY KEY, \
+                 name            text NOT NULL DEFAULT '', \
+                 payer_ref       text, \
+                 idempotency_key text UNIQUE, \
+                 updated_at      timestamptz NOT NULL DEFAULT now())",
         )
         .execute(&self.pool)
         .await?;
@@ -146,58 +111,21 @@ impl PgRoutingStore {
         )
         .execute(&self.pool)
         .await?;
-        // Workspaces — the stable-ID routing pivot (formerly `tenants`). Fresh
-        // databases get this shape directly; a migrated database already has the
-        // renamed table, so this `CREATE IF NOT EXISTS` is a no-op and the
-        // `ADD COLUMN IF NOT EXISTS` below backfills its `account_id`. `account_id`
-        // is a plain reference (NOT cascade): deleting an account that still owns
-        // workspaces must fail — transfer first — never silently drop routing.
+        // Workspaces — the stable-ID routing pivot. `account_id` is a plain
+        // reference (NOT cascade): deleting an account that still owns workspaces
+        // must fail — transfer first — never silently drop routing. `name` is the
+        // display label (workspace-tenancy: NO identity or uniqueness semantics);
+        // `idempotency_key` mirrors the accounts column above.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.workspaces (\
-                 workspace_id text PRIMARY KEY, \
-                 account_id   text REFERENCES routing.accounts(account_id), \
-                 plan         text NOT NULL DEFAULT 'free', \
-                 target_pool  text NOT NULL DEFAULT 'application', \
-                 features     text[] NOT NULL DEFAULT '{}', \
-                 updated_at   timestamptz NOT NULL DEFAULT now())",
-        )
-        .execute(&self.pool)
-        .await?;
-        // Add `account_id` to a workspaces table migrated from the old `tenants`
-        // (which had no ownership column). No-op on a fresh DB where the CREATE
-        // above already included it; tied to column existence, so it is idempotent.
-        sqlx::query(
-            "ALTER TABLE routing.workspaces \
-             ADD COLUMN IF NOT EXISTS account_id text REFERENCES routing.accounts(account_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        // --- Backfill: one solo account per ownerless workspace (nexus-owned-
-        // workspace-tenancy §5.1). A workspace migrated from the old single-org
-        // `tenants` shape has account_id IS NULL after the ADD COLUMN above; give it
-        // an owning account so no routing row is left ownerless post-migration. The
-        // old model was one owner per tenant/workspace (no multi-workspace grouping),
-        // so a 1:1 solo account keyed by the workspace_id is the faithful backfill
-        // (this is the "personal" account the UI presents; the schema is identical).
-        // Idempotent + guarded on the NULL: it fills ONLY legacy ownerless rows and
-        // never re-owns a workspace the control plane already assigned, so it is a
-        // no-op on a fresh DB and on every subsequent startup. The `ON CONFLICT DO
-        // NOTHING` also makes re-provisioning an existing solo account a no-op.
-        //   Member seeding (the account owner + the per-user `staff` memberships) is
-        // deliberately NOT done here: like the identity Profile projection it is a
-        // broker-seeded native CRUD write, not a routing-side ETL — the routing schema
-        // holds no user roster to seed from.
-        sqlx::query(
-            "INSERT INTO routing.accounts (account_id, name) \
-             SELECT workspace_id, workspace_id FROM routing.workspaces \
-             WHERE account_id IS NULL \
-             ON CONFLICT (account_id) DO NOTHING",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "UPDATE routing.workspaces SET account_id = workspace_id, updated_at = now() \
-             WHERE account_id IS NULL",
+                 workspace_id    text PRIMARY KEY, \
+                 account_id      text REFERENCES routing.accounts(account_id), \
+                 name            text NOT NULL DEFAULT '', \
+                 plan            text NOT NULL DEFAULT 'free', \
+                 target_pool     text NOT NULL DEFAULT 'application', \
+                 features        text[] NOT NULL DEFAULT '{}', \
+                 idempotency_key text UNIQUE, \
+                 updated_at      timestamptz NOT NULL DEFAULT now())",
         )
         .execute(&self.pool)
         .await?;

@@ -1,7 +1,8 @@
 //! Control Plane (Rust) — the routing-plane admin surface (RFC C16, §3.13).
 //!
-//! It manages domains (add, remove, verify ownership) and tenants (create, set
-//! plan/features/target pool) in the authoritative routing store, and on EVERY
+//! It manages domains (add, remove, verify ownership) and accounts/workspaces
+//! (create with server-minted ids, reconfigure) in the authoritative routing
+//! store, and on EVERY
 //! mutation publishes the affected normalized domain key(s) on the invalidation
 //! feed so resolvers converge promptly (RFC C16). It is NOT on the request hot
 //! path and is reachable on an administrative boundary only.
@@ -13,8 +14,7 @@
 mod app;
 mod auth_routes;
 mod domains;
-mod orgs;
-mod tenants;
+mod tenancy;
 
 use std::error::Error;
 #[cfg(not(unix))]
@@ -42,11 +42,10 @@ use store_postgres::PgRoutingStore;
 use crate::app::{env, load_plan_limits, load_pools, request_timeout, require_auth, resilient, App};
 use crate::auth_routes::{delete_auth_route, list_auth_routes, upsert_auth_route};
 use crate::domains::{declare_domain, delete_domain, upsert_domain, verification_poll, verify_domain};
-use crate::orgs::{
-    delete_membership, get_account, get_workspace, list_memberships, provision_account,
-    transfer_workspace, upsert_membership, upsert_workspace,
+use crate::tenancy::{
+    create_workspace, delete_membership, get_account, get_workspace, list_memberships,
+    provision_account, transfer_workspace, update_workspace, upsert_membership,
 };
-use crate::tenants::{get_tenant, upsert_tenant};
 
 // --------------------------------------------------------------------------- //
 async fn healthz() -> impl IntoResponse {
@@ -175,8 +174,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // Accounts + Workspaces + Memberships (nexus-owned-workspace-tenancy).
         .route("/accounts", post(provision_account))
         .route("/accounts/{id}", get(get_account))
-        .route("/workspaces", post(upsert_workspace))
-        .route("/workspaces/{id}", get(get_workspace))
+        .route("/workspaces", post(create_workspace))
+        .route("/workspaces/{id}", get(get_workspace).put(update_workspace))
         .route("/workspaces/{id}/transfer", post(transfer_workspace))
         .route(
             "/workspaces/{id}/members",
@@ -192,16 +191,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .route("/domains/declare", post(declare_domain))
         .route("/domains/{domain}/verify", post(verify_domain))
         .route("/domains/{domain}", delete(delete_domain))
-        // DEPRECATED `/tenants*` aliases (account-less) — frozen for the broker/e2e
-        // during cut-over; new callers use `/workspaces*` above.
-        .route("/tenants", post(upsert_tenant))
-        .route("/tenants/{id}", get(get_tenant))
-        .route(
-            "/tenants/{id}/auth-routes",
-            get(list_auth_routes)
-                .put(upsert_auth_route)
-                .delete(delete_auth_route),
-        )
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     // Admin API (:9400) — the data endpoints behind the token gate, plus /healthz
@@ -232,7 +221,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let ops_listener = TcpListener::bind("0.0.0.0:9401").await?;
     info!(
         "control plane: admin on :9400 (/accounts, /workspaces[+/members,/transfer,/auth-routes], \
-         /domains, /domains/declare, /tenants[deprecated], /healthz); \
+         /domains, /domains/declare, /healthz); \
          ops on :9401 (/healthz)"
     );
     // Serve both concurrently; either erroring (or a shutdown signal) brings the

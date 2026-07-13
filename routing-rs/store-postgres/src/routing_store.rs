@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use router_core::auth::{AuthPolicy, PathRule, RouteAuth};
 use router_core::domain::{Pool, WorkspaceConfig};
-use router_core::store::{BoxError, DomainRecord, RoutingStore};
+use router_core::store::{BoxError, CreateOutcome, DomainRecord, RoutingStore};
 
 use crate::PgRoutingStore;
 
@@ -29,7 +29,7 @@ impl RoutingStore for PgRoutingStore {
 
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceConfig>, BoxError> {
         let row = sqlx::query(
-            "SELECT workspace_id, plan, target_pool, features, updated_at::text AS updated_at \
+            "SELECT workspace_id, name, plan, target_pool, features, updated_at::text AS updated_at \
              FROM routing.workspaces WHERE workspace_id = $1",
         )
         .bind(workspace_id)
@@ -44,6 +44,7 @@ impl RoutingStore for PgRoutingStore {
         let target: String = r.get("target_pool");
         Ok(Some(WorkspaceConfig {
             workspace_id: r.get("workspace_id"),
+            name: r.get("name"),
             plan: r.get("plan"),
             target_pool: Pool::new(target),
             features: r.get::<Vec<String>, _>("features"),
@@ -51,13 +52,43 @@ impl RoutingStore for PgRoutingStore {
         }))
     }
 
-    async fn upsert_workspace(&self, cfg: &WorkspaceConfig) -> Result<(), BoxError> {
-        sqlx::query(
-            "INSERT INTO routing.workspaces (workspace_id, plan, target_pool, features, updated_at) \
-             VALUES ($1, $2, $3, $4, now()) \
-             ON CONFLICT (workspace_id) DO UPDATE SET \
-                 plan = EXCLUDED.plan, target_pool = EXCLUDED.target_pool, \
-                 features = EXCLUDED.features, updated_at = now()",
+    async fn create_workspace(
+        &self,
+        cfg: &WorkspaceConfig,
+        idempotency_key: Option<&str>,
+    ) -> Result<CreateOutcome, BoxError> {
+        // Insert-only, replay-safe in ONE round trip (server-minted-ids D2): same
+        // shape as `create_account` — the no-op DO UPDATE locks the conflicting
+        // row so RETURNING yields the ORIGINAL workspace_id on a key replay, and
+        // `xmax = 0` says whether THIS call inserted. A NULL key never conflicts,
+        // so a keyless create always inserts. Never touches an existing row's
+        // config (create and reconfigure are disjoint).
+        let row = sqlx::query(
+            "INSERT INTO routing.workspaces \
+                 (workspace_id, name, plan, target_pool, features, idempotency_key, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now()) \
+             ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key \
+             RETURNING workspace_id, (xmax = 0) AS created",
+        )
+        .bind(&cfg.workspace_id)
+        .bind(&cfg.name)
+        .bind(&cfg.plan)
+        .bind(cfg.target_pool.as_str())
+        .bind(&cfg.features)
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(CreateOutcome { id: row.get("workspace_id"), created: row.get("created") })
+    }
+
+    async fn update_workspace(&self, cfg: &WorkspaceConfig) -> Result<bool, BoxError> {
+        // Update-only — never creates: an unknown id matches zero rows and the
+        // caller 404s instead of minting a ghost workspace. Name and ownership are
+        // deliberately not in the SET list (create-time data / transfer's job).
+        let res = sqlx::query(
+            "UPDATE routing.workspaces SET \
+                 plan = $2, target_pool = $3, features = $4, updated_at = now() \
+             WHERE workspace_id = $1",
         )
         .bind(&cfg.workspace_id)
         .bind(&cfg.plan)
@@ -65,7 +96,7 @@ impl RoutingStore for PgRoutingStore {
         .bind(&cfg.features)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn upsert_domain(

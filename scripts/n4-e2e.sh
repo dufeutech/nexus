@@ -17,6 +17,12 @@ CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
 # unquoted $CPAUTH-style expansion would word-split "Bearer <token>" into two
 # args and silently send an invalid header (unauthenticated 401s).
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+
+# server-minted-ids: workspace ids are SERVER-MINTED (`ws_<uuidv7>`) — resolve the
+# seeded lab workspace by replaying the seed's idempotency key (the replay returns
+# the ORIGINAL id, so this is a stable lookup handle, never a duplicate create).
+. "$(dirname "$0")/provision-lib.sh"
+nexus_resolve_lab_workspaces
 pass=0; fail=0
 
 # --path-as-is: curl must NOT resolve dot segments client-side — the encoded
@@ -30,8 +36,8 @@ expect() { # <path> <want> <label>
 settle() { sleep 2; }  # let the invalidation NOTIFY evict the router's cache
 
 echo "== reset: clear any policy from a prior run =="
-cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}'    >/dev/null
-cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/blog"}' >/dev/null
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}'    >/dev/null
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/blog"}' >/dev/null
 settle
 
 echo "== 1. no policy => public by default (anonymous pass-through) =="
@@ -39,7 +45,7 @@ expect "/"    200 "anon / is public"
 expect "/app" 200 "anon /app is public"
 
 echo "== 2. PUT {/, required} => whole site demands a credential =="
-cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/","auth_required":true}' >/dev/null
 settle
 expect "/"    401 "anon / now 401"
 expect "/app" 401 "anon /app now 401"
@@ -52,7 +58,7 @@ if [ "$FORGED" = "401" ]; then echo "  PASS  client-forged x-auth-required canno
 else echo "  FAIL  client-forged x-auth-required opened a private route (-> $FORGED, want 401)"; fail=$((fail+1)); fi
 
 echo "== 3. PUT {/blog, public} => carve a public path out of a private site =="
-cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/blog","auth_required":false}' >/dev/null
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/blog","auth_required":false}' >/dev/null
 settle
 expect "/blog"        200 "anon /blog is public (override)"
 expect "/blog/post-1" 200 "anon /blog subtree is public"
@@ -79,7 +85,7 @@ expect "/blog/%2e%2e/app"   401 "encoded-dot traversal (/blog/%2e%2e/app) stays 
 echo "== 5. phase 2 (edge-role-entitlement-gate): requirement fields =="
 # Spec "Inconsistent rule is rejected at write time": a requirement with
 # auth_required=false must 400 and store nothing.
-BADRULE=$(cpcurl $JSON -o /dev/null -w '%{http_code}' -X PUT "$CP/tenants/acme/auth-routes" \
+BADRULE=$(cpcurl $JSON -o /dev/null -w '%{http_code}' -X PUT "$CP/workspaces/$ACME_WS/auth-routes" \
   -d '{"path_prefix":"/members","auth_required":false,"requires_entitlement":"pro"}')
 if [ "$BADRULE" = "400" ]; then echo "  PASS  requirement + auth_required=false is rejected (-> $BADRULE)"; pass=$((pass+1));
 else echo "  FAIL  inconsistent rule accepted (-> $BADRULE, want 400)"; fail=$((fail+1)); fi
@@ -88,7 +94,7 @@ else echo "  FAIL  inconsistent rule accepted (-> $BADRULE, want 400)"; fail=$((
 # demands a credential first — anonymous sees the AUTHENTICATION outcome, and the
 # authorization policy is never disclosed. (The authenticated 403 leg needs a
 # real token; covered by sidecar unit tests.)
-cpcurl $JSON -X PUT "$CP/tenants/acme/auth-routes" \
+cpcurl $JSON -X PUT "$CP/workspaces/$ACME_WS/auth-routes" \
   -d '{"path_prefix":"/members","auth_required":true,"requires_role":"admin","min_aal":1}' >/dev/null
 settle
 expect "/members"      401 "anon gated route -> 401 (never 403)"
@@ -98,19 +104,19 @@ expect "/members/area" 401 "anon gated subtree -> 401"
 expect "/blog"         200 "public carve-out unaffected by the gated rule"
 
 # The requirement fields round-trip through the CRUD list surface.
-SNAP=$(cpcurl "$CP/tenants/acme/auth-routes")
+SNAP=$(cpcurl "$CP/workspaces/$ACME_WS/auth-routes")
 case "$SNAP" in
   *'"requires_role":"admin"'*) echo "  PASS  list surface returns the requirement fields"; pass=$((pass+1));;
   *) echo "  FAIL  requirement fields missing from list surface: $SNAP"; fail=$((fail+1));;
 esac
-cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/members"}' >/dev/null
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/members"}' >/dev/null
 
 echo "== policy snapshot =="
-cpcurl "$CP/tenants/acme/auth-routes"; echo
+cpcurl "$CP/workspaces/$ACME_WS/auth-routes"; echo
 
 echo "== cleanup =="
-cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/"}'    >/dev/null
-cpcurl $JSON -X DELETE "$CP/tenants/acme/auth-routes" -d '{"path_prefix":"/blog"}' >/dev/null
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/"}'    >/dev/null
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/auth-routes" -d '{"path_prefix":"/blog"}' >/dev/null
 
 echo
 echo "RESULT: $pass passed, $fail failed"

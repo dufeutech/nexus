@@ -30,6 +30,12 @@ CONTROL_AUTH_TOKEN="${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}"
 # unquoted $CPAUTH-style expansion would word-split "Bearer <token>" into two
 # args and silently send an invalid header (unauthenticated 401s).
 cpcurl() { curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$@"; }
+
+# server-minted-ids: workspace ids are SERVER-MINTED (`ws_<uuidv7>`) — resolve the
+# seeded lab workspace by replaying the seed's idempotency key (the replay returns
+# the ORIGINAL id, so this is a stable lookup handle, never a duplicate create).
+. "$(dirname "$0")/provision-lib.sh"
+nexus_resolve_lab_workspaces
 # authz-admin surface (identity-revocation-integrity): authors GLOBAL facts (roles,
 # suspension) — host 9303 -> container 9300 in the lab compose. Used in step 4 to prove
 # those facts surface in the SIGNED contract's claims.
@@ -79,7 +85,7 @@ USER_ID=$(printf '%s' "$CREATE" | json_get userId)
 [ -n "$USER_ID" ] || die "no userId in create response: $CREATE"
 cleanup() {
   curl -sf -X DELETE "$ZITADEL/management/v1/users/$USER_ID" -H "Authorization: Bearer $PAT" >/dev/null 2>&1
-  cpcurl $JSON -X DELETE "$CP/workspaces/acme/members/$USER_ID" >/dev/null 2>&1
+  cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/members/$USER_ID" >/dev/null 2>&1
   # reset the global facts authored in step 4 (best-effort; the per-run-unique subject
   # makes any lingering inert row harmless).
   azcurl -X DELETE "$AUTHZ/authz/$USER_ID/roles/$GROLE" >/dev/null 2>&1
@@ -106,7 +112,7 @@ DOTS=$(printf '%s' "$TOKEN" | tr -cd '.' | wc -c | tr -d ' ')
 ok "$([ "$DOTS" = "2" ] && echo 1 || echo 0)" "minted access token is a JWT (header.payload.signature)"
 
 echo "== 2. fixture: seed the membership (staff/admin in workspace acme) =="
-SEED=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/acme/members" \
+SEED=$(cpcurl -o /dev/null -w '%{http_code}' $JSON -X PUT "$CP/workspaces/$ACME_WS/members" \
   -d "{\"user_sub\":\"$USER_ID\",\"member_type\":\"staff\",\"role\":\"admin\"}")
 ok "$([ "$SEED" = "200" ] || [ "$SEED" = "201" ] || [ "$SEED" = "204" ] && echo 1 || echo 0)" \
   "membership seeded via control plane (HTTP $SEED)"
@@ -118,7 +124,7 @@ BODY=""; tries=0
 while :; do
   BODY=$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")
   WS=$(hdr_val "$BODY" "X-Workspace-Id")
-  [ "$WS" = "acme" ] && break
+  [ "$WS" = "$ACME_WS" ] && break
   tries=$((tries+1)); [ "$tries" -ge 45 ] && break   # ~90s ceiling
   sleep 2
 done
@@ -136,7 +142,7 @@ if [ -n "$V" ]; then
   SEGS=$(printf '%s' "$V" | awk -F. '{print NF}')
   ok "$([ "$SEGS" = 3 ] && echo 1 || echo 0)" "member x-identity-contract is a signed JWS (got $SEGS segments)"
   PAYLOAD=$(b64url_decode "$(printf '%s' "$V" | cut -d. -f2)")
-  ok "$(printf '%s' "$PAYLOAD" | grep -q '"workspace_id":"acme"' && echo 1 || echo 0)" "signed contract carries workspace_id=acme"
+  ok "$(printf '%s' "$PAYLOAD" | grep -q "\"workspace_id\":\"$ACME_WS\"" && echo 1 || echo 0)" "signed contract carries the resolved workspace_id"
   JWKS=$(curl -s --max-time 5 http://localhost:9210/.well-known/jwks.json)
   ok "$(printf '%s' "$JWKS" | grep -q '\"kty\"' && echo 1 || echo 0)" "JWKS endpoint publishes the verification keys"
 else
@@ -150,7 +156,7 @@ UID_H=$(hdr_val "$BODY" "X-User-Id")
 ok "$([ "$UID_H" = "$USER_ID" ] && echo 1 || echo 0)" "x-user-id equals the token subject (got '${UID_H:-<none>}')"
 
 WS=$(hdr_val "$BODY" "X-Workspace-Id")
-ok "$([ "$WS" = "acme" ] && echo 1 || echo 0)" "x-workspace-id equals the RESOLVED workspace (got '${WS:-<none>}')"
+ok "$([ "$WS" = "$ACME_WS" ] && echo 1 || echo 0)" "x-workspace-id equals the RESOLVED workspace (got '${WS:-<none>}')"
 
 UT=$(hdr_val "$BODY" "X-User-Type")
 ok "$([ "$UT" = "staff" ] && echo 1 || echo 0)" "x-user-type equals the seeded membership type (got '${UT:-<none>}')"
@@ -199,12 +205,12 @@ else
 fi
 
 echo "== 5. the scope is MEMBERSHIP-derived, not token-derived: revoke and it disappears =="
-cpcurl $JSON -X DELETE "$CP/workspaces/acme/members/$USER_ID" >/dev/null 2>&1
+cpcurl $JSON -X DELETE "$CP/workspaces/$ACME_WS/members/$USER_ID" >/dev/null 2>&1
 REVOKED=0; tries=0
 while [ "$tries" -lt 45 ]; do
   BODY2=$(curl -s -H "Host: $HOST" -H "Authorization: Bearer $TOKEN" "$EDGE/")
   WS2=$(hdr_val "$BODY2" "X-Workspace-Id")
-  if [ "$WS2" != "acme" ]; then REVOKED=1; break; fi
+  if [ "$WS2" != "$ACME_WS" ]; then REVOKED=1; break; fi
   tries=$((tries+1)); sleep 2
 done
 ok "$REVOKED" "after revocation the acting workspace scope is no longer emitted"

@@ -29,7 +29,7 @@ const VERIFY_POLL_LOCK_KEY: i64 = 9_204_001;
 #[derive(Deserialize)]
 pub(crate) struct DomainBody {
     domain: String,
-    tenant_id: String,
+    workspace_id: String,
     #[serde(default)]
     wildcard: bool,
 }
@@ -45,14 +45,14 @@ pub(crate) async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainB
     const VERIFIED: bool = false;
     if let Err(e) = s
         .store
-        .upsert_domain(&domain, &body.tenant_id, body.wildcard, VERIFIED)
+        .upsert_domain(&domain, &body.workspace_id, body.wildcard, VERIFIED)
         .await
     {
         return internal(e);
     }
     s.invalidate(&domain).await;
     METRICS.mutations.add(1, &[KeyValue::new("op", "upsert_domain")]);
-    info!(domain = %domain, tenant = ?body.tenant_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
+    info!(domain = %domain, tenant = ?body.workspace_id, wildcard = body.wildcard, verified = VERIFIED, "domain upserted");
     (
         StatusCode::OK,
         Json(json!({ "result": "ok", "domain": domain, "verified": VERIFIED })),
@@ -65,7 +65,7 @@ pub(crate) async fn upsert_domain(State(s): State<App>, Json(body): Json<DomainB
 // --------------------------------------------------------------------------- //
 #[derive(Deserialize)]
 pub(crate) struct DeclareBody {
-    tenant_id: String,
+    workspace_id: String,
     domain: String,
 }
 
@@ -82,7 +82,7 @@ pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<Declar
 
     match s.store.get_domain(&domain, false).await {
         // Owned (verified or pending) by another workspace — never grant a second claim.
-        Ok(Some(rec)) if rec.workspace_id != body.tenant_id => {
+        Ok(Some(rec)) if rec.workspace_id != body.workspace_id => {
             return (StatusCode::CONFLICT, Json(json!({ "error": "domain_taken", "domain": domain })))
                 .into_response();
         }
@@ -103,18 +103,18 @@ pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<Declar
             {
                 warn!(error = %e, "declare: pending sweep failed (count may be stale)");
             }
-            let plan = match s.store.get_workspace(&body.tenant_id).await {
+            let plan = match s.store.get_workspace(&body.workspace_id).await {
                 Ok(Some(cfg)) => cfg.plan,
                 Ok(None) => {
                     return (
                         StatusCode::NOT_FOUND,
-                        Json(json!({ "error": "unknown_tenant", "tenant_id": body.tenant_id })),
+                        Json(json!({ "error": "unknown_workspace", "workspace_id": body.workspace_id })),
                     )
                         .into_response();
                 }
                 Err(e) => return internal(e),
             };
-            let used = match s.store.count_domains_for_workspace(&body.tenant_id).await {
+            let used = match s.store.count_domains_for_workspace(&body.workspace_id).await {
                 Ok(n) => n,
                 Err(e) => return internal(e),
             };
@@ -135,12 +135,12 @@ pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<Declar
             // if a concurrent declare for the same domain won the race between our
             // ownership check above and here, our insert is a no-op and we resolve
             // the conflict by re-reading the current owner (closes the declare TOCTOU).
-            match s.store.create_pending_domain(&domain, &body.tenant_id).await {
+            match s.store.create_pending_domain(&domain, &body.workspace_id).await {
                 Ok(true) => {}
                 Ok(false) => {
                     match s.store.get_domain(&domain, false).await {
                         // Another workspace claimed it first — never a second claim.
-                        Ok(Some(rec)) if rec.workspace_id != body.tenant_id => {
+                        Ok(Some(rec)) if rec.workspace_id != body.workspace_id => {
                             return (
                                 StatusCode::CONFLICT,
                                 Json(json!({ "error": "domain_taken", "domain": domain })),
@@ -159,12 +159,12 @@ pub(crate) async fn declare_domain(State(s): State<App>, Json(body): Json<Declar
         Err(e) => return internal(e),
     }
 
-    let ch = match s.store.mint_or_get_challenge(&domain, &body.tenant_id, s.challenge_ttl).await {
+    let ch = match s.store.mint_or_get_challenge(&domain, &body.workspace_id, s.challenge_ttl).await {
         Ok(c) => c,
         Err(e) => return internal(e),
     };
     METRICS.mutations.add(1, &[KeyValue::new("op", "declare_domain")]);
-    info!(domain = %domain, tenant = ?body.tenant_id, "domain declared (pending)");
+    info!(domain = %domain, tenant = ?body.workspace_id, "domain declared (pending)");
     (
         StatusCode::OK,
         Json(json!({

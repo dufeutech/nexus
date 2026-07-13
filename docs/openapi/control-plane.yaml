@@ -10,9 +10,11 @@ info:
     the process refuses to start without it unless `CONTROL_AUTH_DISABLED=true`.
     There is no workspace header. Every success body carries `"result":"ok"`.
 
-    Note: the `/tenants*` routes are a DEPRECATED account-less alias of `/workspaces*`
-    and are intentionally omitted here — use `/workspaces*`. A response quirk worth
-    knowing: auth-route and domain responses spell the workspace key as `tenant_id`.
+    Ids are SERVER-MINTED (`acct_<uuidv7>` / `ws_<uuidv7>`): creation returns the id
+    and callers never choose one — a create body carrying an id field is rejected
+    (unknown field, 422). Creates accept an optional `idempotency_key` (<=128 bytes,
+    visible ASCII): replaying a key returns the ORIGINAL resource with
+    `created:false` instead of minting a duplicate.
 
     Prose reference: `docs/admin-apis.md`. Schemas mirror the handlers in
     `routing-rs/control-plane/src/`. Descriptive artifact of the live routes, not a
@@ -71,21 +73,22 @@ paths:
   /workspaces:
     post:
       tags: [workspaces]
-      summary: Upsert a workspace
-      operationId: upsertWorkspace
+      summary: Create a workspace (server-minted id)
+      description: Create-only — never overwrites. The minted `ws_…` id is in the response.
+      operationId: createWorkspace
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/WorkspaceBody' }
+            schema: { $ref: '#/components/schemas/WorkspaceCreateBody' }
       responses:
         '200':
-          description: Upserted
+          description: Created (`created:true`) or idempotency-key replay (`created:false`)
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/WorkspaceUpsertResult' }
+              schema: { $ref: '#/components/schemas/WorkspaceCreateResult' }
         '400':
-          description: Invalid target_pool (not in the allow-list)
+          description: Invalid target_pool (not in the allow-list), or invalid_idempotency_key
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -96,6 +99,35 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
   /workspaces/{id}:
+    put:
+      tags: [workspaces]
+      summary: Reconfigure a workspace (plan/pool/features)
+      description: Update-only — an unknown id is a 404, never an implicit create.
+      operationId: reconfigureWorkspace
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceReconfigureBody' }
+      responses:
+        '200':
+          description: Reconfigured
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceUpsertResult' }
+        '400':
+          description: Invalid target_pool (not in the allow-list)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: unknown_workspace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     get:
       tags: [workspaces]
       summary: Read a workspace config
@@ -207,7 +239,7 @@ paths:
         - $ref: '#/components/parameters/WorkspaceId'
       responses:
         '200':
-          description: Rules (note the wrapper key is `tenant_id`)
+          description: Rules
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AuthRouteList' }
@@ -304,7 +336,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/QuotaExceeded' }
         '404':
-          description: unknown_tenant
+          description: unknown_workspace
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -432,14 +464,22 @@ components:
       required: [error]
     AccountBody:
       type: object
+      description: No `account_id` — the id is server-minted and returned in the response.
       properties:
-        account_id: { type: string }
         owner_sub:
           type: string
           description: Becomes the account's first (owner) member.
-        name: { type: string, default: "" }
+        name:
+          type: string
+          default: ""
+          description: Display label only — no identity or uniqueness semantics.
         payer_ref: { type: [string, "null"] }
-      required: [account_id, owner_sub]
+        idempotency_key:
+          type: [string, "null"]
+          maxLength: 128
+          description: Optional replay guard (opaque to nexus, e.g. `signup:<sub>`).
+      required: [owner_sub]
+      additionalProperties: false
     AccountUpsertResult:
       type: object
       properties:
@@ -447,7 +487,7 @@ components:
         account_id: { type: string }
         created:
           type: boolean
-          description: false on an idempotent repeat.
+          description: false = an idempotency-key replay returned the original account.
       required: [result, account_id, created]
     Account:
       type: object
@@ -472,13 +512,17 @@ components:
           type: array
           items: { $ref: '#/components/schemas/AccountMember' }
       required: [account, members]
-    WorkspaceBody:
+    WorkspaceCreateBody:
       type: object
+      description: No `workspace_id` — the id is server-minted and returned in the response.
       properties:
-        workspace_id: { type: string }
+        name:
+          type: string
+          default: ""
+          description: Display label only — no identity or uniqueness semantics.
         account_id:
           type: [string, "null"]
-          description: Owning account (must exist). Omit on a config-only update to leave ownership unchanged.
+          description: Owning account (must exist). Ownership changes go through /transfer.
         plan: { type: string, default: free }
         target_pool:
           type: string
@@ -486,7 +530,36 @@ components:
         features:
           type: array
           items: { type: string }
-      required: [workspace_id, target_pool]
+        idempotency_key:
+          type: [string, "null"]
+          maxLength: 128
+          description: Optional replay guard (opaque to nexus).
+      required: [target_pool]
+      additionalProperties: false
+    WorkspaceReconfigureBody:
+      type: object
+      description: The FULL desired config — plan has no default here (an omitted plan is an error, never a silent downgrade). Name/ownership are not reconfigurable.
+      properties:
+        plan: { type: string }
+        target_pool:
+          type: string
+          description: Required; must be in the pool allow-list.
+        features:
+          type: array
+          items: { type: string }
+      required: [plan, target_pool]
+      additionalProperties: false
+    WorkspaceCreateResult:
+      type: object
+      properties:
+        result: { type: string, const: ok }
+        workspace_id:
+          type: string
+          description: The server-minted `ws_<uuidv7>` id — capture it.
+        created:
+          type: boolean
+          description: false = an idempotency-key replay returned the original workspace.
+      required: [result, workspace_id, created]
     WorkspaceUpsertResult:
       type: object
       properties:
@@ -497,6 +570,7 @@ components:
       type: object
       properties:
         workspace_id: { type: string }
+        name: { type: string }
         plan: { type: string }
         target_pool: { type: string }
         features:
@@ -574,7 +648,7 @@ components:
       required: [path_prefix, auth_required]
     AuthRoute:
       type: object
-      description: One stored rule. Note the list wrapper uses `tenant_id`, not `workspace_id`.
+      description: One stored rule.
       properties:
         path_prefix: { type: string }
         auth_required: { type: boolean }
@@ -586,24 +660,24 @@ components:
     AuthRouteList:
       type: object
       properties:
-        tenant_id: { type: string }
+        workspace_id: { type: string }
         routes:
           type: array
           items: { $ref: '#/components/schemas/AuthRoute' }
-      required: [tenant_id, routes]
+      required: [workspace_id, routes]
     AuthRouteUpsertResult:
       type: object
-      description: Echoes the stored rule. Uses `tenant_id`, not `workspace_id`.
+      description: Echoes the stored rule.
       properties:
         result: { type: string, const: ok }
-        tenant_id: { type: string }
+        workspace_id: { type: string }
         path_prefix: { type: string }
         auth_required: { type: boolean }
         requires_role: { type: [string, "null"] }
         requires_entitlement: { type: [string, "null"] }
         min_aal: { type: [integer, "null"] }
         account_scoped: { type: boolean }
-      required: [result, tenant_id, path_prefix, auth_required, account_scoped]
+      required: [result, workspace_id, path_prefix, auth_required, account_scoped]
     AuthRouteDelete:
       type: object
       properties:
@@ -613,18 +687,18 @@ components:
       type: object
       properties:
         result: { type: string, const: ok }
-        tenant_id: { type: string }
+        workspace_id: { type: string }
         path_prefix: { type: string }
-      required: [result, tenant_id, path_prefix]
+      required: [result, workspace_id, path_prefix]
     DomainBody:
       type: object
       properties:
         domain: { type: string }
-        tenant_id:
+        workspace_id:
           type: string
-          description: Owning workspace id.
+          description: Owning workspace id (`ws_…`).
         wildcard: { type: boolean, default: false }
-      required: [domain, tenant_id]
+      required: [domain, workspace_id]
     DomainUpsertResult:
       type: object
       properties:
@@ -637,9 +711,9 @@ components:
     DeclareBody:
       type: object
       properties:
-        tenant_id: { type: string }
+        workspace_id: { type: string }
         domain: { type: string }
-      required: [tenant_id, domain]
+      required: [workspace_id, domain]
     DnsRecord:
       type: object
       properties:

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sqlx::Row;
 
-use router_core::store::{Account, AccountMember, BoxError, OwnershipStore};
+use router_core::store::{Account, AccountMember, BoxError, CreateOutcome, OwnershipStore};
 
 use crate::PgRoutingStore;
 
@@ -12,20 +12,28 @@ impl OwnershipStore for PgRoutingStore {
         account_id: &str,
         name: &str,
         payer_ref: Option<&str>,
-    ) -> Result<bool, BoxError> {
-        // Idempotent provision (ON CONFLICT DO NOTHING): a repeat signup for an
-        // already-provisioned account is a no-op and never clobbers its name/payer.
-        let res = sqlx::query(
-            "INSERT INTO routing.accounts (account_id, name, payer_ref, updated_at) \
-             VALUES ($1, $2, $3, now()) \
-             ON CONFLICT (account_id) DO NOTHING",
+        idempotency_key: Option<&str>,
+    ) -> Result<CreateOutcome, BoxError> {
+        // Insert-only, replay-safe in ONE round trip (server-minted-ids D2): on an
+        // idempotency-key conflict the no-op DO UPDATE (the key with itself) locks
+        // the existing row so RETURNING yields its ORIGINAL id — no
+        // read-after-conflict gap for two same-key racers, and the existing
+        // name/payer are never clobbered. `xmax = 0` distinguishes a fresh insert
+        // from that replay. A NULL key never conflicts (UNIQUE treats NULLs as
+        // distinct), so a keyless create always inserts.
+        let row = sqlx::query(
+            "INSERT INTO routing.accounts (account_id, name, payer_ref, idempotency_key, updated_at) \
+             VALUES ($1, $2, $3, $4, now()) \
+             ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key \
+             RETURNING account_id, (xmax = 0) AS created",
         )
         .bind(account_id)
         .bind(name)
         .bind(payer_ref)
-        .execute(&self.pool)
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(res.rows_affected() > 0)
+        Ok(CreateOutcome { id: row.get("account_id"), created: row.get("created") })
     }
 
     async fn get_account(&self, account_id: &str) -> Result<Option<Account>, BoxError> {

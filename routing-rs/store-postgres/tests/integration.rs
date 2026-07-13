@@ -3,8 +3,9 @@
 //! These exercise the SQL paths the unit tests can't — most importantly the
 //! nexus-owned-workspace-tenancy §6.3 **transfer** contract (repoint ownership +
 //! reset staff atomically, customer memberships and routing/data ride through) and
-//! the §5.1 **account backfill** (a legacy ownerless workspace is auto-owned by a
-//! solo account on `init_schema`).
+//! the provisioning-idempotency create contract (keyed replay returns the ORIGINAL
+//! row, same-key racers resolve to one row, keyless creates never conflict,
+//! reconfigure never creates).
 //!
 //! Gated on `STORE_PG_TEST_URL` so `cargo test` stays green on a machine with no
 //! database: unset → each test prints a skip line and returns. Point it at a
@@ -82,11 +83,19 @@ macro_rules! skip_if_no_db {
 fn workspace(id: &str) -> WorkspaceConfig {
     WorkspaceConfig {
         workspace_id: id.to_owned(),
+        name: format!("{id} display name"),
         plan: "free".to_owned(),
         target_pool: Pool::new("application"),
         features: vec![],
         updated_at: None,
     }
+}
+
+/// Keyless create (the common seed path in these tests): every call inserts.
+async fn seed_workspace(store: &PgRoutingStore, id: &str) {
+    let outcome = store.create_workspace(&workspace(id), None).await.unwrap();
+    assert!(outcome.created, "keyless seed create must insert");
+    assert_eq!(outcome.id, id, "seed create returns the supplied id");
 }
 
 fn membership(sub: &str, ws: &str, member_type: &str, role: &str) -> Membership {
@@ -138,8 +147,8 @@ async fn apex_and_wildcard_coexist_and_route_to_their_own_workspaces() {
     // domain-host-resolution: the apex (exact row) and its wildcard (wildcard row)
     // are INDEPENDENT entries for the same domain string — the composite
     // (domain, is_wildcard) key lets both exist at once. Seed apex→A, wildcard→B.
-    store.upsert_workspace(&workspace("ws_apex")).await.unwrap();
-    store.upsert_workspace(&workspace("ws_wild")).await.unwrap();
+    seed_workspace(&store, "ws_apex").await;
+    seed_workspace(&store, "ws_wild").await;
     store.upsert_domain("example.com", "ws_apex", false, true).await.unwrap();
     store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
 
@@ -177,8 +186,8 @@ async fn an_exact_row_beats_a_covering_wildcard() {
 
     // domain-host-resolution (most-specific-wins): an exact row for the subdomain
     // must take precedence over a wildcard that would otherwise cover it.
-    store.upsert_workspace(&workspace("ws_exact")).await.unwrap();
-    store.upsert_workspace(&workspace("ws_wild")).await.unwrap();
+    seed_workspace(&store, "ws_exact").await;
+    seed_workspace(&store, "ws_wild").await;
     store.upsert_domain("example.com", "ws_wild", true, true).await.unwrap();
     store.upsert_domain("shop.example.com", "ws_exact", false, true).await.unwrap();
 
@@ -204,7 +213,7 @@ async fn wildcard_matching_is_single_label_only() {
     // domain-host-resolution (single-label depth): a wildcard matches ONLY hosts
     // exactly one label below it. `a.b.example.com` is two labels below
     // `example.com`, so the `example.com` wildcard must NOT answer it.
-    store.upsert_workspace(&workspace("ws_top")).await.unwrap();
+    seed_workspace(&store, "ws_top").await;
     store.upsert_domain("example.com", "ws_top", true, true).await.unwrap();
     assert_eq!(
         resolve_via_store(&store, "a.b.example.com").await,
@@ -214,7 +223,7 @@ async fn wildcard_matching_is_single_label_only() {
 
     // Coverage of the deeper host requires a wildcard at ITS OWN parent
     // (`b.example.com`); then the single-label hop resolves it.
-    store.upsert_workspace(&workspace("ws_deep")).await.unwrap();
+    seed_workspace(&store, "ws_deep").await;
     store.upsert_domain("b.example.com", "ws_deep", true, true).await.unwrap();
     assert_eq!(
         resolve_via_store(&store, "a.b.example.com").await.as_deref(),
@@ -231,7 +240,7 @@ async fn an_unknown_host_fails_closed_to_no_tenant() {
     // matching parent wildcard resolves to NO tenant — never a default/catch-all.
     // Seed an unrelated domain so the store is non-empty (a populated store must
     // still refuse an unknown host).
-    store.upsert_workspace(&workspace("ws_known")).await.unwrap();
+    seed_workspace(&store, "ws_known").await;
     store.upsert_domain("known.example.com", "ws_known", false, true).await.unwrap();
 
     assert_eq!(
@@ -252,9 +261,9 @@ async fn transfer_repoints_ownership_and_resets_staff_only() {
     let (store, pool, _guard) = skip_if_no_db!();
 
     // Two owning accounts; ws_1 starts owned by the old account.
-    assert!(store.create_account("acct_old", "Old", None).await.unwrap());
-    assert!(store.create_account("acct_new", "New", None).await.unwrap());
-    store.upsert_workspace(&workspace("ws_1")).await.unwrap();
+    assert!(store.create_account("acct_old", "Old", None, None).await.unwrap().created);
+    assert!(store.create_account("acct_new", "New", None, None).await.unwrap().created);
+    seed_workspace(&store, "ws_1").await;
     assert!(store.set_workspace_account("ws_1", "acct_old").await.unwrap());
 
     // A verified domain (routing state) + a staff and a customer membership.
@@ -292,11 +301,11 @@ async fn transfer_preserves_plan_and_switches_payer_to_the_new_account() {
     // workspace-tenancy R4: plan lives on the WORKSPACE (it travels with a
     // transfer); payer lives on the ACCOUNT (it switches with a transfer). Two
     // accounts with distinct payers of record; ws_pro starts on the old one.
-    assert!(store.create_account("acct_old", "Old", Some("payer_old")).await.unwrap());
-    assert!(store.create_account("acct_new", "New", Some("payer_new")).await.unwrap());
+    assert!(store.create_account("acct_old", "Old", Some("payer_old"), None).await.unwrap().created);
+    assert!(store.create_account("acct_new", "New", Some("payer_new"), None).await.unwrap().created);
     let mut ws = workspace("ws_pro");
     ws.plan = "pro".to_owned();
-    store.upsert_workspace(&ws).await.unwrap();
+    assert!(store.create_workspace(&ws, None).await.unwrap().created);
     assert!(store.set_workspace_account("ws_pro", "acct_old").await.unwrap());
 
     store.transfer_workspace("ws_pro", "acct_new").await.unwrap();
@@ -330,7 +339,7 @@ async fn domains_are_aliases_and_removal_leaves_the_workspace_intact() {
     // detachable aliases. Several domains resolve to ONE workspace…
     let mut ws = workspace("ws_alias");
     ws.plan = "pro".to_owned();
-    store.upsert_workspace(&ws).await.unwrap();
+    assert!(store.create_workspace(&ws, None).await.unwrap().created);
     store.upsert_domain("a.example.com", "ws_alias", false, true).await.unwrap();
     store.upsert_domain("b.example.com", "ws_alias", false, true).await.unwrap();
     assert_eq!(store.lookup_domain("a.example.com", false).await.unwrap().as_deref(), Some("ws_alias"));
@@ -346,54 +355,129 @@ async fn domains_are_aliases_and_removal_leaves_the_workspace_intact() {
 }
 
 #[tokio::test]
-async fn create_account_is_idempotent_and_never_clobbers() {
+async fn keyed_account_replay_returns_the_original_and_never_clobbers() {
     let (store, _pool, _guard) = skip_if_no_db!();
 
-    // workspace-tenancy R2: a repeat provision for an existing account is a
-    // no-op — it must never overwrite the account's name or payer of record.
-    assert!(store.create_account("acct_1", "First", Some("payer_1")).await.unwrap());
-    assert!(
-        !store.create_account("acct_1", "Imposter", Some("payer_2")).await.unwrap(),
-        "second provision reports no-op"
-    );
+    // provisioning-idempotency: replaying an idempotency key returns the ORIGINAL
+    // account (its id, `created: false`) and never overwrites its name/payer —
+    // this is what keeps signup provisioning safe to call unconditionally.
+    let first = store
+        .create_account("acct_1", "First", Some("payer_1"), Some("signup:sub-a"))
+        .await
+        .unwrap();
+    assert!(first.created, "first keyed create inserts");
+    assert_eq!(first.id, "acct_1");
+
+    // The replay arrives with a FRESH minted id (the handler mints per request) —
+    // the key, not the id, is what replays.
+    let replay = store
+        .create_account("acct_2", "Imposter", Some("payer_2"), Some("signup:sub-a"))
+        .await
+        .unwrap();
+    assert!(!replay.created, "replay reports no insert");
+    assert_eq!(replay.id, "acct_1", "replay returns the ORIGINAL id");
+    assert!(store.get_account("acct_2").await.unwrap().is_none(), "no second account minted");
+
     let acct = store.get_account("acct_1").await.unwrap().expect("account exists");
-    assert_eq!(acct.name, "First", "name not clobbered by a repeat provision");
+    assert_eq!(acct.name, "First", "name not clobbered by a replay");
     assert_eq!(acct.payer_ref.as_deref(), Some("payer_1"), "payer not clobbered");
+}
+
+#[tokio::test]
+async fn concurrent_same_key_creates_resolve_to_one_account() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // provisioning-idempotency (race scenario): two same-key creates racing on
+    // separate connections yield exactly one row, and BOTH callers receive its id.
+    let (left, right) = tokio::join!(
+        store.create_account("acct_l", "Left", None, Some("signup:racer")),
+        store.create_account("acct_r", "Right", None, Some("signup:racer")),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(
+        [left.created, right.created].iter().filter(|c| **c).count(),
+        1,
+        "exactly one racer inserts"
+    );
+    assert_eq!(left.id, right.id, "both racers receive the same id");
+}
+
+#[tokio::test]
+async fn keyless_creates_never_conflict() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // A NULL idempotency key opts out of replay protection: every keyless create
+    // inserts (UNIQUE treats NULLs as distinct)...
+    assert!(store.create_account("acct_a", "Same Name", None, None).await.unwrap().created);
+    assert!(store.create_account("acct_b", "Same Name", None, None).await.unwrap().created);
+    // ...and creation never overwrites: same display name, two distinct resources
+    // (workspace-tenancy: display names carry no identity semantics).
+    assert!(store.get_account("acct_a").await.unwrap().is_some());
+    assert!(store.get_account("acct_b").await.unwrap().is_some());
+
+    let mut ws_first = workspace("ws_a");
+    let mut ws_second = workspace("ws_b");
+    ws_first.name = "Same Name".to_owned();
+    ws_second.name = "Same Name".to_owned();
+    assert!(store.create_workspace(&ws_first, None).await.unwrap().created);
+    assert!(store.create_workspace(&ws_second, None).await.unwrap().created);
+}
+
+#[tokio::test]
+async fn keyed_workspace_replay_returns_the_original_untouched() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    let created = store.create_workspace(&workspace("ws_orig"), Some("flow:one")).await.unwrap();
+    assert!(created.created);
+
+    // Replay with a fresh minted id AND different config: the original row rides
+    // through untouched (create never overwrites).
+    let mut differing = workspace("ws_other");
+    differing.plan = "pro".to_owned();
+    let replay = store.create_workspace(&differing, Some("flow:one")).await.unwrap();
+    assert!(!replay.created, "replay reports no insert");
+    assert_eq!(replay.id, "ws_orig", "replay returns the ORIGINAL id");
+    let row = store.get_workspace("ws_orig").await.unwrap().expect("original survives");
+    assert_eq!(row.plan, "free", "replay must not reconfigure the original");
+    assert!(store.get_workspace("ws_other").await.unwrap().is_none(), "no ghost row");
+}
+
+#[tokio::test]
+async fn update_workspace_reconfigures_but_never_creates() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+
+    // provisioning-idempotency: reconfiguring an unknown id matches nothing —
+    // it must NOT create (the caller 404s instead of minting a ghost).
+    assert!(
+        !store.update_workspace(&workspace("ws_ghost")).await.unwrap(),
+        "unknown id matches zero rows"
+    );
+    assert!(store.get_workspace("ws_ghost").await.unwrap().is_none(), "nothing created");
+
+    // The happy path updates config but leaves the display name alone (name is
+    // create-time data; PUT carries no name).
+    seed_workspace(&store, "ws_cfg").await;
+    let mut next = workspace("ws_cfg");
+    next.plan = "pro".to_owned();
+    next.name = "ignored by update".to_owned();
+    assert!(store.update_workspace(&next).await.unwrap(), "existing row matched");
+    let after = store.get_workspace("ws_cfg").await.unwrap().expect("row survives");
+    assert_eq!(after.plan, "pro", "plan reconfigured");
+    assert_eq!(after.name, "ws_cfg display name", "display name untouched by update");
 }
 
 #[tokio::test]
 async fn transfer_of_unknown_workspace_is_none() {
     let (store, _pool, _guard) = skip_if_no_db!();
-    store.create_account("acct_new", "New", None).await.unwrap();
+    let _ = store.create_account("acct_new", "New", None, None).await.unwrap();
     assert_eq!(store.transfer_workspace("ghost", "acct_new").await.unwrap(), None);
-}
-
-#[tokio::test]
-async fn init_schema_backfills_a_solo_account_for_an_ownerless_workspace() {
-    let (store, pool, _guard) = skip_if_no_db!();
-
-    // A legacy row: a workspace with no owning account (upsert_workspace does not
-    // set account_id — create-time ownership is a separate call, and a migrated
-    // `tenants` row had none).
-    store.upsert_workspace(&workspace("legacy_ws")).await.unwrap();
-    assert_eq!(workspace_account(&pool, "legacy_ws").await, None, "ownerless before backfill");
-
-    // Re-running the idempotent bootstrap runs the backfill.
-    store.init_schema().await.unwrap();
-
-    // A solo account keyed by the workspace_id now owns it...
-    assert_eq!(workspace_account(&pool, "legacy_ws").await.as_deref(), Some("legacy_ws"));
-    assert!(store.get_account("legacy_ws").await.unwrap().is_some(), "solo account provisioned");
-
-    // ...and it is idempotent: a second pass neither errors nor re-owns it.
-    store.init_schema().await.unwrap();
-    assert_eq!(workspace_account(&pool, "legacy_ws").await.as_deref(), Some("legacy_ws"));
 }
 
 #[tokio::test]
 async fn auth_route_requirement_fields_round_trip() {
     let (store, _pool, _guard) = skip_if_no_db!();
-    store.upsert_workspace(&workspace("ws_auth")).await.unwrap();
+    seed_workspace(&store, "ws_auth").await;
 
     // A phase-1 rule (no requirements) and a phase-2 gated rule.
     let plain = RouteAuth { required: true, ..RouteAuth::PASS_THROUGH };

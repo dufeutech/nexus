@@ -18,6 +18,8 @@ serde.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 subtle.workspace = true
+# Server-minted typed ids — confined to the `ids` module (server-minted-ids D1).
+uuid.workspace = true
 # Telemetry (first-party-telemetry): the shared init lives here so all routing-plane
 # binaries wire it identically. tracing/tracing-subscriber move onto the core crate
 # because the telemetry module owns the subscriber stack (previously per-binary).

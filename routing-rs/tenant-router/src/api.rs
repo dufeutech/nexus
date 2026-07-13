@@ -153,7 +153,7 @@ mod tests {
     use tokio::time::sleep;
     use router_core::auth::{AuthPolicy, RouteAuth};
     use router_core::domain::{Pool, WorkspaceConfig};
-    use router_core::store::{BoxError, DomainRecord, RoutingStore};
+    use router_core::store::{BoxError, CreateOutcome, DomainRecord, RoutingStore};
     use tower::util::ServiceExt;
 
     /// A handler that outlives the timeout must be terminated with 408 rather
@@ -246,6 +246,7 @@ mod tests {
             // test only cares whether resolution succeeds, not the config's contents.
             Ok(Some(WorkspaceConfig {
                 workspace_id: workspace_id.to_owned(),
+                name: String::new(),
                 plan: "free".to_owned(),
                 target_pool: Pool::new("application"),
                 features: vec![],
@@ -258,7 +259,16 @@ mod tests {
         }
 
         // --- control-plane surface: never exercised by the parity test ---------- //
-        async fn upsert_workspace(&self, _cfg: &WorkspaceConfig) -> Result<(), BoxError> {
+        async fn create_workspace(
+            &self,
+            _cfg: &WorkspaceConfig,
+            _idempotency_key: Option<&str>,
+        ) -> Result<CreateOutcome, BoxError> {
+            Err("FakeStore: control-plane surface is not exercised by the \
+                 /authorize-vs-router parity test"
+                .into())
+        }
+        async fn update_workspace(&self, _cfg: &WorkspaceConfig) -> Result<bool, BoxError> {
             Err("FakeStore: control-plane surface is not exercised by the \
                  /authorize-vs-router parity test"
                 .into())

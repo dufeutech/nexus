@@ -216,7 +216,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
     ports:
-      - "9400:9400"   # admin API (domains/tenants) + healthz
+      - "9400:9400"   # admin API (domains/workspaces) + healthz
       - "9401:9401"   # ops: /metrics + /healthz (scraped by Prometheus)
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9400/healthz"]
@@ -259,11 +259,15 @@ services:
       control-plane:
         condition: service_healthy
 
-  # One-shot: seed a baseline tenant + verified domains via the control plane so
-  # the lab is end-to-end without manual steps (RFC C13). Crucially it verifies
-  # `localhost` -> tenant `acme`, so the identity-plane demos (Host: localhost)
-  # keep working now that tenant routing runs first (C17) and rejects unknown
-  # hosts (C18). Also seeds wildcard + an unverified domain for the routing demos.
+  # One-shot: seed the baseline workspaces + verified domains via the control
+  # plane so the lab is end-to-end without manual steps (RFC C13). Ids are
+  # SERVER-MINTED (server-minted-ids): the seed provisions through the shared
+  # helper with stable idempotency keys (`seed:acme`, `seed:globex`) and captures
+  # the returned `ws_…` ids — e2e scripts replay the same keys to resolve the
+  # same workspaces. Crucially it verifies `localhost` -> the acme workspace, so
+  # the identity-plane demos (Host: localhost) keep working now that tenant
+  # routing runs first (C17) and rejects unknown hosts (C18). Also seeds
+  # wildcard + an unverified domain for the routing demos.
   routing-seed:
     image: curlimages/curl:latest
     container_name: zitadel-lab-routing-seed
@@ -272,6 +276,9 @@ services:
       # Same lab default as the control-plane service — the admin API now runs
       # with auth ENABLED (production parity), so the seed must present it.
       CONTROL_AUTH_TOKEN: ${CONTROL_AUTH_TOKEN:-zitadel-lab-dev-token}
+      CP: http://control-plane:9400
+    volumes:
+      - ./scripts/provision-lib.sh:/provision-lib.sh:ro
     depends_on:
       control-plane:
         condition: service_healthy
@@ -280,15 +287,16 @@ services:
       - -c
       - >-
         until curl -sf http://control-plane:9400/healthz >/dev/null; do echo 'waiting for control-plane'; sleep 2; done;
+        . /provision-lib.sh;
+        nexus_resolve_lab_workspaces;
+        echo "acme=$$ACME_WS globex=$$GLOBEX_WS";
         H='-H content-type:application/json';
         A="authorization: Bearer $$CONTROL_AUTH_TOKEN";
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/tenants -d '{"tenant_id":"acme","plan":"pro","target_pool":"application","features":["beta"]}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/tenants -d '{"tenant_id":"globex","plan":"enterprise","target_pool":"api"}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"localhost","tenant_id":"acme","verified":true}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"app.acme.test","tenant_id":"acme","verified":true}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"acme.test","tenant_id":"acme","wildcard":true,"verified":true}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"api.globex.test","tenant_id":"globex","verified":true}';
-        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d '{"domain":"unverified.test","tenant_id":"acme","verified":false}';
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d "{\"domain\":\"localhost\",\"workspace_id\":\"$$ACME_WS\",\"verified\":true}";
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d "{\"domain\":\"app.acme.test\",\"workspace_id\":\"$$ACME_WS\",\"verified\":true}";
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d "{\"domain\":\"acme.test\",\"workspace_id\":\"$$ACME_WS\",\"wildcard\":true,\"verified\":true}";
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d "{\"domain\":\"api.globex.test\",\"workspace_id\":\"$$GLOBEX_WS\",\"verified\":true}";
+        curl -sf $$H -H "$$A" -X POST http://control-plane:9400/domains -d "{\"domain\":\"unverified.test\",\"workspace_id\":\"$$ACME_WS\",\"verified\":false}";
         echo; echo 'routing seed complete'
 
   # One-shot lab companion to routing-seed: the control plane (correctly,
