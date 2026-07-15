@@ -1,9 +1,12 @@
 name: CI
 
-# Lint + test on every push and PR (plus a manual Run workflow button).
+# Lint + test on pushes to main and on every PR (plus a manual Run button).
+# Pushes are scoped to main so a branch with an open PR is not built twice (once
+# for the branch push, once for the PR) — the pull_request event covers branches.
+# A feature branch therefore first gets CI when its PR is opened.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch: {}
 
