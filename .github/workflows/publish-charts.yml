@@ -141,7 +141,7 @@ jobs:
       # If it publishes, the `edge-platform` package name is wedged on GHCR (delete + retry);
       # if it 500s too, the umbrella content itself is what GHCR rejects.
       - name: Probe umbrella under throwaway name
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.probe }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.probe }}
         working-directory: deploy/helm
         env:
           REPO: ${{ steps.reg.outputs.repo }}
