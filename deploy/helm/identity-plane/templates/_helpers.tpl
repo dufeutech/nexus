@@ -165,3 +165,49 @@ token
 {{- define "identity-plane.ownsAuthzAdminSecret" -}}
 {{- if or .Values.authzAdmin.existingSecret .Values.authzAdmin.authDisabled -}}false{{- else -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+identity-contract-signing: the sidecar's signing env, single-sourced so the standalone
+identity edge and the umbrella's COMBINED edge stay in lockstep (they drifted once — infra
+finding N11 — and a co-located edge that omits this silently serves UNSIGNED traffic).
+
+Call with (dict "signing" <signing-values> "fullname" <plane-fullname>); the CALLER gates on
+`<signing>.enabled` and applies indentation via `| nindent`. `fullname` names the default
+BAO_TOKEN Secret (`<fullname>-bao-token`) the plane's signing.yaml renders — pass the identity
+plane's fullname even from the umbrella so both consume the SAME token Secret.
+*/}}
+{{- define "identity-plane.signingEnv" -}}
+{{- $s := .signing -}}
+# identity-contract-signing: mint x-identity-contract (ES256) + publish the
+# public keys on :9210. `aud` is derived from x-route-pool, not configured.
+- { name: SIGNING_ISSUER, value: {{ $s.issuer | quote }} }
+- { name: CONTRACT_TOKEN_TTL_SECONDS, value: {{ $s.tokenTtlSeconds | quote }} }
+- { name: JWKS_LISTEN, value: {{ $s.jwksListen | quote }} }
+{{- if $s.transit.enabled }}
+# automate-signing-key-rotation: managed custody + AUTOMATED rotation via
+# OpenBao Transit (Mode B local signing). The sidecar pulls versioned keys,
+# GENERATES the JWKS from Transit's public keys, and rotates on schedule /
+# on demand. If Bao is unreachable at startup it falls back to the break-glass
+# PEM below (when provided) rather than running unsigned.
+- { name: SIGNING_TRANSIT_KEY, value: {{ required "sidecar.signing.transit.keyName is required when transit is enabled" $s.transit.keyName | quote }} }
+- { name: SIGNING_TRANSIT_MOUNT, value: {{ $s.transit.mount | quote }} }
+- { name: BAO_ADDR, value: {{ required "sidecar.signing.transit.address is required when transit is enabled" $s.transit.address | quote }} }
+- name: BAO_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ $s.transit.tokenExistingSecret | default (printf "%s-bao-token" .fullname) }}
+      key: token
+- { name: SIGNING_KEY_POLL_SECONDS, value: {{ $s.transit.pollSeconds | quote }} }
+- { name: CONTRACT_MAX_CLOCK_SKEW_SECONDS, value: {{ $s.transit.maxClockSkewSeconds | quote }} }
+{{- with $s.transit.rotationPeriodSeconds }}
+- { name: SIGNING_ROTATION_PERIOD_SECONDS, value: {{ . | quote }} }
+{{- end }}
+{{- end }}
+{{- if $s.kid }}
+# Break-glass MANUAL key (the pre-rotation path; also the Transit startup
+# fallback). Present whenever manual key material is configured.
+- { name: SIGNING_KEY_PATH, value: /etc/nexus/signing-key/key.pem }
+- { name: SIGNING_KID, value: {{ $s.kid | quote }} }
+- { name: JWKS_FILE, value: /etc/nexus/signing-jwks/jwks.json }
+{{- end }}
+{{- end -}}
