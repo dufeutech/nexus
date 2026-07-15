@@ -252,7 +252,9 @@ mod tests {
             GateOutcome::Permit(reason) => {
                 assert!(reason.starts_with("permit:"), "permit carries the policy id: {reason}");
             }
-            GateOutcome::Deny { .. } => panic!("read grant must permit the audit read surface"),
+            GateOutcome::Deny { .. } => {
+                unreachable!("read grant must permit the audit read surface")
+            }
         }
         // Outside grant: every mutation and the credential surface refuse.
         for (method, template) in

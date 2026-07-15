@@ -22,6 +22,7 @@ use std::error::Error;
 #[cfg(not(unix))]
 use std::future::pending;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -243,7 +244,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let loaded = if policy_path.trim().is_empty() {
             CedarAdminPdp::with_default_policies()
         } else {
-            CedarAdminPdp::from_path(std::path::Path::new(policy_path.trim()))
+            CedarAdminPdp::from_path(Path::new(policy_path.trim()))
         };
         match loaded {
             Ok(engine) => {
