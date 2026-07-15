@@ -1,0 +1,100 @@
+name: Publish charts
+
+# Package the Helm charts and push them to GHCR as OCI artifacts, so a consumer
+# (e.g. infra-v1) can `helm pull oci://ghcr.io/<owner>/charts/<chart> --version X`
+# WITHOUT vendoring the chart source out of this repo. The umbrella is packaged
+# with its subcharts bundled in (`helm dependency update`), so `edge-platform` is
+# self-contained: one pull, no local-path re-vendor.
+#
+# Chart versions are INDEPENDENT of the image appVersion (Helm's model): this
+# publishes whatever `version:` each Chart.yaml declares — it does NOT build or
+# retag images. Flow: bump the chart `version` in Chart.yaml, merge, then run this
+# (button) or push a `charts-*` tag. Images are published separately (build-images).
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push to GHCR (uncheck to package-only)"
+        type: boolean
+        required: false
+        default: true
+      force:
+        description: "Overwrite a chart version that is already published (default: skip it)"
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      # A marker tag (e.g. charts-2026-07-15) publishes every chart at its declared version.
+      - "charts-*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Never cancel a publish mid-push — a half-pushed registry state is worse than a queue.
+  group: publish-charts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      # GHCR OCI repo. Owner may be mixed-case; OCI names must be lowercase.
+      - name: Compute registry
+        id: reg
+        run: echo "repo=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        # Skip on a package-only manual run (nothing is pushed, so no creds needed).
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package & push charts
+        working-directory: deploy/helm
+        env:
+          REPO: ${{ steps.reg.outputs.repo }}
+          # push defaults true for the tag trigger; honours the toggle on manual runs.
+          PUSH: ${{ (github.event_name != 'workflow_dispatch' || inputs.push) && 'true' || 'false' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          OUT=$(mktemp -d)
+
+          # edge-platform's subcharts are file:// local-path deps; vendor them so the
+          # packaged umbrella bundles them and installs without the repo checkout.
+          helm dependency update edge-platform
+
+          # `helm package` tars the chart as-is — it does NOT render templates, so no
+          # values are needed here (render/lint is the CI helm-lint job's job).
+          for chart in identity-plane routing-plane edge-platform; do
+            helm package "$chart" -d "$OUT"
+          done
+
+          for tgz in "$OUT"/*.tgz; do
+            # Read name/version from chart metadata (robust vs. hyphens in a version).
+            name=$(helm show chart "$tgz" | awk '/^name:/{print $2; exit}')
+            version=$(helm show chart "$tgz" | awk '/^version:/{print $2; exit}')
+            echo "::group::$name $version"
+            if [ "$PUSH" != "true" ]; then
+              echo "package-only: $tgz (not pushed)"; echo "::endgroup::"; continue
+            fi
+            # Immutability: a published version is a fixed promise. Skip a re-push of an
+            # existing version unless force — republishing identical/changed bytes under a
+            # used version breaks reproducibility for anyone who already pinned it.
+            if [ "$FORCE" != "true" ] && helm show chart "$REPO/$name" --version "$version" >/dev/null 2>&1; then
+              echo "SKIP: $name $version already published (re-run with force=true to overwrite)"
+              echo "::endgroup::"; continue
+            fi
+            echo "pushing $name $version -> $REPO"
+            helm push "$tgz" "$REPO"
+            echo "::endgroup::"
+          done
+
+          echo "Charts available at: $REPO/{identity-plane,routing-plane,edge-platform}"
