@@ -1,10 +1,16 @@
 name: Publish charts
 
-# Package the Helm charts and push them to GHCR as OCI artifacts, so a consumer
+# Package the plane Helm charts and push them to GHCR as OCI artifacts, so a consumer
 # (e.g. infra-v1) can `helm pull oci://ghcr.io/<owner>/charts/<chart> --version X`
-# WITHOUT vendoring the chart source out of this repo. The umbrella is packaged
-# self-contained (its subcharts bundled in), so `edge-platform` installs from one
-# pull with no local-path re-vendor.
+# WITHOUT vendoring the chart source out of this repo.
+#
+# SCOPE: the two plane subcharts (identity-plane, routing-plane) only. The edge-platform
+# UMBRELLA is deliberately NOT published here: GHCR rejects its OCI manifest PUT with an
+# opaque `500 unknown error` (ruled out: Helm version, the dependencies stanza, the package
+# name, and nested-vs-unpacked bundling — the two subcharts publish fine, only the umbrella
+# manifest is refused). Until GHCR accepts it, install the umbrella from the repo
+# (`helm dependency update ./deploy/helm/edge-platform` — it re-vendors these same subchart
+# versions) as documented in deploy/README.md.
 #
 # Chart versions are INDEPENDENT of the image appVersion (Helm's model): this
 # publishes whatever `version:` each Chart.yaml declares — it does NOT build or
@@ -72,30 +78,11 @@ jobs:
           set -euo pipefail
           OUT=$(mktemp -d)
 
-          # edge-platform's subcharts are file:// local-path deps; vendor them so the
-          # packaged umbrella is self-contained (installs without the repo checkout).
-          helm dependency update edge-platform
-
-          # GHCR rejects the umbrella's OCI manifest PUT with `500 unknown error` when the
-          # packaged layer contains NESTED .tgz files (the subchart tarballs `dependency
-          # update` drops into charts/). Bundle the subcharts as UNPACKED directories
-          # instead: the layer becomes a single-level tarball GHCR accepts, and Helm renders
-          # charts/<dir> identically to charts/<name>.tgz. Also drop the now-moot file://
-          # `dependencies` stanza + Chart.lock from the PACKAGED copy (source keeps them for
-          # local `helm dependency update`; the CI checkout is ephemeral). Verified: the
-          # unpacked umbrella renders the same 14 containers / 4 Deployments.
-          ( cd edge-platform/charts && for t in *.tgz; do tar xzf "$t" && rm -f "$t"; done )
-          rm -f edge-platform/Chart.lock
-          if command -v yq >/dev/null 2>&1; then
-            yq -i 'del(.dependencies)' edge-platform/Chart.yaml
-          else
-            # Fallback: the stanza is the last top-level block in Chart.yaml.
-            sed -i '/^dependencies:/,$d' edge-platform/Chart.yaml
-          fi
-
           # `helm package` tars the chart as-is — it does NOT render templates, so no
-          # values are needed here (render/lint is the CI helm-lint job's job).
-          for chart in identity-plane routing-plane edge-platform; do
+          # values are needed here (render/lint is the CI helm-lint job's job). Only the
+          # two plane subcharts are published; the edge-platform umbrella is repo-installed
+          # (see the SCOPE note at the top of this workflow).
+          for chart in identity-plane routing-plane; do
             helm package "$chart" -d "$OUT"
           done
 
@@ -131,4 +118,4 @@ jobs:
           done
 
           if [ -n "$FAILED" ]; then echo "::error::charts failed to publish:$FAILED"; exit 1; fi
-          echo "Charts available at: $REPO/{identity-plane,routing-plane,edge-platform}"
+          echo "Charts available at: $REPO/{identity-plane,routing-plane}"
