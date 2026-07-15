@@ -149,24 +149,26 @@ helm dependency update ./helm/edge-platform
 helm install edge ./helm/edge-platform -n edge --create-namespace -f my-values.yaml
 ```
 
-### Installing from the published OCI charts (no repo checkout)
+### Installing the plane charts from the OCI registry (no repo checkout)
 
-The charts are also published to GHCR as OCI artifacts by the **Publish charts** workflow
-(`.github/workflows/publish-charts.yml`) — so you can install a pinned chart version without
-cloning this repo or re-vendoring subcharts. The `edge-platform` package is **self-contained**
-(its subcharts are bundled at publish time), so the `helm dependency update` step above is not
-needed on this path. Chart versions are independent of the image `appVersion`; pin the chart
-version you want (`helm show chart` to list what a version deploys).
+The two **plane** charts are published to GHCR as OCI artifacts by the **Publish charts**
+workflow (`.github/workflows/publish-charts.yml`), so you can install a pinned version without
+cloning this repo. Chart versions are independent of the image `appVersion`; run
+`helm show chart oci://…/<chart> --version X` to see what a version deploys.
 
 ```bash
-# One combined edge, straight from the registry (subcharts already bundled):
-helm install edge oci://ghcr.io/dufeutech/charts/edge-platform --version 0.2.1 \
-  -n edge --create-namespace -f my-values.yaml
-
-# Or a single plane standalone:
 helm install identity oci://ghcr.io/dufeutech/charts/identity-plane --version 0.1.0 \
   -n identity --create-namespace -f my-values.yaml
+
+helm install routing oci://ghcr.io/dufeutech/charts/routing-plane --version 0.2.0 \
+  -n routing --create-namespace -f my-values.yaml
 ```
+
+> **The `edge-platform` umbrella is NOT on the registry.** GHCR rejects its OCI manifest with an
+> opaque `500` (the plane subcharts publish fine; only the umbrella manifest is refused — see the
+> workflow's SCOPE note). Install the umbrella from the repo instead — `helm dependency update`
+> re-vendors these same subchart versions (see the umbrella install block above). Registry
+> distribution of the umbrella can be revisited when GHCR accepts it.
 
 Create the credential Secrets out-of-band (preferred over inline values):
 
