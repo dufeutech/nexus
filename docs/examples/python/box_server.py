@@ -37,7 +37,9 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
 from jwt import PyJWKClient
 
-JWKS_URL = os.environ.get("NEXUS_JWKS_URL", "http://localhost:9210/.well-known/jwks.json")
+JWKS_URL = os.environ.get(
+    "NEXUS_JWKS_URL", "http://localhost:9210/.well-known/jwks.json"
+)
 ISSUER = os.environ.get("NEXUS_ISSUER", "https://identity.nexus")
 # aud is YOUR box's name — the value nexus routes to you as x-route-pool.
 # A contract minted for another box will not verify here.
@@ -55,14 +57,14 @@ app = FastAPI(title="example nexus box")
 class Identity:
     """The verified acting identity, read from the contract's claims."""
 
-    sub: str                       # user sub / service id / api-key id
-    workspace_id: str              # the AUTHORIZED acting workspace
-    principal_kind: str            # user | apikey | service
-    role: Optional[str] = None     # workspace-scoped; absent for a service
+    sub: str  # user sub / service id / api-key id
+    workspace_id: str  # the AUTHORIZED acting workspace
+    principal_kind: str  # user | apikey | service
+    role: Optional[str] = None  # workspace-scoped; absent for a service
     roles: list[str] = field(default_factory=list)
     entitlements: list[str] = field(default_factory=list)
-    permissions: list[str] = field(default_factory=list)   # service principals only
-    plan: Optional[str] = None     # absent => NOT provisioned, never a default tier
+    permissions: list[str] = field(default_factory=list)  # service principals only
+    plan: Optional[str] = None  # absent => NOT provisioned, never a default tier
     on_behalf_of: Optional[str] = None  # apikey only: the creating human
 
 
@@ -72,7 +74,8 @@ def _verify_contract(token: str) -> Identity:
     try:
         key = _jwks.get_signing_key_from_jwt(token).key
         claims = jwt.decode(
-            token, key,
+            token,
+            key,
             algorithms=["ES256"],
             issuer=ISSUER,
             audience=BOX_NAME,
@@ -139,6 +142,7 @@ def optional_identity(request: Request) -> Optional[Identity]:
 # Routes
 # ---------------------------------------------------------------------------
 
+
 @app.get("/public/health")
 def health():
     """/public/* is the edge's only non-enriched designation (ext_proc off):
@@ -181,7 +185,11 @@ def catalog(who: Optional[Identity] = Depends(optional_identity)):
 
 # Toy datastore, keyed by (workspace, order) — every row is workspace-scoped.
 ORDERS = {
-    ("ws_demo", "order-1"): {"order_id": "order-1", "owner_sub": "user-123", "total": 4200},
+    ("ws_demo", "order-1"): {
+        "order_id": "order-1",
+        "owner_sub": "user-123",
+        "total": 4200,
+    },
 }
 
 
