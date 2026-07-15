@@ -23,6 +23,11 @@ on:
         type: boolean
         required: false
         default: false
+      probe:
+        description: "DIAGNOSTIC: push the umbrella content under a throwaway name (edge-platform-probe)"
+        type: boolean
+        required: false
+        default: false
   push:
     tags:
       # A marker tag (e.g. charts-2026-07-15) publishes every chart at its declared version.
@@ -131,3 +136,20 @@ jobs:
 
           if [ -n "$FAILED" ]; then echo "::error::charts failed to publish:$FAILED"; exit 1; fi
           echo "Charts available at: $REPO/{identity-plane,routing-plane,edge-platform}"
+
+      # DIAGNOSTIC (temporary): push the SAME umbrella content under a throwaway name.
+      # If it publishes, the `edge-platform` package name is wedged on GHCR (delete + retry);
+      # if it 500s too, the umbrella content itself is what GHCR rejects.
+      - name: Probe umbrella under throwaway name
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.probe }}
+        working-directory: deploy/helm
+        env:
+          REPO: ${{ steps.reg.outputs.repo }}
+        run: |
+          set -euo pipefail
+          helm dependency update edge-platform
+          rm -rf /tmp/probe && cp -r edge-platform /tmp/probe
+          yq -i '.name = "edge-platform-probe" | del(.dependencies)' /tmp/probe/Chart.yaml
+          helm package /tmp/probe -d /tmp
+          echo "pushing edge-platform-probe (same content, fresh name) -> $REPO"
+          helm push /tmp/edge-platform-probe-*.tgz "$REPO" --debug
