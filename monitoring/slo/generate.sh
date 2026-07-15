@@ -22,10 +22,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUTDIR="$HERE/../prometheus/rules"
 mkdir -p "$OUTDIR"
 
+# Run the container as the invoking user. The sloth image is distroless-nonroot
+# (uid 65532); on native Linux (CI) that user can't write to the host-owned bind
+# mount, so /out writes fail with "permission denied". Docker Desktop (Win/Mac)
+# masks this by ignoring host ownership on binds, which is why it only bites CI.
+# `id -u/-g` maps the container process to the host user that owns $OUTDIR.
+DOCKER_USER="$(id -u):$(id -g)"
+
 for spec in "$HERE"/*.slo.yaml; do
   base="$(basename "$spec" .slo.yaml)"
   echo "sloth generate: $base"
   docker run --rm \
+    --user "$DOCKER_USER" \
     -v "$HERE:/specs:ro" \
     -v "$OUTDIR:/out" \
     "ghcr.io/slok/sloth:$SLOTH_VERSION" \
