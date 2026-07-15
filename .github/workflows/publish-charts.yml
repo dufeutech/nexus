@@ -120,7 +120,7 @@ jobs:
             # others (a summary at the end fails the job if any chart failed).
             n=0; pushed=""
             while :; do
-              if helm push "$tgz" "$REPO"; then pushed=1; break; fi
+              if helm push "$tgz" "$REPO" --debug; then pushed=1; break; fi
               n=$((n+1))
               if [ "$n" -ge 4 ]; then echo "push failed after $n attempts"; break; fi
               echo "push attempt $n failed; retrying in $((n*5))s"; sleep $((n*5))
