@@ -78,6 +78,20 @@ jobs:
           # packaged umbrella bundles them and installs without the repo checkout.
           helm dependency update edge-platform
 
+          # GHCR returns `500 unknown error` on the umbrella's OCI manifest PUT when its
+          # config carries the `dependencies` stanza (the two dependency-free subcharts
+          # push fine). The subcharts are already vendored into charts/ above, and Helm
+          # renders everything under charts/ regardless of the stanza — so drop it from the
+          # PACKAGED copy only. Source keeps its file:// deps for local `helm dependency
+          # update`; the CI checkout is ephemeral. Verified: the stripped umbrella renders
+          # byte-for-byte the same subcharts.
+          if command -v yq >/dev/null 2>&1; then
+            yq -i 'del(.dependencies)' edge-platform/Chart.yaml
+          else
+            # Fallback: the stanza is the last top-level block in Chart.yaml.
+            sed -i '/^dependencies:/,$d' edge-platform/Chart.yaml
+          fi
+
           # `helm package` tars the chart as-is — it does NOT render templates, so no
           # values are needed here (render/lint is the CI helm-lint job's job).
           for chart in identity-plane routing-plane edge-platform; do
