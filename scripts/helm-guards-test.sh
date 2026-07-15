@@ -133,6 +133,36 @@ ok "$([ "$ISS" = "$JWKS" ] && echo 1 || echo 0)" "edge issuer port ($ISS) == edg
 ok "$([ "$(printf '%s\n' "$CPORT" | wc -l)" = "1" ] && echo 1 || echo 0)" "compose uses ONE ZITADEL_EXTERNALPORT default (got: $(printf '%s ' $CPORT))"
 ok "$([ "$ISS" = "$CPORT" ] && echo 1 || echo 0)" "edge issuer port ($ISS) == compose ZITADEL_EXTERNALPORT default ($CPORT)"
 
+echo "== identity-contract-signing: enabled signing reaches EVERY edge topology (infra N11) =="
+# The signing env is single-sourced (identity-plane.signingEnv) so the standalone edge and
+# the umbrella's COMBINED edge cannot drift. Assert BOTH mint + publish when signing is on,
+# and that a signing-off umbrella stays clean (no always-on regression).
+IP_SIGN=(--set sidecar.signing.enabled=true
+         --set sidecar.signing.transit.enabled=true
+         --set sidecar.signing.transit.tokenExistingSecret=ci-bao-token)
+EP_SIGN=(--set identity-plane.sidecar.signing.enabled=true
+         --set identity-plane.sidecar.signing.transit.enabled=true
+         --set identity-plane.sidecar.signing.transit.tokenExistingSecret=ci-bao-token)
+
+OUT=$(render identity-plane "${IP_BASE[@]}" "${IP_ORIGIN_NP[@]}" "${IP_JWKS_TLS[@]}" "${IP_SIGN[@]}") ; rc=$?
+ok "$([ $rc -eq 0 ] && echo 1 || echo 0)" "standalone: signing topology renders"
+ok "$(printf '%s' "$OUT" | grep -q 'SIGNING_TRANSIT_KEY' && echo 1 || echo 0)" "standalone: edge carries SIGNING_TRANSIT_* env"
+ok "$(printf '%s' "$OUT" | grep -q 'name: BAO_TOKEN' && echo 1 || echo 0)" "standalone: edge injects BAO_TOKEN"
+ok "$(printf '%s' "$OUT" | grep -q 'containerPort: 9210' && echo 1 || echo 0)" "standalone: edge opens the :9210 jwks port"
+ok "$(printf '%s' "$OUT" | grep -q 'targetPort: jwks' && echo 1 || echo 0)" "standalone: Service publishes the public JWKS port"
+
+OUT=$(render edge-platform "${EP_BASE[@]}" "${EP_ORIGIN_NP[@]}" --set identity-plane.oidc.jwksTls.enabled=true "${EP_SIGN[@]}") ; rc=$?
+ok "$([ $rc -eq 0 ] && echo 1 || echo 0)" "umbrella: signing topology renders"
+ok "$(printf '%s' "$OUT" | grep -q 'SIGNING_TRANSIT_KEY' && echo 1 || echo 0)" "umbrella: COMBINED edge carries SIGNING_TRANSIT_* env (N11 fixed)"
+ok "$(printf '%s' "$OUT" | grep -q 'name: BAO_TOKEN' && echo 1 || echo 0)" "umbrella: combined edge injects BAO_TOKEN"
+ok "$(printf '%s' "$OUT" | grep -q 'containerPort: 9210' && echo 1 || echo 0)" "umbrella: combined edge opens the :9210 jwks port"
+ok "$(printf '%s' "$OUT" | grep -q 'targetPort: id-jwks' && echo 1 || echo 0)" "umbrella: combined-edge Service publishes the public JWKS port"
+
+OUT=$(render edge-platform "${EP_BASE[@]}" "${EP_ORIGIN_NP[@]}" --set identity-plane.oidc.jwksTls.enabled=true) ; rc=$?
+ok "$(printf '%s' "$OUT" | grep -q 'SIGNING_TRANSIT' && echo 0 || echo 1)" "signing OFF: combined edge carries no SIGNING_* env"
+ok "$(printf '%s' "$OUT" | grep -q 'containerPort: 9210' && echo 0 || echo 1)" "signing OFF: combined edge opens no :9210 port"
+ok "$(printf '%s' "$OUT" | grep -q 'targetPort: id-jwks' && echo 0 || echo 1)" "signing OFF: Service does not expose JWKS"
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" = 0 ]

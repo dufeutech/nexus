@@ -16,6 +16,16 @@ spec:
       port: {{ .Values.edge.service.port }}
       targetPort: http
       protocol: TCP
+    {{- $iv := index .Values "identity-plane" }}
+    {{- if $iv.sidecar.signing.enabled }}
+    # identity-contract-signing: the JWKS is PUBLIC by design (boxes fetch it to verify the
+    # signed x-identity-contract), so — unlike the local-only debug/metrics ports — it IS
+    # exposed here, mirroring the standalone identity edge Service.
+    - name: jwks
+      port: 9210
+      targetPort: id-jwks
+      protocol: TCP
+    {{- end }}
 {{- if .Values.edge.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

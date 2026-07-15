@@ -120,10 +120,23 @@ spec:
             # closed (gated routes 403). Unset would fall back to the embedded default.
             - name: POLICY_DIR
               value: /etc/nexus/policy
+            {{- if $iv.sidecar.signing.enabled }}
+            # identity-contract-signing: the COMBINED edge mints + publishes exactly like the
+            # standalone identity edge (shared identity-plane.signingEnv template — infra N11:
+            # a co-located edge without this serves UNSIGNED). fullname points at the identity
+            # subchart's resources so the BAO token + break-glass material are the SAME Secrets
+            # its signing.yaml renders.
+            {{- include "identity-plane.signingEnv" (dict "signing" $iv.sidecar.signing "fullname" (include "edge-platform.identityFullname" .)) | nindent 12 }}
+            {{- end }}
           ports:
             - { name: id-ext-proc, containerPort: 50051 }
             - { name: id-profile, containerPort: 9200 }
             - { name: id-metrics, containerPort: 9202 }
+            {{- if $iv.sidecar.signing.enabled }}
+            # identity-contract-signing: the PUBLIC JWKS (boxes fetch it to verify the signed
+            # contract) — exposed on the Service too. See edge-service.yaml.
+            - { name: id-jwks, containerPort: 9210 }
+            {{- end }}
           readinessProbe:
             httpGet: { path: /healthz, port: id-profile }
             initialDelaySeconds: 2
@@ -137,6 +150,12 @@ spec:
           volumeMounts:
             # adopt-cedar-policy-gate: the L2 policy-as-data set (POLICY_DIR above).
             - { name: identity-policy, mountPath: /etc/nexus/policy, readOnly: true }
+            {{- if and $iv.sidecar.signing.enabled $iv.sidecar.signing.kid }}
+            # identity-contract-signing break-glass key material only (pure-Transit mounts
+            # nothing here — the key lives in OpenBao and the JWKS is generated).
+            - { name: signing-key, mountPath: /etc/nexus/signing-key, readOnly: true }
+            - { name: signing-jwks, mountPath: /etc/nexus/signing-jwks, readOnly: true }
+            {{- end }}
         # ---- Envoy edge (the combined tenant-first chain) ----
         - name: envoy
           image: {{ include "edge-platform.image" (dict "repo" $rv.images.envoy.repository "tag" $rv.images.envoy.tag "ctx" .) }}
@@ -168,6 +187,17 @@ spec:
         - name: identity-policy
           configMap:
             name: {{ include "edge-platform.fullname" . }}-identity-policy
+        {{- if and $iv.sidecar.signing.enabled $iv.sidecar.signing.kid }}
+        # identity-contract-signing break-glass material, rendered by the identity-plane
+        # subchart's signing.yaml as <release>-identity-plane-signing-{key,jwks}. Pure-Transit
+        # mode has none — the key stays in OpenBao and the JWKS is generated.
+        - name: signing-key
+          secret:
+            secretName: {{ $iv.sidecar.signing.existingSecret | default (printf "%s-signing-key" (include "edge-platform.identityFullname" .)) }}
+        - name: signing-jwks
+          configMap:
+            name: {{ printf "%s-signing-jwks" (include "edge-platform.identityFullname" .) }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}
