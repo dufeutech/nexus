@@ -59,17 +59,43 @@ Native-format content stays in native files loaded through adapters: rule-files
 are YAML under `files/`, dashboards are JSON, both rendered/mounted — never inlined
 as string literals.
 
-### Build-vs-adopt: the metrics backend (defer to /opsx:decide)
+### Build-vs-adopt decisions (recorded via /opsx:decide)
 
-The one critical concern is the metrics store/rule-evaluator choice. Recommendation
-to record at `/opsx:decide`: **Adopt VictoriaMetrics** (single-node + a standalone
-rule evaluator) as the lean backend — it is the production target's choice, is
-PromQL-compatible (our content ports unchanged), and is materially lighter than
-the alternatives. Alternatives considered: keep Prometheus (heavier, and diverges
-from the production backend so the lab would not dogfood it); Thanos/Mimir
-(far heavier, wrong for a 3-VPS fleet); Grafana Agent/Alloy (collection, not a
-store). This decision is realized only in adapters (lab container + collector
-exporter); the core stays backend-neutral.
+The critical concerns — the metrics store/rule-evaluator, and rule
+correctness/portability validation — are settled below. Both are realized only in
+adapters (lab container + collector exporter; a CI/generator step); the core stays
+backend-neutral.
+
+### Decision: Metrics store + rule evaluator — Adopt VictoriaMetrics (vmsingle + vmalert)
+
+- **Status**: approved
+- **Why**: PromQL-compatible so our rule/dashboard content ports unchanged; ~½ the
+  RAM and up to 7× less disk than Prometheus; it is the exact stack infra-v1 runs,
+  so the lab dogfoods production.
+- **Considered**: keep Prometheus (heavier, and diverges from the production
+  backend so the lab would not exercise it); managed TSDB / Rent (off-table — the
+  fleet self-hosts with no cloud dependency and must stay locally exercisable).
+- **Isolation**: enters only through the lab backend container and the collector's
+  metrics-exporter config; never referenced by any first-party service.
+
+### Decision: Rule correctness + portability validation — Adopt promtool
+
+- **Status**: approved
+- **Why**: `promtool check rules` + `test rules` unit-tests rules against synthetic
+  series, and its PromQL parser doubles as the portability guard (valid PromQL ⇒
+  portable; a backend-only MetricsQL construct fails the parse). No new heavy
+  dependency; directly backs the "same rules evaluate on both backends"
+  verification.
+- **Considered**: also adopt Cloudflare `pint` for deeper PR-time linting (deferred
+  — needs config + a live backend, more than needed now); hand-written regex guard
+  (Build — brittle, reinvents a parser; rejected).
+- **Isolation**: a CI/generator validation step; never runs at request time.
+
+### The prior SLO source-of-truth stands
+
+Rule content is still single-sourced from the already-adopted Sloth objective specs
+(`monitoring/slo/*.slo.yaml`); this change adds a rendering of that source, not a
+second author. No re-decision needed.
 
 ### Delivery-form selection default
 

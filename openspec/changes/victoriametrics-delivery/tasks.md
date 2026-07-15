@@ -1,8 +1,9 @@
 ## 1. Build-vs-adopt gate
 
-- [ ] 1.1 Run `/opsx:decide` for the metrics-backend concern; record the
+- [x] 1.1 Run `/opsx:decide` for the metrics-backend concern; record the
   VictoriaMetrics adoption (store + standalone rule evaluator) and the rejected
-  alternatives into `design.md`.
+  alternatives into `design.md`. (Also recorded: Adopt promtool for rule
+  correctness/portability validation.)
 - [ ] 1.2 Resolve the `monitoring.delivery` default open question and record it in
   `design.md` (operator vs otlp-only).
 
