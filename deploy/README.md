@@ -149,6 +149,25 @@ helm dependency update ./helm/edge-platform
 helm install edge ./helm/edge-platform -n edge --create-namespace -f my-values.yaml
 ```
 
+### Installing from the published OCI charts (no repo checkout)
+
+The charts are also published to GHCR as OCI artifacts by the **Publish charts** workflow
+(`.github/workflows/publish-charts.yml`) — so you can install a pinned chart version without
+cloning this repo or re-vendoring subcharts. The `edge-platform` package is **self-contained**
+(its subcharts are bundled at publish time), so the `helm dependency update` step above is not
+needed on this path. Chart versions are independent of the image `appVersion`; pin the chart
+version you want (`helm show chart` to list what a version deploys).
+
+```bash
+# One combined edge, straight from the registry (subcharts already bundled):
+helm install edge oci://ghcr.io/dufeutech/charts/edge-platform --version 0.2.1 \
+  -n edge --create-namespace -f my-values.yaml
+
+# Or a single plane standalone:
+helm install identity oci://ghcr.io/dufeutech/charts/identity-plane --version 0.1.0 \
+  -n identity --create-namespace -f my-values.yaml
+```
+
 Create the credential Secrets out-of-band (preferred over inline values):
 
 ```bash
