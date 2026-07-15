@@ -469,17 +469,38 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /admin-tokens:
+    get:
+      tags: [admin-tokens]
+      summary: List admin credentials (grants, status, lineage — never secrets)
+      description: |
+        Review surface (admin-plane-authorization "a credential's grant is
+        reviewable"): every credential's identity, granted scopes, status and
+        rotation lineage. Secret material is never selected, let alone
+        returned. Requires the `token-admin` scope.
+      operationId: listAdminTokens
+      responses:
+        '200':
+          description: All credentials
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminTokenList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
     post:
       tags: [admin-tokens]
-      summary: Issue a named admin token
+      summary: Issue a named admin token with an explicit grant
       description: |
-        Mints an individually identifiable admin credential for ONE caller
-        (attribution, not authorization). The plaintext secret is returned ONCE
-        and never persisted — only its peppered HMAC lands in
-        `routing.admin_tokens`. Requires ADMIN_TOKEN_PEPPER (else 503). The
-        issuance itself is audited (`admin_token.issue`). First-token
+        Mints an individually identifiable admin credential for ONE caller,
+        carrying an EXPLICIT grant (admin-plane-authorization): `scopes` is
+        required and non-empty — there is no implicit default, and unknown
+        scope words are rejected. The plaintext secret is returned ONCE and
+        never persisted — only its peppered HMAC lands in
+        `routing.admin_tokens`. Requires ADMIN_TOKEN_PEPPER (else 503) and the
+        `token-admin` scope (else 403). The issuance itself is audited
+        (`admin_token.issue`, grant in the detail). First-token
         chicken-and-egg: mint it while the legacy shared token
-        (ADMIN_LEGACY_TOKEN_OK=true) still authenticates this call.
+        (ADMIN_LEGACY_TOKEN_OK=true, full grant) still authenticates this call.
       operationId: issueAdminToken
       parameters:
         - { $ref: '#/components/parameters/ActingOperator' }
@@ -495,11 +516,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IssuedAdminToken' }
         '400':
-          description: Missing/empty name
+          description: Missing/empty name, empty scopes, or an unknown scope word
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
   /admin-tokens/{id}/rotate:
     post:
@@ -545,6 +567,15 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AdminTokenRevokeResult' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            Lockout guard (admin-plane-authorization "the last credential
+            administrator cannot be removed"): the target is the ONLY active
+            credential holding `token-admin`; the credential stays active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/AdminTokenMgmtUnconfigured' }
   /healthz:
     get:
@@ -597,6 +628,17 @@ components:
   responses:
     Unauthorized:
       description: Missing or invalid bearer token (a denial event is recorded)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: |
+        Authenticated but not authorized (admin-plane-authorization): the
+        actor's grant lacks the route's required scope (`read` for GETs,
+        `provision` for platform-data mutations, `token-admin` for the
+        /admin-tokens surface). Applies to EVERY gated endpoint, not just
+        where listed. Carries the machine-readable decision reason; an
+        `authz.denied` ledger event attributes the refusal to the actor.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -968,7 +1010,37 @@ components:
         name:
           type: string
           description: The named caller this credential identifies (e.g. signup-broker, ops-cli, ci).
-      required: [name]
+        scopes:
+          type: array
+          description: |
+            The credential's grant (admin-plane-authorization) — explicit and
+            non-empty; no implicit default. `token-admin` is the distinguished
+            credential-administration scope no other scope includes.
+          items:
+            type: string
+            enum: [read, provision, token-admin]
+          minItems: 1
+      required: [name, scopes]
+    AdminCredential:
+      type: object
+      description: One credential on the review surface — never secret material.
+      properties:
+        token_id: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [active, revoked] }
+        scopes:
+          type: array
+          items: { type: string }
+        rotated_from: { type: [string, "null"] }
+        created_at: { type: string }
+      required: [token_id, name, status, scopes, created_at]
+    AdminTokenList:
+      type: object
+      properties:
+        tokens:
+          type: array
+          items: { $ref: '#/components/schemas/AdminCredential' }
+      required: [tokens]
     IssuedAdminToken:
       type: object
       properties:

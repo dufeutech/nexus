@@ -24,10 +24,14 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
+use router_core::admin_authz::{
+    is_known_scope, AdminCredentialRecord, LastTokenAdminGuard, SCOPE_TOKEN_ADMIN,
+};
 use router_core::audit::{
-    is_known_action, AuditCtx, AuditEventRecord, AuditQuery, DenialEvent, InvalidQueryBound,
-    ACTION_ADMIN_TOKEN_ISSUE, ACTION_ADMIN_TOKEN_REVOKE, ACTION_ADMIN_TOKEN_ROTATE,
-    ACTION_AUTH_DENIED, ACTOR_UNAUTHENTICATED, OUTCOME_OK, SURFACE_CONTROL_PLANE,
+    is_known_action, AuditCtx, AuditEventRecord, AuditQuery, AuthzDenialEvent, DenialEvent,
+    InvalidQueryBound, ACTION_ADMIN_TOKEN_ISSUE, ACTION_ADMIN_TOKEN_REVOKE,
+    ACTION_ADMIN_TOKEN_ROTATE, ACTION_AUTH_DENIED, ACTION_AUTHZ_DENIED, ACTOR_UNAUTHENTICATED,
+    OUTCOME_OK, SURFACE_CONTROL_PLANE,
 };
 use router_core::ids::mint_audit_event_id;
 use router_core::store::BoxError;
@@ -64,6 +68,13 @@ where
     if !is_known_action(event.action) {
         return Err(format!("audit action '{}' is not in the closed vocabulary", event.action).into());
     }
+    // The permitting authorization decision rides into the event detail
+    // (admin-plane-authorization: recorded actions carry why they were
+    // allowed), so a review reads the reason without re-deriving it.
+    let mut detail = event.detail.clone();
+    if let (Some(reason), Some(object)) = (&actx.authz_reason, detail.as_object_mut()) {
+        object.insert("authz_reason".to_owned(), json!(reason));
+    }
     sqlx::query(
         "INSERT INTO routing.admin_audit_events \
              (event_id, occurred_at, surface, action, actor_token_id, asserted_operator, \
@@ -78,7 +89,7 @@ where
     .bind(event.target_kind)
     .bind(event.target_id)
     .bind(event.outcome)
-    .bind(event.detail.to_string())
+    .bind(detail.to_string())
     .bind(actx.trace_id.as_deref())
     .bind(actx.source_ip.as_deref())
     .bind(event.idempotency_key)
@@ -117,6 +128,31 @@ impl PgRoutingStore {
         .bind(ACTION_AUTH_DENIED)
         .bind(ACTOR_UNAUTHENTICATED)
         .bind(json!({ "credential": denial.kind.as_str() }).to_string())
+        .bind(denial.trace_id.as_deref())
+        .bind(denial.source_ip.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Best-effort denial record for the 403 path (admin-plane-authorization
+    /// delta on "Denied admin access is recorded"): an AUTHENTICATED actor
+    /// refused by the policy gate. Attributed — actor, attempted action class,
+    /// and the decision reason — never credential material. Standalone insert
+    /// (no mutation exists); the CALLER treats a failure as log-and-continue,
+    /// so a failed write stays a denial.
+    pub async fn record_authz_denial(&self, denial: &AuthzDenialEvent) -> Result<(), BoxError> {
+        sqlx::query(
+            "INSERT INTO routing.admin_audit_events \
+                 (event_id, occurred_at, surface, action, actor_token_id, outcome, detail, \
+                  trace_id, source_ip) \
+             VALUES ($1, now(), $2, $3, $4, 'denied', $5::jsonb, $6, $7)",
+        )
+        .bind(mint_audit_event_id())
+        .bind(SURFACE_CONTROL_PLANE)
+        .bind(ACTION_AUTHZ_DENIED)
+        .bind(&denial.actor)
+        .bind(json!({ "action_class": denial.class, "reason": denial.reason }).to_string())
         .bind(denial.trace_id.as_deref())
         .bind(denial.source_ip.as_deref())
         .execute(&self.pool)
@@ -250,6 +286,23 @@ fn generate_admin_credential() -> Result<(String, String), BoxError> {
     ))
 }
 
+/// The authenticated admin caller a presented secret resolves to: the
+/// attribution handle plus the credential's grant, fetched together in the ONE
+/// indexed lookup so authorization adds no second store round-trip.
+#[derive(Debug, Clone)]
+pub struct AdminActor {
+    /// The public token id (`atk_…`) audit events carry.
+    pub token_id: String,
+    /// The granted scopes the authorization gate evaluates against.
+    pub scopes: Vec<String>,
+}
+
+/// Serializes credential-administration mutations that must observe a stable
+/// active-token-admin count (the lockout guard): a transaction-scoped advisory
+/// lock, so two concurrent revokes of the last two `token-admin` credentials
+/// cannot both pass the count check. Arbitrary constant, unique to this guard.
+const TOKEN_ADMIN_GUARD_LOCK: i64 = 0x6e78_5f74_6b61_6467; // "nx_tkadg"
+
 /// Read-write access to `routing.admin_tokens` for the control plane: issue /
 /// rotate / revoke (each audited atomically) and the per-request hash lookup.
 #[derive(Clone)]
@@ -271,20 +324,31 @@ impl PgAdminTokenStore {
         Self { pool: store.pool.clone(), hasher }
     }
 
-    /// Issue a named credential for one caller. Persists ONLY the secret's hash
-    /// and returns the plaintext once; records `admin_token.issue` in the same
+    /// Issue a named credential for one caller with an EXPLICIT grant (spec
+    /// "Grants are explicit at provisioning": an empty or unknown scope set is
+    /// refused at write time — the HTTP layer pre-validates for a clean 400;
+    /// this check is the fail-closed backstop). Persists ONLY the secret's
+    /// hash and returns the plaintext once; records `admin_token.issue` (with
+    /// the grant, so the ledger shows what was conferred) in the same
     /// transaction.
-    pub async fn issue(&self, name: &str, actx: &AuditCtx) -> Result<IssuedAdminToken, BoxError> {
+    pub async fn issue(
+        &self,
+        name: &str,
+        scopes: &[String],
+        actx: &AuditCtx,
+    ) -> Result<IssuedAdminToken, BoxError> {
+        let scopes = normalized_scopes(scopes)?;
         let (token_id, secret) = generate_admin_credential()?;
         let token_hash = self.hasher.hash(&secret);
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO routing.admin_tokens (token_id, name, token_hash, status) \
-             VALUES ($1, $2, $3, 'active')",
+            "INSERT INTO routing.admin_tokens (token_id, name, token_hash, status, scopes) \
+             VALUES ($1, $2, $3, 'active', $4)",
         )
         .bind(&token_id)
         .bind(name)
         .bind(&token_hash)
+        .bind(&scopes)
         .execute(&mut *tx)
         .await?;
         record(
@@ -295,7 +359,7 @@ impl PgAdminTokenStore {
                 target_kind: "admin_token",
                 target_id: &token_id,
                 outcome: OUTCOME_OK,
-                detail: json!({ "name": name }),
+                detail: json!({ "name": name, "scopes": scopes }),
                 idempotency_key: None,
             },
         )
@@ -304,9 +368,12 @@ impl PgAdminTokenStore {
         Ok(IssuedAdminToken { token_id, secret })
     }
 
-    /// Rotate `token_id`: mint a NEW active credential under the same name,
-    /// record the lineage (`rotated_from`), and revoke the old one — all in one
-    /// audited transaction. `Ok(None)` if `token_id` is not an active token.
+    /// Rotate `token_id`: mint a NEW active credential under the same name AND
+    /// the same grant (rotation changes the secret, never the authorization —
+    /// so the active `token-admin` count is preserved and the lockout guard
+    /// needs no say here), record the lineage (`rotated_from`), and revoke the
+    /// old one — all in one audited transaction. `Ok(None)` if `token_id` is
+    /// not an active token.
     pub async fn rotate(
         &self,
         token_id: &str,
@@ -314,7 +381,7 @@ impl PgAdminTokenStore {
     ) -> Result<Option<IssuedAdminToken>, BoxError> {
         let mut tx = self.pool.begin().await?;
         let Some(row) = sqlx::query(
-            "SELECT name FROM routing.admin_tokens \
+            "SELECT name, scopes FROM routing.admin_tokens \
              WHERE token_id = $1 AND status = 'active' FOR UPDATE",
         )
         .bind(token_id)
@@ -324,15 +391,18 @@ impl PgAdminTokenStore {
             return Ok(None);
         };
         let name: String = row.try_get("name")?;
+        let scopes: Vec<String> = row.try_get("scopes")?;
         let (new_token_id, secret) = generate_admin_credential()?;
         let new_hash = self.hasher.hash(&secret);
         sqlx::query(
-            "INSERT INTO routing.admin_tokens (token_id, name, token_hash, status, rotated_from) \
-             VALUES ($1, $2, $3, 'active', $4)",
+            "INSERT INTO routing.admin_tokens \
+                 (token_id, name, token_hash, status, scopes, rotated_from) \
+             VALUES ($1, $2, $3, 'active', $4, $5)",
         )
         .bind(&new_token_id)
         .bind(&name)
         .bind(&new_hash)
+        .bind(&scopes)
         .bind(token_id)
         .execute(&mut *tx)
         .await?;
@@ -351,7 +421,7 @@ impl PgAdminTokenStore {
                 target_kind: "admin_token",
                 target_id: &new_token_id,
                 outcome: OUTCOME_OK,
-                detail: json!({ "name": name, "rotated_from": token_id }),
+                detail: json!({ "name": name, "rotated_from": token_id, "scopes": scopes }),
                 idempotency_key: None,
             },
         )
@@ -363,8 +433,43 @@ impl PgAdminTokenStore {
     /// Revoke `token_id` (status flip — every other caller's credential keeps
     /// working). `true` if an active token was revoked, `false` if it was
     /// already revoked or unknown (idempotent; no state change ⇒ no event).
+    ///
+    /// Lockout guard (spec "The last credential administrator cannot be
+    /// removed"): revoking the ONLY active credential holding `token-admin`
+    /// is refused with the typed [`LastTokenAdminGuard`]. The advisory lock
+    /// serializes concurrent revokes so two callers cannot each observe "one
+    /// other remains" and jointly remove both.
     pub async fn revoke(&self, token_id: &str, actx: &AuditCtx) -> Result<bool, BoxError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(TOKEN_ADMIN_GUARD_LOCK)
+            .execute(&mut *tx)
+            .await?;
+        let Some(target) = sqlx::query(
+            "SELECT scopes FROM routing.admin_tokens \
+             WHERE token_id = $1 AND status = 'active' FOR UPDATE",
+        )
+        .bind(token_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(false);
+        };
+        let scopes: Vec<String> = target.try_get("scopes")?;
+        if scopes.iter().any(|scope| scope == SCOPE_TOKEN_ADMIN) {
+            let remaining: i64 = sqlx::query(
+                "SELECT count(*) FROM routing.admin_tokens \
+                 WHERE status = 'active' AND $1 = ANY(scopes) AND token_id <> $2",
+            )
+            .bind(SCOPE_TOKEN_ADMIN)
+            .bind(token_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            if remaining == 0 {
+                return Err(Box::new(LastTokenAdminGuard));
+            }
+        }
         let res = sqlx::query(
             "UPDATE routing.admin_tokens SET status = 'revoked', updated_at = now() \
              WHERE token_id = $1 AND status = 'active'",
@@ -392,20 +497,69 @@ impl PgAdminTokenStore {
         Ok(true)
     }
 
-    /// Resolve a presented bearer secret to its token id, if it is an active
-    /// named credential. One indexed lookup by the peppered hash; a revoked or
-    /// unknown secret simply matches no row (fail-closed).
-    pub async fn lookup(&self, presented_secret: &str) -> Result<Option<String>, BoxError> {
+    /// Resolve a presented bearer secret to its actor — token id AND grant in
+    /// the same single indexed lookup (authorization adds no second store
+    /// round-trip), if it is an active named credential. A revoked or unknown
+    /// secret simply matches no row (fail-closed).
+    pub async fn lookup(&self, presented_secret: &str) -> Result<Option<AdminActor>, BoxError> {
         let token_hash = self.hasher.hash(presented_secret);
         let row = sqlx::query(
-            "SELECT token_id FROM routing.admin_tokens \
+            "SELECT token_id, scopes FROM routing.admin_tokens \
              WHERE token_hash = $1 AND status = 'active'",
         )
         .bind(&token_hash)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|found| found.get::<String, _>("token_id")))
+        row.map(|found| {
+            Ok(AdminActor {
+                token_id: found.try_get("token_id")?,
+                scopes: found.try_get("scopes")?,
+            })
+        })
+        .transpose()
     }
+
+    /// Enumerate credentials for review (spec "A credential's grant is
+    /// reviewable"): identity, grant, status, and lineage — NEVER the secret
+    /// or its hash (they are not even selected).
+    pub async fn list(&self) -> Result<Vec<AdminCredentialRecord>, BoxError> {
+        let rows = sqlx::query(
+            "SELECT token_id, name, status, scopes, rotated_from, created_at::text AS created_at \
+             FROM routing.admin_tokens ORDER BY created_at, token_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AdminCredentialRecord {
+                    token_id: row.try_get("token_id")?,
+                    name: row.try_get("name")?,
+                    status: row.try_get("status")?,
+                    scopes: row.try_get("scopes")?,
+                    rotated_from: row.try_get("rotated_from")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Validate + normalize a grant at write time (fail-closed backstop behind the
+/// HTTP layer's 400): non-empty, every scope in the closed vocabulary, sorted
+/// and de-duplicated so the stored form is canonical.
+fn normalized_scopes(scopes: &[String]) -> Result<Vec<String>, BoxError> {
+    if scopes.is_empty() {
+        return Err("admin credential mint requires a non-empty scope set".into());
+    }
+    for scope in scopes {
+        if !is_known_scope(scope) {
+            return Err(format!("unknown admin scope '{scope}'").into());
+        }
+    }
+    let mut normalized: Vec<String> = scopes.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 // --------------------------------------------------------------------------- //

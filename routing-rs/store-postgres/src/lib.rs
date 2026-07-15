@@ -27,7 +27,9 @@ mod membership_store;
 mod ownership_store;
 mod routing_store;
 
-pub use admin_audit::{AdminTokenHasher, IssuedAdminToken, PgAdminTokenStore, PgAuditMaintenance};
+pub use admin_audit::{
+    AdminActor, AdminTokenHasher, IssuedAdminToken, PgAdminTokenStore, PgAuditMaintenance,
+};
 pub use invalidations::PgInvalidations;
 
 /// The NOTIFY channel the control plane publishes invalidations on.
@@ -291,13 +293,16 @@ impl PgRoutingStore {
         .await?;
         // Named admin credentials (admin-action-audit D4): one row per caller,
         // peppered-HMAC hash only (never the secret), rotation lineage via
-        // `rotated_from`, revocation as a status flip.
+        // `rotated_from`, revocation as a status flip. `scopes` is the
+        // credential's grant (admin-plane-authorization): the closed scope
+        // vocabulary the authorization gate evaluates against.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS routing.admin_tokens (\
                  token_id     text PRIMARY KEY, \
                  name         text NOT NULL, \
                  token_hash   text NOT NULL UNIQUE, \
                  status       text NOT NULL DEFAULT 'active', \
+                 scopes       text[] NOT NULL DEFAULT '{}', \
                  rotated_from text, \
                  created_at   timestamptz NOT NULL DEFAULT now(), \
                  updated_at   timestamptz NOT NULL DEFAULT now())",
@@ -308,6 +313,24 @@ impl PgRoutingStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS admin_tokens_active_hash_idx \
              ON routing.admin_tokens (token_hash) WHERE status = 'active'",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Lockstep with migrations/0003_admin_token_scopes.sql: a pre-scopes
+        // database gains the column, and every credential existing at cutover
+        // is backfilled with the FULL grant (spec "Cutover preserves existing
+        // callers"). Empty-scoped rows only — mint enforces a non-empty set,
+        // so a legitimately-narrowed token can never match this again.
+        sqlx::query(
+            "ALTER TABLE routing.admin_tokens \
+             ADD COLUMN IF NOT EXISTS scopes text[] NOT NULL DEFAULT '{}'",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE routing.admin_tokens \
+             SET scopes = ARRAY['read', 'provision', 'token-admin'], updated_at = now() \
+             WHERE cardinality(scopes) = 0",
         )
         .execute(&self.pool)
         .await?;

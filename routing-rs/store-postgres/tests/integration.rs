@@ -25,9 +25,10 @@
 
 use std::env;
 
+use router_core::admin_authz::{LastTokenAdminGuard, SCOPES, SCOPE_READ, SCOPE_TOKEN_ADMIN};
 use router_core::audit::{
-    AuditCtx, AuditEventRecord, AuditQuery, DenialEvent, DenialKind, InvalidQueryBound,
-    OUTCOME_OK, OUTCOME_REPLAY,
+    AuditCtx, AuditEventRecord, AuditQuery, AuthzDenialEvent, DenialEvent, DenialKind,
+    InvalidQueryBound, OUTCOME_OK, OUTCOME_REPLAY,
 };
 use router_core::auth::RouteAuth;
 use router_core::domain::{Pool, WorkspaceConfig};
@@ -95,7 +96,16 @@ fn actx() -> AuditCtx {
         asserted_operator: Some("tester@example.com".to_owned()),
         trace_id: None,
         source_ip: Some("127.0.0.1".to_owned()),
+        authz_reason: None,
     }
+}
+
+/// The full grant (what the cutover backfill assigns) as owned strings, in
+/// the store's canonical (sorted) form — mint normalizes what it persists.
+fn full_scopes() -> Vec<String> {
+    let mut scopes: Vec<String> = SCOPES.iter().map(|scope| (*scope).to_owned()).collect();
+    scopes.sort_unstable();
+    scopes
 }
 
 /// Query the ledger for one action's events (time-ordered).
@@ -696,6 +706,7 @@ async fn events_are_complete_secret_free_and_queryable_by_filter() {
         asserted_operator: None,
         trace_id: Some("00-trace-span-01".to_owned()),
         source_ip: Some("10.1.1.1".to_owned()),
+        authz_reason: None,
     };
     store
         .upsert_membership(&membership("user_x", "ws_q", "staff", "admin"), &other)
@@ -761,35 +772,41 @@ async fn named_tokens_issue_rotate_revoke_with_lineage_and_audit() {
     let tokens = PgAdminTokenStore::new(&store, AdminTokenHasher::new(b"test-pepper"));
 
     // Two named callers, individually identifiable (spec: two callers are
-    // distinguishable in the ledger — their token ids differ).
-    let broker = tokens.issue("signup-broker", &actx()).await.unwrap();
-    let ci = tokens.issue("ci", &actx()).await.unwrap();
+    // distinguishable in the ledger — their token ids differ). Both get the
+    // full grant so the lifecycle below is exactly the pre-scopes behavior
+    // (admin-plane-authorization "Cutover preserves existing callers").
+    let full = full_scopes();
+    let broker = tokens.issue("signup-broker", &full, &actx()).await.unwrap();
+    let ci = tokens.issue("ci", &full, &actx()).await.unwrap();
     assert_ne!(broker.token_id, ci.token_id, "each caller gets its own credential id");
     assert_ne!(broker.secret, ci.secret);
 
-    // Both secrets resolve to their own ids.
-    assert_eq!(tokens.lookup(&broker.secret).await.unwrap().as_deref(), Some(broker.token_id.as_str()));
-    assert_eq!(tokens.lookup(&ci.secret).await.unwrap().as_deref(), Some(ci.token_id.as_str()));
-    assert_eq!(tokens.lookup("nexus_admin_wrong").await.unwrap(), None, "unknown secret fails closed");
+    // Both secrets resolve to their own actors — id AND grant in one lookup.
+    let broker_actor = tokens.lookup(&broker.secret).await.unwrap().expect("broker resolves");
+    assert_eq!(broker_actor.token_id, broker.token_id);
+    assert_eq!(broker_actor.scopes, full, "the grant rides along with the lookup");
+    let ci_actor = tokens.lookup(&ci.secret).await.unwrap().expect("ci resolves");
+    assert_eq!(ci_actor.token_id, ci.token_id);
+    assert!(tokens.lookup("nexus_admin_wrong").await.unwrap().is_none(), "unknown secret fails closed");
 
     // Revoking one caller leaves the other working (spec scenario).
     assert!(tokens.revoke(&ci.token_id, &actx()).await.unwrap());
-    assert_eq!(tokens.lookup(&ci.secret).await.unwrap(), None, "revoked secret is rejected");
+    assert!(tokens.lookup(&ci.secret).await.unwrap().is_none(), "revoked secret is rejected");
     assert_eq!(
-        tokens.lookup(&broker.secret).await.unwrap().as_deref(),
-        Some(broker.token_id.as_str()),
+        tokens.lookup(&broker.secret).await.unwrap().expect("still active").token_id,
+        broker.token_id,
         "the other caller's credential keeps working"
     );
     assert!(!tokens.revoke(&ci.token_id, &actx()).await.unwrap(), "second revoke is a no-op");
 
-    // Rotation: new secret under the same name, lineage recorded, old one dead.
+    // Rotation: new secret under the same name AND grant, lineage recorded,
+    // old one dead (rotation changes the secret, never the authorization).
     let rotated = tokens.rotate(&broker.token_id, &actx()).await.unwrap().expect("active token rotates");
     assert_ne!(rotated.token_id, broker.token_id);
-    assert_eq!(tokens.lookup(&broker.secret).await.unwrap(), None, "pre-rotation secret is dead");
-    assert_eq!(
-        tokens.lookup(&rotated.secret).await.unwrap().as_deref(),
-        Some(rotated.token_id.as_str())
-    );
+    assert!(tokens.lookup(&broker.secret).await.unwrap().is_none(), "pre-rotation secret is dead");
+    let rotated_actor = tokens.lookup(&rotated.secret).await.unwrap().expect("rotated resolves");
+    assert_eq!(rotated_actor.token_id, rotated.token_id);
+    assert_eq!(rotated_actor.scopes, full, "rotation preserves the grant");
     assert!(tokens.rotate(&broker.token_id, &actx()).await.unwrap().is_none(), "revoked id can't rotate");
 
     // The provisioning actions are themselves in the ledger — and no event
@@ -805,6 +822,110 @@ async fn named_tokens_issue_rotate_revoke_with_lineage_and_audit() {
             "no event may carry credential material: {serialized}"
         );
     }
+}
+
+#[tokio::test]
+async fn grants_are_explicit_reviewable_and_lockout_guarded() {
+    let (store, _pool, _guard) = skip_if_no_db!();
+    let tokens = PgAdminTokenStore::new(&store, AdminTokenHasher::new(b"test-pepper"));
+
+    // Spec "An unscoped provisioning request is refused" (store backstop; the
+    // HTTP layer answers the 400): empty and unknown scope sets never mint.
+    assert!(
+        tokens.issue("unscoped", &[], &actx()).await.is_err(),
+        "an empty scope set must refuse to mint"
+    );
+    assert!(
+        tokens.issue("bad-scope", &["root".to_owned()], &actx()).await.is_err(),
+        "an unknown scope word must refuse to mint"
+    );
+    assert!(
+        tokens.list().await.unwrap().is_empty(),
+        "a refused mint creates nothing"
+    );
+
+    // One credential administrator, one narrowed reader.
+    let admin = tokens.issue("ops-admin", &full_scopes(), &actx()).await.unwrap();
+    let reader = tokens
+        .issue("dashboard", &[SCOPE_READ.to_owned()], &actx())
+        .await
+        .unwrap();
+
+    // Spec "A credential's grant is reviewable": scopes visible with identity,
+    // no secret material anywhere in the listing.
+    let listed = tokens.list().await.unwrap();
+    assert_eq!(listed.len(), 2, "both credentials are enumerable");
+    let listed_reader = listed.iter().find(|c| c.token_id == reader.token_id).unwrap();
+    assert_eq!(listed_reader.scopes, vec![SCOPE_READ.to_owned()]);
+    assert_eq!(listed_reader.status, "active");
+    let serialized = serde_json::to_string(&listed).unwrap();
+    assert!(
+        !serialized.contains("nexus_admin_") && !serialized.contains(&admin.secret),
+        "the review surface never carries secret material"
+    );
+
+    // Spec "The last credential administrator cannot be removed": the only
+    // token-admin holder is refused with the typed guard...
+    let refused = tokens.revoke(&admin.token_id, &actx()).await;
+    assert!(
+        refused.as_ref().is_err_and(|e| e.downcast_ref::<LastTokenAdminGuard>().is_some()),
+        "revoking the last token-admin credential must surface the typed guard"
+    );
+    assert_eq!(
+        tokens.lookup(&admin.secret).await.unwrap().expect("still active").token_id,
+        admin.token_id,
+        "the refused credential remains active"
+    );
+    // ...while a second administrator makes the same revoke succeed, and a
+    // non-token-admin credential was never guarded.
+    let second = tokens
+        .issue("ops-admin-2", &[SCOPE_TOKEN_ADMIN.to_owned()], &actx())
+        .await
+        .unwrap();
+    assert!(tokens.revoke(&admin.token_id, &actx()).await.unwrap());
+    assert!(tokens.revoke(&reader.token_id, &actx()).await.unwrap(), "reader is unguarded");
+    // The survivor is now the last administrator again — guarded again.
+    assert!(
+        tokens
+            .revoke(&second.token_id, &actx())
+            .await
+            .is_err_and(|e| e.downcast_ref::<LastTokenAdminGuard>().is_some()),
+        "the guard re-engages on the new last administrator"
+    );
+
+    // Authorization denials join the ledger, attributed with a reason (spec
+    // "An authorization refusal leaves an attributed trace").
+    store
+        .record_authz_denial(&AuthzDenialEvent {
+            actor: reader.token_id.clone(),
+            class: "provision",
+            reason: "deny:no-permit".to_owned(),
+            source_ip: Some("10.2.2.2".to_owned()),
+            trace_id: None,
+        })
+        .await
+        .unwrap();
+    let denials = events_for_action(&store, "authz.denied").await;
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].actor_token_id, reader.token_id, "attributed to the actor");
+    assert_eq!(denials[0].outcome, "denied");
+    assert_eq!(denials[0].detail["action_class"], "provision");
+    assert_eq!(denials[0].detail["reason"], "deny:no-permit");
+
+    // The permitting decision reason rides recorded action events (delta 5.2):
+    // the issue events above were recorded with an authz_reason-free ctx, so
+    // exercise the merge explicitly.
+    let permitted_ctx = AuditCtx { authz_reason: Some("permit:scope-token-admin".to_owned()), ..actx() };
+    let third = tokens
+        .issue("ops-admin-3", &[SCOPE_TOKEN_ADMIN.to_owned()], &permitted_ctx)
+        .await
+        .unwrap();
+    let issues = events_for_action(&store, "admin_token.issue").await;
+    let third_event = issues.iter().find(|e| e.target_id.as_deref() == Some(third.token_id.as_str())).unwrap();
+    assert_eq!(
+        third_event.detail["authz_reason"], "permit:scope-token-admin",
+        "a recorded action carries why it was allowed"
+    );
 }
 
 #[tokio::test]

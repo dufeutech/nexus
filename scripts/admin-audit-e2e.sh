@@ -41,8 +41,12 @@ RUN=e2e-$$
 
 # ---------------------------------------------------------------------------
 section "0. mint two named tokens (attribution handles)"
-ALPHA=$(boot -H 'content-type: application/json' -X POST "$CONTROL_PLANE/admin-tokens" -d "{\"name\":\"$RUN-alpha\"}")
-BETA=$(boot  -H 'content-type: application/json' -X POST "$CONTROL_PLANE/admin-tokens" -d "{\"name\":\"$RUN-beta\"}")
+# admin-plane-authorization: scopes are REQUIRED at mint (no implicit default).
+# Full grant here — this e2e drives mutations, ledger reads, AND revokes with
+# both tokens, exactly the pre-scopes behavior (parity).
+FULL='"scopes":["read","provision","token-admin"]'
+ALPHA=$(boot -H 'content-type: application/json' -X POST "$CONTROL_PLANE/admin-tokens" -d "{\"name\":\"$RUN-alpha\",$FULL}")
+BETA=$(boot  -H 'content-type: application/json' -X POST "$CONTROL_PLANE/admin-tokens" -d "{\"name\":\"$RUN-beta\",$FULL}")
 ALPHA_ID=$(jfield "$ALPHA" token_id); ALPHA_SECRET=$(jfield "$ALPHA" secret)
 BETA_ID=$(jfield "$BETA" token_id);   BETA_SECRET=$(jfield "$BETA" secret)
 ok "$([ -n "$ALPHA_ID" ] && [ -n "$ALPHA_SECRET" ] && echo 1 || echo 0)" "token alpha minted ($ALPHA_ID)"
@@ -102,8 +106,20 @@ ok "$([ "$IC" = "401" ] && echo 1 || echo 0)" "a revoked credential + operator a
 
 # ---------------------------------------------------------------------------
 section "4. cleanup"
+# admin-plane-authorization lockout guard: if alpha is the LAST active
+# token-admin credential, its revoke is refused with 409 last_token_admin and
+# the credential stays active (spec "The last credential administrator cannot
+# be removed") — that refusal is itself a pass, and the one credential
+# deliberately remains (the next run's cleanup will revoke it once its own
+# tokens exist). Any other outcome than revoked:true / last_token_admin fails.
 CV=$(boot -X POST "$CONTROL_PLANE/admin-tokens/$ALPHA_ID/revoke")
-ok "$(printf '%s' "$CV" | grep -q '"revoked":true' && echo 1 || echo 0)" "alpha revoked (throwaway tokens never linger)"
+if printf '%s' "$CV" | grep -q '"revoked":true'; then
+  ok 1 "alpha revoked (throwaway tokens never linger)"
+elif printf '%s' "$CV" | grep -q '"error":"last_token_admin"'; then
+  ok 1 "alpha is the last credential administrator — revoke refused (lockout guard), credential retained"
+else
+  ok 0 "alpha revoke: expected revoked:true or last_token_admin, got: $CV"
+fi
 
 # ---------------------------------------------------------------------------
 echo

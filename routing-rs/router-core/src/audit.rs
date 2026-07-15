@@ -59,9 +59,13 @@ pub const ACTION_ADMIN_TOKEN_REVOKE: &str = "admin_token.revoke";
 /// Rejected admin authentication (401) — recorded best-effort, never in a
 /// mutation transaction (no mutation exists).
 pub const ACTION_AUTH_DENIED: &str = "auth.denied";
+/// Rejected admin authorization (403, admin-plane-authorization): an
+/// AUTHENTICATED actor refused by the policy gate — recorded best-effort,
+/// attributed to the actor, carrying the decision reason.
+pub const ACTION_AUTHZ_DENIED: &str = "authz.denied";
 
 /// The closed vocabulary, in one place, so membership is checkable.
-pub const ACTIONS: [&str; 16] = [
+pub const ACTIONS: [&str; 17] = [
     ACTION_ACCOUNT_PROVISION,
     ACTION_WORKSPACE_CREATE,
     ACTION_WORKSPACE_RECONFIGURE,
@@ -78,6 +82,7 @@ pub const ACTIONS: [&str; 16] = [
     ACTION_ADMIN_TOKEN_ROTATE,
     ACTION_ADMIN_TOKEN_REVOKE,
     ACTION_AUTH_DENIED,
+    ACTION_AUTHZ_DENIED,
 ];
 
 /// Whether `action` is in the closed vocabulary. The store's `record` refuses
@@ -135,6 +140,11 @@ pub struct AuditCtx {
     pub trace_id: Option<String>,
     /// Caller network source.
     pub source_ip: Option<String>,
+    /// The PERMITTING authorization decision's machine-readable reason
+    /// (admin-plane-authorization spec: recorded actions carry why they were
+    /// allowed). Set by the authorization gate on permit; `None` on paths that
+    /// bypass the gate (auth disabled, system actors).
+    pub authz_reason: Option<String>,
 }
 
 impl AuditCtx {
@@ -147,6 +157,7 @@ impl AuditCtx {
             asserted_operator: None,
             trace_id: None,
             source_ip: None,
+            authz_reason: None,
         }
     }
 }
@@ -180,6 +191,26 @@ impl DenialKind {
 pub struct DenialEvent {
     /// Whether a credential was absent or presented-but-invalid.
     pub kind: DenialKind,
+    /// Caller network source.
+    pub source_ip: Option<String>,
+    /// Request correlation (W3C `traceparent`) where present.
+    pub trace_id: Option<String>,
+}
+
+/// A rejected-authorization event (admin-plane-authorization delta on
+/// "Denied admin access is recorded"): an AUTHENTICATED actor whose grant did
+/// not cover the attempted action. Attributed — it carries the actor, the
+/// attempted action class, and the decision reason — never credential
+/// material. Recorded best-effort (no mutation exists to share a transaction
+/// with); a failed write stays a denial.
+#[derive(Debug, Clone)]
+pub struct AuthzDenialEvent {
+    /// The authenticated actor refused by the gate.
+    pub actor: String,
+    /// The attempted action class's ledger word.
+    pub class: &'static str,
+    /// The decision's machine-readable reason.
+    pub reason: String,
     /// Caller network source.
     pub source_ip: Option<String>,
     /// Request correlation (W3C `traceparent`) where present.

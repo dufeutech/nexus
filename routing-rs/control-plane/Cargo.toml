@@ -15,6 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 router-core = { path = "../router-core" }
+# admin-plane-least-privilege D1/D2: the Cedar decision-point adapter for the
+# admin authorization gate. Only the CONSTRUCTORS are referenced here (wiring);
+# every decision flows through the router_core::admin_authz port.
+routing-policy-cedar = { path = "../policy-cedar" }
 store-postgres = { path = "../store-postgres" }
 invalidations-nats = { path = "../invalidations-nats" }
 dns-resolver = { path = "../dns-resolver" }

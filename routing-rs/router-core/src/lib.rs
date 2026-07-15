@@ -11,6 +11,7 @@
 //! No vendor concretion lives here (rules §2): Postgres, Redis, and the edge
 //! transport are adapters that depend on these ports, never the reverse.
 
+pub mod admin_authz;
 pub mod audit;
 pub mod auth;
 pub mod cache;

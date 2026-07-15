@@ -1,0 +1,28 @@
+[package]
+name = "routing-policy-cedar"
+edition.workspace = true
+version.workspace = true
+description = "Cedar policy-decision-point adapter for the Nexus admin-plane authorization gate"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lib]
+name = "routing_policy_cedar"
+path = "src/lib.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+# admin-plane-least-privilege (design D1, ratified at /opsx:decide): the SAME Cedar
+# engine the identity plane adopted (adopt-cedar-policy-gate) — in-process,
+# policy-as-data with a schema validator that fails closed at load. The
+# `cedar-policy` dependency is ISOLATED to THIS crate behind the
+# router_core::admin_authz::AdminPolicyDecisionPoint port (D2); neither
+# `router-core` nor the control plane imports it, so the engine is a reversible
+# adapter swap.
+cedar-policy = "4.11"
+
+[lints]
+workspace = true

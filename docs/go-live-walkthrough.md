@@ -125,8 +125,15 @@ audit ledger". Rollback at any step = re-enable the flag.
       service's DB user at its `*_service` role (append-only enforcement);
       enable **pgAudit** on both admin databases (out-of-band access trail).
 - [ ] Mint a named token per real caller on EACH surface (signup broker, ops CLI,
-      CI): `POST /admin-tokens {"name":"…"}` — store each one-time secret in the
-      caller's secret store.
+      CI): `POST /admin-tokens {"name":"…","scopes":[…]}` — store each one-time
+      secret in the caller's secret store. On the **control plane**, scopes are
+      REQUIRED and enforced per request (admin-plane-authorization): grant least
+      privilege from the start — `provision`+`read` for provisioning automation,
+      `read` for dashboards/review, `token-admin` ONLY on the operator
+      credential(s). Use the ledger per token id to confirm each caller's real
+      action classes before narrowing further; the guard refuses to revoke the
+      last `token-admin` credential (409). Full detail: `admin-apis.md` →
+      "Authorization semantics" and "Cutover & narrowing".
 - [ ] Update every caller to its own token; watch the logs for
       "legacy shared admin token used" warnings until they stop.
 - [ ] Flip `ADMIN_LEGACY_TOKEN_OK=false` (the default) and redeploy; verify via

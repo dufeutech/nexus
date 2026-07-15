@@ -14,6 +14,7 @@
 mod app;
 mod audit_api;
 mod auth_routes;
+mod authz_gate;
 mod domains;
 mod tenancy;
 
@@ -36,9 +37,11 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use dns_resolver::DnsOwnershipProof;
+use router_core::admin_authz::{AdminPolicyDecisionPoint, DenyAllAdminPdp};
 use router_core::telemetry;
 use router_core::store::{FanoutPublisher, InvalidationPublisher};
 use invalidations_nats::NatsPublisher;
+use routing_policy_cedar::CedarAdminPdp;
 use store_postgres::{AdminTokenHasher, PgAdminTokenStore, PgAuditMaintenance, PgRoutingStore};
 
 use crate::app::{
@@ -46,9 +49,10 @@ use crate::app::{
     DenialLimiter,
 };
 use crate::audit_api::{
-    export_audit_events, issue_admin_token, list_audit_events, retention_days_from_env,
-    retention_purge, revoke_admin_token, rotate_admin_token,
+    export_audit_events, issue_admin_token, list_admin_tokens, list_audit_events,
+    retention_days_from_env, retention_purge, revoke_admin_token, rotate_admin_token,
 };
+use crate::authz_gate::require_authz;
 use crate::auth_routes::{delete_auth_route, list_auth_routes, upsert_auth_route};
 use crate::domains::{declare_domain, delete_domain, upsert_domain, verification_poll, verify_domain};
 use crate::tenancy::{
@@ -227,6 +231,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
+    // Admin authorization decision point (admin-plane-authorization D1/D2):
+    // Cedar over the grant policy — embedded defaults, or the per-environment
+    // set from ADMIN_POLICY_PATH (a directory holding admin.cedar[schema]).
+    // A load/validation failure DOES NOT fail startup (liveness and the ops
+    // surface must stay up): it installs deny-all, so every gated admin route
+    // refuses loudly until a valid policy set is in place (spec "A failed
+    // policy load denies all gated actions").
+    let policy_path = env("ADMIN_POLICY_PATH", "");
+    let pdp: Arc<dyn AdminPolicyDecisionPoint> = {
+        let loaded = if policy_path.trim().is_empty() {
+            CedarAdminPdp::with_default_policies()
+        } else {
+            CedarAdminPdp::from_path(std::path::Path::new(policy_path.trim()))
+        };
+        match loaded {
+            Ok(engine) => {
+                info!(
+                    source = %if policy_path.trim().is_empty() { "embedded" } else { policy_path.trim() },
+                    "admin authorization policy loaded"
+                );
+                Arc::new(engine)
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "admin policy load failed — installing deny-all (every gated admin \
+                     route will 403 until a valid policy set is provided)"
+                );
+                Arc::new(DenyAllAdminPdp)
+            }
+        }
+    };
+
     let app = App {
         store,
         publisher,
@@ -236,6 +273,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         challenge_ttl,
         pending_ttl,
         auth,
+        pdp,
         // Bound DENIAL ledger writes per source (design risk: scanner flooding);
         // 30/min/source keeps real break-in attempts visible without unbounded growth.
         denials: Arc::new(DenialLimiter::new(Duration::from_mins(1), 30)),
@@ -277,9 +315,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // D4/D6) — same admin gate; the ledger has NO mutation endpoints.
         .route("/audit/events", get(list_audit_events))
         .route("/audit/events/export", get(export_audit_events))
-        .route("/admin-tokens", post(issue_admin_token))
+        .route("/admin-tokens", get(list_admin_tokens).post(issue_admin_token))
         .route("/admin-tokens/{id}/rotate", post(rotate_admin_token))
         .route("/admin-tokens/{id}/revoke", post(revoke_admin_token))
+        // Gate order (admin-plane-authorization): the LAST route_layer added is
+        // OUTERMOST, so require_auth authenticates FIRST (401), then
+        // require_authz evaluates the actor's grant against the matched
+        // route's class (403). Every route above is classified in
+        // authz_gate::ROUTE_CLASSES — an unclassified route denies for all.
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_authz))
         .route_layer(middleware::from_fn_with_state(app.clone(), require_auth));
 
     // Admin API (:9400) — the data endpoints behind the token gate, plus /healthz

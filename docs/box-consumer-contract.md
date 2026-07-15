@@ -4,6 +4,9 @@
 edge (any Python/Node/Go/… service). This is the complete wire reference for
 the trusted headers the edge injects and what your box must do with them.
 
+A runnable Python reference implementation of this contract lives at
+[`examples/python/box_server.py`](examples/python/box_server.py).
+
 This document is the **header-level companion** to the canonical
 [`nexus-upstream-requirements.md`](../nexus-upstream-requirements.md) (which owns the
 cross-repo narrative and status). Where the requirements doc lists the identity subset, this

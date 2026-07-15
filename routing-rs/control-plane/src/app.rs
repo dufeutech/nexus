@@ -26,6 +26,7 @@ use opentelemetry::{global, KeyValue};
 use serde_json::json;
 use tracing::{error, warn};
 
+use router_core::admin_authz::{AdminPolicyDecisionPoint, SCOPES};
 use router_core::audit::{
     AuditCtx, DenialEvent, DenialKind, ACTOR_AUTH_DISABLED, ACTOR_LEGACY_SHARED,
     ASSERTED_OPERATOR_MAX_BYTES, TRACE_ID_MAX_BYTES,
@@ -110,6 +111,11 @@ pub(crate) struct App {
     /// migration mode. Fail-closed — the server refuses to start without an
     /// explicit choice, so it is never silently open.
     pub(crate) auth: AdminAuth,
+    /// The admin-plane authorization decision point (admin-plane-authorization
+    /// D1/D2): evaluates every authenticated admin action against the actor's
+    /// grant, behind the vendor-agnostic port. `DenyAllAdminPdp` is installed
+    /// when no valid policy set loaded, so gated routes fail closed.
+    pub(crate) pdp: Arc<dyn AdminPolicyDecisionPoint>,
     /// Per-source rate limit for DENIAL ledger writes only (an unauthenticated
     /// scanner must not flood the ledger); mutation events are never limited.
     pub(crate) denials: Arc<DenialLimiter>,
@@ -299,16 +305,33 @@ fn asserted_operator(headers: &HeaderMap) -> Result<Option<String>, Box<Response
     Ok(Some(value.to_owned()))
 }
 
+/// The authenticated actor's grant, attached to the request by [`require_auth`]
+/// for the authorization gate to evaluate (admin-plane-authorization). Default
+/// is EMPTY — absent-grant paths deny-by-default, never permit.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ActorGrant(pub(crate) Vec<String>);
+
+/// The full grant — what the reserved `legacy-shared` actor holds while the
+/// migration flag keeps it alive (design D4: the crutch keeps its
+/// deprecation-warned full power and dies on schedule).
+fn full_grant() -> Vec<String> {
+    SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
+}
+
 /// Resolve a presented bearer secret to its individually identifiable actor id
-/// (admin-action-audit D4/D5): a named token's id via the peppered-hash lookup,
-/// or the reserved `legacy-shared` id while the migration flag allows the old
+/// AND its grant (admin-action-audit D4/D5 + admin-plane-authorization): a
+/// named token's id/scopes via the one peppered-hash lookup, or the reserved
+/// `legacy-shared` id (full grant) while the migration flag allows the old
 /// shared token (compared in constant time, deprecation-warned per use).
 /// `None` = not authenticated.
-async fn resolve_actor(auth: &AdminAuth, presented: &str) -> Result<Option<String>, BoxError> {
+async fn resolve_actor(
+    auth: &AdminAuth,
+    presented: &str,
+) -> Result<Option<(String, Vec<String>)>, BoxError> {
     if let Some(tokens) = &auth.tokens
-        && let Some(token_id) = tokens.lookup(presented).await?
+        && let Some(actor) = tokens.lookup(presented).await?
     {
-        return Ok(Some(token_id));
+        return Ok(Some((actor.token_id, actor.scopes)));
     }
     if auth.legacy_ok
         && let Some(legacy) = auth.legacy.as_deref()
@@ -318,7 +341,7 @@ async fn resolve_actor(auth: &AdminAuth, presented: &str) -> Result<Option<Strin
             "legacy shared admin token used (ADMIN_LEGACY_TOKEN_OK=true) — provision a named \
              token for this caller and flip the flag off (admin-action-audit migration)"
         );
-        return Ok(Some(ACTOR_LEGACY_SHARED.to_owned()));
+        return Ok(Some((ACTOR_LEGACY_SHARED.to_owned(), full_grant())));
     }
     Ok(None)
 }
@@ -362,8 +385,10 @@ pub(crate) async fn require_auth(State(s): State<App>, mut req: Request, next: N
         .map(|info| info.0.ip().to_string());
     let trace_id = header_capped(req.headers(), "traceparent", TRACE_ID_MAX_BYTES);
 
-    let actor = if s.auth.disabled {
-        ACTOR_AUTH_DISABLED.to_owned()
+    let (actor, grant) = if s.auth.disabled {
+        // Authorization is bypassed with authentication (the whole gate is
+        // explicitly off — trusted-network/dev only), so the grant is unread.
+        (ACTOR_AUTH_DISABLED.to_owned(), Vec::new())
     } else {
         // Parse `Authorization: Bearer <token>` with the vetted `headers`
         // typed-header parser (RFC 7235: case-insensitive scheme, correct
@@ -378,8 +403,8 @@ pub(crate) async fn require_auth(State(s): State<App>, mut req: Request, next: N
             },
             None => None,
         };
-        if let Some(actor) = resolved {
-            actor
+        if let Some(actor_and_grant) = resolved {
+            actor_and_grant
         } else {
             METRICS.mutations.add(1, &[KeyValue::new("op", "unauthorized")]);
             // Method + path only — never the presented credential. `had_bearer`
@@ -405,7 +430,11 @@ pub(crate) async fn require_auth(State(s): State<App>, mut req: Request, next: N
         asserted_operator: operator,
         trace_id,
         source_ip,
+        // Set by the authorization gate on permit (admin-plane-authorization);
+        // stays None on paths that bypass it (auth disabled).
+        authz_reason: None,
     });
+    let _prior_grant = req.extensions_mut().insert(ActorGrant(grant));
     next.run(req).await
 }
 
@@ -470,6 +499,7 @@ mod denial_write_failure_tests {
 
     use async_trait::async_trait;
 
+    use router_core::admin_authz::DenyAllAdminPdp;
     use router_core::domain::PoolSet;
     use router_core::plan::PlanLimits;
     use router_core::store::{BoxError, InvalidationPublisher};
@@ -511,6 +541,7 @@ mod denial_write_failure_tests {
             challenge_ttl: 60,
             pending_ttl: 0,
             auth: AdminAuth { disabled: false, tokens: None, legacy: None, legacy_ok: false },
+            pdp: Arc::new(DenyAllAdminPdp),
             denials: Arc::new(DenialLimiter::new(Duration::from_mins(1), 30)),
         };
         let response = deny(&app, true, (Some("10.0.0.9".to_owned()), None)).await;

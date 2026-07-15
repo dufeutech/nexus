@@ -35,6 +35,7 @@ Machine-readable specs (OpenAPI 3.1) mirror these routes — see
 docs, and validate:
 [`openapi/authz-admin.yaml`](openapi/authz-admin.yaml),
 [`openapi/control-plane.yaml`](openapi/control-plane.yaml).
+Runnable Python examples for every flow below: [`examples/python/`](examples/python/README.md).
 
 ---
 
@@ -290,32 +291,72 @@ Both surfaces share this machinery (per plane — two independent ledgers and to
 tables that merge cleanly by event time on export). Everything below works the same
 on `$AUTHZ` and `$CP`; examples use `$CP`.
 
-### Named admin tokens — `POST /admin-tokens`, `…/{id}/rotate`, `…/{id}/revoke`
+### Named admin tokens — `GET/POST /admin-tokens`, `…/{id}/rotate`, `…/{id}/revoke`
 
 > Requires `ADMIN_TOKEN_PEPPER` on the service (a separate secret from
-> `APIKEY_HMAC_PEPPER`; generate with `openssl rand -hex 32`). Unset → these three
+> `APIKEY_HMAC_PEPPER`; generate with `openssl rand -hex 32`). Unset → these
 > endpoints return `503 admin_token_mgmt_unconfigured`.
 
-Each **caller** gets its own credential — attribution, not authorization (every
-token grants the same admin surface):
+Each **caller** gets its own credential. On the **control plane** a credential also
+carries its **grant** (admin-plane-authorization): an explicit, non-empty set of
+scopes evaluated on every request, deny-by-default —
+
+| Scope | Grants |
+|---|---|
+| `read` | all GETs: tenancy/domain/auth-route reads, audit query/export |
+| `provision` | platform-data mutations: accounts, workspaces, members, domains, auth-routes |
+| `token-admin` | credential administration: mint/rotate/revoke/list admin tokens — **no other scope includes it**, so an ordinary token can never mint its own successor |
+
+(authz-admin `:9300` named tokens remain attribution-only for now.)
 
 ```sh
-# issue — the plaintext secret is returned ONCE, in "secret". Store it now.
+# issue — scopes are REQUIRED (no default; [] and unknown words are 400).
+# The plaintext secret is returned ONCE, in "secret". Store it now.
 curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -H 'content-type: application/json' \
-  -X POST "$CP/admin-tokens" -d '{"name":"signup-broker"}'
+  -X POST "$CP/admin-tokens" -d '{"name":"signup-broker","scopes":["provision","read"]}'
 ```
 ```json
 { "token_id": "atk_…", "secret": "nexus_admin_<plaintext-once>" }
 ```
 ```sh
-# rotate — no body; new secret under the same name (lineage kept), old one dead. 201, same shape.
+# list — review every credential's grant/status/lineage (never secret material).
+curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" "$CP/admin-tokens"
+# rotate — no body; new secret under the same name AND grant (rotation changes the
+# secret, never the authorization); lineage kept, old one dead. 201, same shape.
 curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -X POST "$CP/admin-tokens/$TOKEN_ID/rotate"
 # revoke — no body; idempotent; every OTHER caller's token keeps working.
+# 409 last_token_admin if this is the LAST active token-admin credential (lockout guard).
 curl -s -H "authorization: Bearer $CONTROL_AUTH_TOKEN" -X POST "$CP/admin-tokens/$TOKEN_ID/revoke"
 ```
 
 Only the secret's peppered HMAC is stored; verification is one indexed lookup.
-Issue/rotate/revoke are themselves audited (`admin_token.*`).
+Issue/rotate/revoke are themselves audited (`admin_token.*`), with the grant in the
+event detail.
+
+**Authorization semantics (admin-plane-authorization).** After authentication
+(401s unchanged), every route is classified `read` / `provision` / `token-admin` and
+the actor's grant must contain the class — otherwise **403
+`{"error":"forbidden","reason":…}`**, recorded on the ledger as `authz.denied`
+attributed to the actor. Permitted mutations carry the permitting policy id in the
+event detail (`authz_reason`). The policy is data (`admin.cedar[schema]`,
+`ADMIN_POLICY_PATH`; embedded defaults otherwise); a malformed set fails closed —
+every gated route 403s until fixed. The reserved actors keep their posture:
+`auth-disabled` bypasses the gate entirely, `legacy-shared` holds the full grant
+while `ADMIN_LEGACY_TOKEN_OK=true`.
+
+**Cutover & narrowing (rollback: revert the image — the `scopes` column is additive
+and ignored by the old binary).**
+
+1. Deploy: the migration (`0003_admin_token_scopes.sql`, also run at startup)
+   backfills every existing token with the FULL grant — nothing breaks (parity).
+2. Watch the ledger per token id to learn each caller's real action classes, then
+   mint narrowed replacements (`provision`+`read` for provisioning automation,
+   `read` for dashboards) and cut callers over one at a time.
+3. Revoke or de-scope the over-broad originals. Keep `token-admin` on the operator
+   credential(s) only — the guard refuses to revoke the last one
+   (`409 last_token_admin`); break-glass if all credential admins are somehow lost:
+   `ADMIN_LEGACY_TOKEN_OK=true` + the shared token (full grant) mints a fresh
+   `token-admin` credential, then flip the flag back off.
 
 **Legacy shared-token migration (BREAKING).** The old single shared token per
 surface no longer authenticates by itself — the service refuses to start unless

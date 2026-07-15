@@ -22,6 +22,7 @@ use serde_json::json;
 use tokio::time::interval;
 use tracing::{error, info, warn};
 
+use router_core::admin_authz::{is_known_scope, LastTokenAdminGuard};
 use router_core::audit::{AuditCtx, AuditQuery, InvalidQueryBound};
 use router_core::store::BoxError;
 use store_postgres::{PgAuditMaintenance, PgRoutingStore};
@@ -256,10 +257,14 @@ pub(crate) struct IssueTokenBody {
     /// The named caller this credential is issued to (e.g. `signup-broker`,
     /// `ops-cli`, `ci`). Attribution, not authorization.
     name: String,
+    /// The credential's grant (admin-plane-authorization: "Grants are explicit
+    /// at provisioning") — REQUIRED and non-empty; there is no implicit
+    /// default. Each entry must be in the closed scope vocabulary.
+    scopes: Vec<String>,
 }
 
-/// `POST /admin-tokens` — issue a named credential. The secret is returned
-/// exactly once and never persisted or logged.
+/// `POST /admin-tokens` — issue a named credential with an explicit grant.
+/// The secret is returned exactly once and never persisted or logged.
 pub(crate) async fn issue_admin_token(
     State(s): State<App>,
     Extension(actx): Extension<AuditCtx>,
@@ -272,16 +277,48 @@ pub(crate) async fn issue_admin_token(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name_required" }))).into_response();
     }
-    match tokens.issue(name, &actx).await {
+    // Fail-closed at the boundary (spec "An unscoped provisioning request is
+    // refused"): no scopes → 400, an unknown scope word → 400; nothing mints.
+    if body.scopes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "scopes_required",
+                "hint": "grant an explicit, non-empty scope set (read, provision, token-admin)",
+            })),
+        )
+            .into_response();
+    }
+    if let Some(unknown) = body.scopes.iter().find(|scope| !is_known_scope(scope)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown_scope", "scope": unknown })),
+        )
+            .into_response();
+    }
+    match tokens.issue(name, &body.scopes, &actx).await {
         Ok(issued) => {
             METRICS.mutations.add(1, &[KeyValue::new("op", "issue_admin_token")]);
-            info!(token_id = %issued.token_id, name, "admin token issued");
+            info!(token_id = %issued.token_id, name, scopes = ?body.scopes, "admin token issued");
             (
                 StatusCode::CREATED,
                 Json(json!({ "token_id": issued.token_id, "secret": issued.secret })),
             )
                 .into_response()
         }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /admin-tokens` — enumerate credentials for review (spec "A
+/// credential's grant is reviewable"): identity, grant, status, lineage —
+/// never secret material (the store does not even select it).
+pub(crate) async fn list_admin_tokens(State(s): State<App>) -> Response {
+    let Some(tokens) = s.auth.tokens.as_ref() else {
+        return token_mgmt_unconfigured();
+    };
+    match tokens.list().await {
+        Ok(records) => (StatusCode::OK, Json(json!({ "tokens": records }))).into_response(),
         Err(e) => internal(e),
     }
 }
@@ -316,7 +353,10 @@ pub(crate) async fn rotate_admin_token(
 }
 
 /// `POST /admin-tokens/{id}/revoke` — status flip; idempotent (`revoked: false`
-/// when the id was already revoked or unknown).
+/// when the id was already revoked or unknown). Refuses with 409 when the
+/// target is the LAST active `token-admin` credential (spec "The last
+/// credential administrator cannot be removed") — the lockout hazard is named,
+/// and the credential stays active.
 pub(crate) async fn revoke_admin_token(
     State(s): State<App>,
     Path(token_id): Path<String>,
@@ -331,6 +371,15 @@ pub(crate) async fn revoke_admin_token(
             info!(%token_id, revoked, "admin token revoke");
             (StatusCode::OK, Json(json!({ "result": "ok", "revoked": revoked }))).into_response()
         }
+        Err(e) if e.downcast_ref::<LastTokenAdminGuard>().is_some() => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "last_token_admin",
+                "reason": e.to_string(),
+                "token_id": token_id,
+            })),
+        )
+            .into_response(),
         Err(e) => internal(e),
     }
 }

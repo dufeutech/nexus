@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["router-core", "store-postgres", "cache-redis", "invalidations-nats", "dns-resolver", "tenant-router", "control-plane"]
+members = ["router-core", "store-postgres", "cache-redis", "invalidations-nats", "dns-resolver", "tenant-router", "control-plane", "policy-cedar"]
 
 [workspace.package]
 edition = "2024"

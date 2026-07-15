@@ -1,0 +1,18 @@
+// Admin-plane authorization schema (admin-plane-least-privilege D3).
+//
+// One principal type: the named admin credential, carrying its granted scope
+// set. One resource type: the admin surface — its id is the forward-
+// compatibility seam for per-tenant grants (design D6), deliberately unread by
+// the parity policy. Three actions, one per route class the control plane
+// registers its admin routes into.
+
+entity AdminToken = {
+  scopes: Set<String>,
+};
+
+entity AdminSurface;
+
+action "read", "provision", "token-admin" appliesTo {
+  principal: [AdminToken],
+  resource: [AdminSurface],
+};

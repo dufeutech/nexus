@@ -8,8 +8,10 @@ plane, written in the same transaction as the mutation it describes — an unrec
 admin mutation does not commit. Admin credentials are **individually identifiable**
 (one named token per caller, rotatable and revocable independently), so every event
 names who acted; callers may additionally assert the human operator they act for,
-recorded verbatim and never trusted for authorization. Denied authentications leave a
-trace; idempotent replays are visible as replays; the bootstrap grant is covered; and
+recorded verbatim and never trusted for authorization. Denied access leaves a trace —
+rejected authentications and authorization refusals alike (the latter attributed to the
+actor with the decision reason, per `admin-plane-authorization`);
+idempotent replays are visible as replays; the bootstrap grant is covered; and
 each surface exposes a read/query + export path over its own ledger with a governed
 retention window. Deliberately NOT telemetry: the ledger never rides the fail-open
 collection layer. Provides the SOC 2 CC6.x/CC7.2/CC8.1 administrative-action evidence.
@@ -113,10 +115,14 @@ influence authentication, authorization, or the outcome of the action in any way
 
 ### Requirement: Denied admin access is recorded
 
-The system SHALL record an audit event for every rejected authentication attempt on
-an admin surface, carrying the time, surface, source, and the fact that a credential
-was absent or invalid — without recording the presented credential material. A
-failure to record a denial SHALL never convert the denial into an acceptance.
+The system SHALL record an audit event for every denied request on an admin surface
+— both a rejected authentication attempt and an authenticated action refused by
+authorization. An authentication denial SHALL carry the time, surface, source, and
+the fact that a credential was absent or invalid — without recording the presented
+credential material. An authorization denial SHALL carry the time, surface, source,
+the authenticated actor's identity, the attempted action, and the machine-readable
+decision reason. A failure to record a denial SHALL never convert the denial into
+an acceptance.
 
 #### Scenario: A failed authentication leaves a trace
 
@@ -124,6 +130,19 @@ failure to record a denial SHALL never convert the denial into an acceptance.
   surface
 - **THEN** a denial event is recorded with time, surface, and source, and the
   presented credential value appears nowhere in it
+
+#### Scenario: An authorization refusal leaves an attributed trace
+
+- **WHEN** an authenticated actor's action is refused because its grant lacks the
+  required scope
+- **THEN** a denial event is recorded with time, surface, source, the actor's
+  identity, the attempted action, and the decision reason
+
+#### Scenario: A failed denial write stays a denial
+
+- **WHEN** recording an authorization denial fails
+- **THEN** the request remains refused and the recording failure is surfaced
+  operationally
 
 ### Requirement: Idempotent replays are audited as replays
 

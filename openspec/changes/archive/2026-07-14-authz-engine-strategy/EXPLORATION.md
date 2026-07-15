@@ -125,3 +125,27 @@ reversible boundary). De-risks both.
 3. Leave L3/OpenFGA parked here until §6.5 and the D DB fork resolve.
 4. Unrelated and independent: `b-floor-trust-hardening` proceeds on its own (it does not depend on
    the authz-engine work).
+
+---
+
+## Closure (2026-07-14) — exploration executed; archiving
+
+Every actionable output of this exploration has landed or been decided:
+
+- **L2 / Cedar: SHIPPED.** `adopt-cedar-policy-gate` implemented, verified, and archived
+  (2026-07-09). Engine embedded in `identity-rs/policy-cedar`; behavior synced to the main
+  `authorization-policy-engine` spec. Next-steps 1–2 above are done.
+- **L3 / OpenFGA: PARKED on product, not infra.** Infra gate resolved (store = CNPG/Postgres).
+  Product gate failed on scan (no nested/inherited per-resource sharing model exists anywhere;
+  products live outside this repo as boxes). **Re-open condition:** a first-wave product with a
+  real resource graph (Drive-shaped nested/inherited sharing) to model against. Recorded in the
+  `project-multi-product-platform` memory; nothing further for a repo change to track.
+- **L1 / commerce plane: still future.** Entitlements remain Profile flags fed to Cedar as
+  context; a real licensing plane becomes its own change when billing/plans work begins.
+- **Successor identified — admin-plane least privilege (L2, second consumer).** The control
+  plane's admin surface authenticates named tokens (`admin-action-audit`) but authorizes nothing:
+  every authenticated token can call every route on `:9400`, including `POST /admin-tokens`
+  (mint) — one leaked token is full control-plane takeover with self-persistence. The
+  `authorization-policy-engine` spec already frames the edge gate as only "the first consumer."
+  Scoping admin tokens via the already-adopted engine is the natural next slice; proposed
+  separately (not part of this strategy exploration, and not claimed by `platform-ha-and-hardening`).
