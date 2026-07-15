@@ -1,88 +1,20 @@
-{{- if .Values.metrics.prometheusRule.enabled -}}
-{{- $t := .Values.metrics.prometheusRule.thresholds -}}
-# Nexus-authored application-SLO alert rules (first-party-telemetry) — the twin of
-# serviceMonitor. Consumed by the Prometheus Operator OR the VictoriaMetrics
-# operator/vmalert; nexus AUTHORS, your engine EVALUATES. The `result`/`op` rules need
+{{- if eq .Values.monitoring.delivery "operator" -}}
+# operator-form delivery (monitoring.delivery=operator): nexus-authored application-SLO
+# alert rules as a PrometheusRule CR, consumed by the Prometheus Operator OR the
+# VictoriaMetrics operator/vmalert. The rule bodies come from the shared
+# "routing-plane.appSloGroups" helper, so the files-form ConfigMap
+# (monitoring-rules-files.yaml) ships byte-identical content. The `result`/`op` rules need
 # your OTel collector to KEEP those attributes (see the identity-plane note); the edge
-# rule uses Envoy's SCRAPED admin stats and is collector-independent.
+# rule uses Envoy's SCRAPED admin stats and is collector-independent. Requires that operator's CRD.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: {{ include "routing-plane.fullname" . }}-app-slo
   labels:
     {{- include "routing-plane.labels" . | nindent 4 }}
-    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- with .Values.monitoring.operator.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  groups:
-    - name: nexus-routing.slo
-      rules:
-        - alert: NexusRoutingNotReady
-          expr: router_ready == 0
-          for: 10m
-          labels: { severity: critical, plane: routing }
-          annotations:
-            summary: "Tenant-router not ready"
-            description: >-
-              The tenant-router has reported not-ready (warming, or its routing store is
-              unreachable) for 10m. Host→workspace resolution fails closed while it is
-              down, so requests cannot be routed.
-        - alert: NexusRoutingLatencyHigh
-          expr: histogram_quantile(0.99, sum by (le) (rate(router_ext_proc_duration_seconds_bucket[5m]))) > {{ $t.routingP99Seconds }}
-          for: 10m
-          labels: { severity: warning, plane: routing }
-          annotations:
-            summary: "Routing decision p99 latency high"
-            description: >-
-              Tenant-router ext_proc p99 has been above {{ $t.routingP99Seconds }}s for
-              10m — the routing decision (a cache lookup, or a store read on a miss) is
-              slow and sits in front of every request.
-        - alert: NexusRoutingRejectSpike
-          expr: sum(rate(router_ext_proc_requests_total{result="reject"}[5m])) > {{ $t.rejectPerSecond }}
-          for: 10m
-          labels: { severity: warning, plane: routing }
-          annotations:
-            summary: "Routing unknown-host reject spike"
-            description: >-
-              The edge is rejecting requests for unknown/unverified hosts (404, C18)
-              above {{ $t.rejectPerSecond }}/s for 10m — a missing/unverified domain
-              registration or host-probing. Needs the `result` attribute kept by your
-              collector.
-        - alert: NexusControlPlaneUnauthorizedSpike
-          expr: sum(rate(control_mutations_total{op="unauthorized"}[5m])) > {{ $t.unauthorizedPerSecond }}
-          for: 10m
-          labels: { severity: warning, plane: routing }
-          annotations:
-            summary: "Control-plane unauthorized (401) spike"
-            description: >-
-              The routing control plane is rejecting admin requests (401) above
-              {{ $t.unauthorizedPerSecond }}/s for 10m — a bad/rotated CONTROL_AUTH_TOKEN
-              or unauthorized attempts against the routing store. Needs the `op`
-              attribute kept by your collector.
-    {{- if .Values.edge.enabled }}
-    - name: nexus-edge.slo
-      rules:
-        - alert: NexusEdge5xxHigh
-          expr: |
-            sum(rate(envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="edge"}[5m]))
-              / sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m]))
-              > {{ $t.edge5xxRatio }}
-          for: 5m
-          labels: { severity: critical, plane: edge }
-          annotations:
-            summary: "Edge 5xx ratio high"
-            description: >-
-              More than {{ $t.edge5xxRatio }} of edge responses were 5xx over 5m — the
-              edge or a backend pool is failing. Envoy admin stats (scraped).
-        - alert: NexusEdgeLatencyHigh
-          expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }}
-          for: 10m
-          labels: { severity: warning, plane: edge }
-          annotations:
-            summary: "Edge request p99 latency high"
-            description: >-
-              Edge downstream request p99 has been above {{ $t.edgeP99Milliseconds }}ms
-              for 10m (Envoy `downstream_rq_time` is in milliseconds).
-    {{- end }}
+  {{- include "routing-plane.appSloGroups" . | nindent 2 }}
 {{- end }}

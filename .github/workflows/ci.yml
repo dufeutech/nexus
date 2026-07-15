@@ -162,11 +162,12 @@ jobs:
           ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing \
                 --set oidc.jwksTls.enabled=true \
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
-          # Also exercise the opt-in monitoring artifacts (PrometheusRule + dashboards).
-          MON="--set metrics.prometheusRule.enabled=true --set dashboards.enabled=true"
           helm lint identity-plane $ARGS
+          # Default render exercises the files delivery form (monitoring.delivery=files);
+          # this one exercises the operator form (PrometheusRule + PodMonitor + sidecar
+          # dashboards). See the monitoring-delivery job for the full 3-mode matrix.
           helm template rel identity-plane $ARGS >/dev/null
-          helm template rel identity-plane $ARGS $MON >/dev/null
+          helm template rel identity-plane $ARGS --set monitoring.delivery=operator >/dev/null
 
       - name: Lint & render routing-plane
         run: |
@@ -175,8 +176,8 @@ jobs:
           BASE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
           helm lint routing-plane $BASE
           helm template rel routing-plane $BASE >/dev/null
-          # Opt-in monitoring artifacts (PrometheusRule + dashboards).
-          helm template rel routing-plane $BASE --set metrics.prometheusRule.enabled=true --set dashboards.enabled=true >/dev/null
+          # Operator delivery form (files is the default, rendered above).
+          helm template rel routing-plane $BASE --set monitoring.delivery=operator >/dev/null
           helm template rel routing-plane $BASE --set postgres.readUrl=postgres://u:p@pgbouncer:6432/routing >/dev/null
           # Exercise the auth-disabled path and the broker-only NetworkPolicy helpers.
           helm template rel routing-plane --set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.enabled=false >/dev/null
@@ -194,11 +195,11 @@ jobs:
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint edge-platform $ARGS
           helm template rel edge-platform $ARGS >/dev/null
-          # Opt-in monitoring artifacts across the umbrella + both subcharts.
+          # Operator delivery form across the umbrella + both subcharts (files is default).
           helm template rel edge-platform $ARGS \
-            --set metrics.prometheusRule.enabled=true \
-            --set identity-plane.metrics.prometheusRule.enabled=true --set identity-plane.dashboards.enabled=true \
-            --set routing-plane.metrics.prometheusRule.enabled=true --set routing-plane.dashboards.enabled=true >/dev/null
+            --set monitoring.delivery=operator \
+            --set identity-plane.monitoring.delivery=operator \
+            --set routing-plane.monitoring.delivery=operator >/dev/null
 
       # Fail-closed guard matrix (production-readiness-gate): asserts that a
       # topology missing an origin-enforcement or JWKS-integrity choice REFUSES
@@ -209,6 +210,46 @@ jobs:
       - name: Guard assertions (origin trust + JWKS integrity + designation)
         working-directory: .
         run: bash scripts/helm-guards-test.sh
+
+  # portable-monitoring-delivery: the SLO rules are single-sourced (Sloth) and shipped in
+  # BOTH delivery forms (operator CRDs and operator-less ConfigMaps) from identical
+  # content. This job proves (1) the generated rules are not stale, (2) they are valid
+  # PORTABLE PromQL and their burn-rate unit tests pass (promtool), and (3) every chart
+  # renders under all three monitoring.delivery values.
+  monitoring-delivery:
+    name: monitoring delivery (rules + chart matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: SLO rules — regen determinism + promtool (portability + burn tests)
+        run: |
+          # Regenerating from the Sloth specs must leave a CLEAN diff — a stale rules
+          # dir or chart staging fails here (single source of truth).
+          ./monitoring/slo/generate.sh
+          git diff --exit-code -- monitoring/prometheus/rules deploy/helm/*/files/slo \
+            || { echo '::error::SLO rules are stale — run monitoring/slo/generate.sh and commit'; exit 1; }
+          # promtool: valid portable PromQL (the portability guard) + burn-rate unit tests.
+          ./monitoring/slo/check.sh
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Render every chart under each delivery form
+        working-directory: deploy/helm
+        run: |
+          IDENT="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing --set oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
+          ROUTE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
+          helm dependency update edge-platform >/dev/null
+          EDGE="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity --set identity-plane.authzAdmin.adminToken=ci-dummy --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing --set routing-plane.postgres.url=postgres://u:p@h:5432/routing --set routing-plane.controlPlane.auth.token=ci-dummy --set identity-plane.oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
+          for mode in files operator otlp-only; do
+            echo "== monitoring.delivery=$mode =="
+            helm template rel identity-plane $IDENT --set monitoring.delivery=$mode >/dev/null
+            helm template rel routing-plane  $ROUTE --set monitoring.delivery=$mode >/dev/null
+            helm template rel edge-platform  $EDGE  --set monitoring.delivery=$mode \
+              --set identity-plane.monitoring.delivery=$mode \
+              --set routing-plane.monitoring.delivery=$mode >/dev/null
+          done
 
   # Release gate (production-readiness-gate 6.4): boot the reference topology
   # from a CLEAN checkout (no .env, auth ENABLED — production parity) and run

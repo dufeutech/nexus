@@ -1,13 +1,13 @@
-{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{- if eq .Values.monitoring.delivery "operator" -}}
 {{- $fullName := include "identity-plane.fullname" . -}}
-{{- $labels := .Values.metrics.serviceMonitor.labels -}}
-{{- $interval := .Values.metrics.serviceMonitor.interval -}}
-# first-party-telemetry (Change B): the identity-plane Rust services (sidecar,
-# authz-admin, membership-sync) NO LONGER expose scrape endpoints — they
-# PUSH OTLP metrics to the collector (one endpoint env; see deploy/README.md
-# "Telemetry"). Their ServiceMonitors and the sidecar PodMonitor scrape target were
-# retired. Only Envoy's own admin stats (:9901), outside the box telemetry contract,
-# remain scrape-based.
+{{- $labels := .Values.monitoring.operator.labels -}}
+{{- $interval := .Values.monitoring.operator.scrapeInterval -}}
+# operator-form delivery: first-party-telemetry (Change B) — the identity-plane Rust
+# services (sidecar, authz-admin, membership-sync) NO LONGER expose scrape endpoints;
+# they PUSH OTLP metrics to the collector (one endpoint env; see deploy/README.md
+# "Telemetry"). Only Envoy's own admin stats (:9901), outside the box telemetry
+# contract, remain scrape-based — via this PodMonitor. On operator-less clusters
+# (monitoring.delivery=files) the equivalent Envoy scrape is wired by the platform, not here.
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:

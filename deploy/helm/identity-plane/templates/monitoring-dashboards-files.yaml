@@ -1,0 +1,21 @@
+{{- if eq .Values.monitoring.delivery "files" }}
+# operator-INDEPENDENT dashboard delivery: the SAME dashboard JSON as the operator form,
+# shipped as ConfigMaps WITHOUT the Grafana-sidecar discovery label — a file-provider
+# Grafana (as on infra-v1 and in the lab) mounts these into the "Nexus" folder. One
+# ConfigMap per dashboards/*.json.
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "identity-plane.fullname" $ }}-dash-{{ base $path | trimSuffix ".json" }}
+  labels:
+    {{- include "identity-plane.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: grafana-dashboard
+  annotations:
+    nexus.dev/grafana-folder: {{ $.Values.monitoring.dashboards.folder | quote }}
+data:
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

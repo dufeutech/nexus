@@ -36,6 +36,30 @@ receivers:
         # OTLP/HTTP for host-side test payloads and http-exporting producers.
         endpoint: 0.0.0.0:4318
 
+  prometheus:
+    # The few remaining PULL targets, folded into the single egress (change:
+    # victoriametrics-delivery — the operator-independent replacement for the retired
+    # standalone Prometheus's scrape jobs): Envoy's admin stats (outside the box
+    # contract), the collector's own self-telemetry, and Loki's limit counters.
+    # Everything else PUSHES OTLP. These scraped series must NOT pass the cardinality
+    # collapse below (they carry Envoy's edge labels the edge rules key on), so they
+    # ride a separate pipeline.
+    config:
+      scrape_configs:
+        - job_name: envoy
+          metrics_path: /stats/prometheus
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["envoy:9901"]
+        - job_name: otel-collector
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["localhost:8888"]
+        - job_name: loki
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["loki:3100"]
+
 processors:
   # Self-protection (telemetry-cost-controls): the collector must not OOM under a
   # volume flood — it soft-limits memory, refusing incoming data (and applying
@@ -99,11 +123,12 @@ exporters:
     tls:
       insecure: true
 
-  otlphttp/prometheus:
-    # Metrics store: Prometheus 3.x native OTLP receiver (push path — a new
-    # box needs zero scrape coordination). The exporter appends /v1/metrics,
-    # so the env value is the base, e.g. http://prometheus:9090/api/v1/otlp.
-    endpoint: ${env:PROMETHEUS_OTLP_ENDPOINT}
+  otlphttp/victoriametrics:
+    # Metrics store: VictoriaMetrics native OTLP ingestion (push path — a new box
+    # needs zero scrape coordination). The exporter appends /v1/metrics, so the env
+    # value is the base, e.g. http://victoria-metrics:8428/opentelemetry ->
+    # /opentelemetry/v1/metrics (change: victoriametrics-delivery).
+    endpoint: ${env:VM_OTLP_ENDPOINT}
     tls:
       insecure: true
 
@@ -135,12 +160,18 @@ service:
       # batch only.
       processors: [memory_limiter, batch]
       exporters: [otlp/tempo]
-    metrics:
+    metrics/push:
+      # Boxes' OTLP metrics push: cardinality guard sits between the limiter and
+      # the batcher: collapse high-cardinality attributes before export to VM.
       receivers: [otlp]
-      # Cardinality guard sits between the limiter and the batcher: collapse
-      # high-cardinality attributes before they are batched toward Prometheus.
       processors: [memory_limiter, transform/cardinality, batch]
-      exporters: [otlphttp/prometheus]
+      exporters: [otlphttp/victoriametrics]
+    metrics/scrape:
+      # Pulled targets (Envoy admin, collector self, Loki): NO cardinality collapse —
+      # they carry the low-cardinality Envoy edge labels the edge rules key on.
+      receivers: [prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/victoriametrics]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]

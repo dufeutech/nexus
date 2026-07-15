@@ -1,18 +1,18 @@
-{{- if .Values.metrics.prometheusRule.enabled -}}
-# Sloth-GENERATED multi-window burn-rate SLO rules (change: slo-burn-rate-policy).
-# The rule bodies are compiled from monitoring/slo/identity-sidecar.slo.yaml by Sloth and
-# staged into files/slo/ by monitoring/slo/generate.sh — DO NOT hand-edit the embedded
-# rules; regenerate instead. This template only wraps them in a PrometheusRule CR so the
-# SAME rules a clean checkout evaluates locally also ship to production. Gated by the same
-# metrics.prometheusRule.enabled flag as the hand-authored threshold alerts; the rules key
-# on the `result` attribute + the promoted deployment.environment.name label (per-env SLOs).
+{{- if eq .Values.monitoring.delivery "operator" -}}
+# operator-form delivery: Sloth-GENERATED multi-window burn-rate SLO rules
+# (change: slo-burn-rate-policy) wrapped in a PrometheusRule CR. The rule bodies are
+# compiled from monitoring/slo/identity-sidecar.slo.yaml by Sloth and staged into
+# files/slo/ by monitoring/slo/generate.sh — DO NOT hand-edit; regenerate instead. The
+# files-form ConfigMap (monitoring-rules-files.yaml) embeds the SAME file, so both
+# delivery forms evaluate identical burn-rate rules. The rules key on the `result`
+# attribute + the promoted deployment.environment.name label (per-env SLOs).
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: {{ include "identity-plane.fullname" . }}-slo-burn-rate
   labels:
     {{- include "identity-plane.labels" . | nindent 4 }}
-    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- with .Values.monitoring.operator.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:

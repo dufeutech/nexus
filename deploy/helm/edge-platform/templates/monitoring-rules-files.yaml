@@ -1,0 +1,20 @@
+{{- if eq .Values.monitoring.delivery "files" -}}
+# operator-INDEPENDENT delivery (monitoring.delivery=files, DEFAULT): the SAME combined-edge
+# SLO rules as the operator form, but as a plain rule-file ConfigMap a standalone evaluator
+# (e.g. vmalert) mounts and loads — no Prometheus/VictoriaMetrics operator required (infra-v1).
+#   app-slo.rules.yaml -> hand-authored threshold alerts (shared "edgeSloGroups" helper;
+#                         identical to the operator-form PrometheusRule). This umbrella owns
+#                         only the combined-edge rules; the per-plane Rust-service rules ship
+#                         from the subcharts (identity-plane / routing-plane), so there is no
+#                         Sloth burn-rate key here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edge-platform.fullname" . }}-slo-rules
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slo-rules
+data:
+  app-slo.rules.yaml: |
+{{ include "edge-platform.edgeSloGroups" . | indent 4 }}
+{{- end }}
