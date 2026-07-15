@@ -3,8 +3,8 @@ name: Publish charts
 # Package the Helm charts and push them to GHCR as OCI artifacts, so a consumer
 # (e.g. infra-v1) can `helm pull oci://ghcr.io/<owner>/charts/<chart> --version X`
 # WITHOUT vendoring the chart source out of this repo. The umbrella is packaged
-# with its subcharts bundled in (`helm dependency update`), so `edge-platform` is
-# self-contained: one pull, no local-path re-vendor.
+# self-contained (its subcharts bundled in), so `edge-platform` installs from one
+# pull with no local-path re-vendor.
 #
 # Chart versions are INDEPENDENT of the image appVersion (Helm's model): this
 # publishes whatever `version:` each Chart.yaml declares — it does NOT build or
@@ -20,11 +20,6 @@ on:
         default: true
       force:
         description: "Overwrite a chart version that is already published (default: skip it)"
-        type: boolean
-        required: false
-        default: false
-      probe:
-        description: "DIAGNOSTIC: push the umbrella content under a throwaway name (edge-platform-probe)"
         type: boolean
         required: false
         default: false
@@ -52,10 +47,8 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           # Pin Helm 3.x: Helm 4 pushes OCI 1.1 artifact manifests (empty-config
-          # artifactType), which GHCR rejects with `500 unknown error` on the manifest
-          # PUT. Helm 3's OCI 1.0 config media type is what GHCR accepts — the same
-          # reason the docker image pushes work. Packaging apiVersion-v2 charts is
-          # unaffected. Revisit when GHCR handles OCI 1.1 empty configs.
+          # artifactType) that GHCR rejects with `500 unknown error`. Helm 3's OCI 1.0
+          # config media type is what GHCR accepts (the path the docker image pushes use).
           version: v3.21.3
 
       # GHCR OCI repo. Owner may be mixed-case; OCI names must be lowercase.
@@ -80,16 +73,19 @@ jobs:
           OUT=$(mktemp -d)
 
           # edge-platform's subcharts are file:// local-path deps; vendor them so the
-          # packaged umbrella bundles them and installs without the repo checkout.
+          # packaged umbrella is self-contained (installs without the repo checkout).
           helm dependency update edge-platform
 
-          # GHCR returns `500 unknown error` on the umbrella's OCI manifest PUT when its
-          # config carries the `dependencies` stanza (the two dependency-free subcharts
-          # push fine). The subcharts are already vendored into charts/ above, and Helm
-          # renders everything under charts/ regardless of the stanza — so drop it from the
-          # PACKAGED copy only. Source keeps its file:// deps for local `helm dependency
-          # update`; the CI checkout is ephemeral. Verified: the stripped umbrella renders
-          # byte-for-byte the same subcharts.
+          # GHCR rejects the umbrella's OCI manifest PUT with `500 unknown error` when the
+          # packaged layer contains NESTED .tgz files (the subchart tarballs `dependency
+          # update` drops into charts/). Bundle the subcharts as UNPACKED directories
+          # instead: the layer becomes a single-level tarball GHCR accepts, and Helm renders
+          # charts/<dir> identically to charts/<name>.tgz. Also drop the now-moot file://
+          # `dependencies` stanza + Chart.lock from the PACKAGED copy (source keeps them for
+          # local `helm dependency update`; the CI checkout is ephemeral). Verified: the
+          # unpacked umbrella renders the same 14 containers / 4 Deployments.
+          ( cd edge-platform/charts && for t in *.tgz; do tar xzf "$t" && rm -f "$t"; done )
+          rm -f edge-platform/Chart.lock
           if command -v yq >/dev/null 2>&1; then
             yq -i 'del(.dependencies)' edge-platform/Chart.yaml
           else
@@ -125,7 +121,7 @@ jobs:
             # others (a summary at the end fails the job if any chart failed).
             n=0; pushed=""
             while :; do
-              if helm push "$tgz" "$REPO" --debug; then pushed=1; break; fi
+              if helm push "$tgz" "$REPO"; then pushed=1; break; fi
               n=$((n+1))
               if [ "$n" -ge 4 ]; then echo "push failed after $n attempts"; break; fi
               echo "push attempt $n failed; retrying in $((n*5))s"; sleep $((n*5))
@@ -136,20 +132,3 @@ jobs:
 
           if [ -n "$FAILED" ]; then echo "::error::charts failed to publish:$FAILED"; exit 1; fi
           echo "Charts available at: $REPO/{identity-plane,routing-plane,edge-platform}"
-
-      # DIAGNOSTIC (temporary): push the SAME umbrella content under a throwaway name.
-      # If it publishes, the `edge-platform` package name is wedged on GHCR (delete + retry);
-      # if it 500s too, the umbrella content itself is what GHCR rejects.
-      - name: Probe umbrella under throwaway name
-        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.probe }}
-        working-directory: deploy/helm
-        env:
-          REPO: ${{ steps.reg.outputs.repo }}
-        run: |
-          set -euo pipefail
-          helm dependency update edge-platform
-          rm -rf /tmp/probe && cp -r edge-platform /tmp/probe
-          yq -i '.name = "edge-platform-probe" | del(.dependencies)' /tmp/probe/Chart.yaml
-          helm package /tmp/probe -d /tmp
-          echo "pushing edge-platform-probe (same content, fresh name) -> $REPO"
-          helm push /tmp/edge-platform-probe-*.tgz "$REPO" --debug
