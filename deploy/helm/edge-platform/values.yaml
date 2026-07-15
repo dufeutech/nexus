@@ -178,19 +178,30 @@ originEnforcement:
   external: false
 
 # -------------------------------------------------------------------------- #
-# Monitoring — nexus-authored SLO alert rules for the COMBINED edge (Envoy) this
-# umbrella owns. Enable the per-plane Rust-service rules on the subcharts:
-#   identity-plane.metrics.prometheusRule.enabled=true
-#   routing-plane.metrics.prometheusRule.enabled=true
-# and this block for the edge. Consumed by the Prometheus Operator / VM operator/vmalert.
+# Monitoring artifact delivery (portable-monitoring-delivery) for the COMBINED edge
+# (Envoy) this umbrella owns. ONE selector picks HOW nexus's SLO rules reach the cluster;
+# the query CONTENT is the same portable PromQL either way. Envoy admin stats are SCRAPED,
+# so these rules are collector-independent.
+#   files    -> operator-INDEPENDENT (DEFAULT): a rule-file ConfigMap a standalone evaluator
+#               (e.g. vmalert) mounts and loads — NO Prometheus/VictoriaMetrics operator.
+#   operator -> a PrometheusRule CR. Requires that operator's CRD.
+#   otlp-only-> render NO rules; metrics reach the store by OTLP push.
+# The per-plane Rust-service rules ship from the subcharts — select them there:
+#   identity-plane.monitoring.delivery / routing-plane.monitoring.delivery.
 # -------------------------------------------------------------------------- #
-metrics:
-  prometheusRule:
-    enabled: false
+monitoring:
+  delivery: files
+
+  # Alert thresholds — the "> Y" in each hand-authored rule; tune to your SLOs. Used by
+  # both the files and operator forms.
+  thresholds:
+    edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
+    edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
+
+  # operator form ONLY: extra labels so your operator's ruleSelector matches
+  # (e.g. release: kube-prom-stack).
+  operator:
     labels: {}
-    thresholds:
-      edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
-      edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
 
 # Store connection overrides for the combined edge. Empty => derived from the
 # subchart release names (the normal case). Set these only if a subchart points at

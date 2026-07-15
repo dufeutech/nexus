@@ -3,8 +3,8 @@
 {{- if not $np.allowFrom }}
 {{- fail "controlPlane.networkPolicy.enabled but controlPlane.networkPolicy.allowFrom is empty — specify the broker peer(s) allowed to reach the admin API on :9400 (or set controlPlane.networkPolicy.enabled=false)" }}
 {{- end }}
-{{- if and .Values.metrics.serviceMonitor.enabled (not $np.allowMetricsFrom) }}
-{{- fail "controlPlane.networkPolicy.enabled with metrics.serviceMonitor.enabled but controlPlane.networkPolicy.allowMetricsFrom is empty — specify the scrape peer(s) allowed to reach /metrics on the ops port :9401, or the policy would silently drop Prometheus (set allowMetricsFrom, or disable metrics.serviceMonitor)" }}
+{{- if and (eq .Values.monitoring.delivery "operator") (not $np.allowMetricsFrom) }}
+{{- fail "controlPlane.networkPolicy.enabled with monitoring.delivery=operator but controlPlane.networkPolicy.allowMetricsFrom is empty — specify the scrape peer(s) allowed to reach /metrics on the ops port :9401, or the policy would silently drop Prometheus (set allowMetricsFrom, or use a non-operator monitoring.delivery)" }}
 {{- end }}
 {{- if and .Values.controlPlane.ingress.enabled (not $np.allowIngressControllerFrom) }}
 {{- fail "controlPlane.networkPolicy.enabled with controlPlane.ingress.enabled but controlPlane.networkPolicy.allowIngressControllerFrom is empty — specify the ingress-controller peer allowed to reach the admin API on :9400, or the broker-only rule would deny the admin Ingress (set allowIngressControllerFrom, or disable controlPlane.ingress)" }}

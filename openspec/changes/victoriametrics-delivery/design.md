@@ -97,11 +97,17 @@ Rule content is still single-sourced from the already-adopted Sloth objective sp
 (`monitoring/slo/*.slo.yaml`); this change adds a rendering of that source, not a
 second author. No re-decision needed.
 
-### Delivery-form selection default
+### Delivery-form selection default (resolved)
 
-`monitoring.delivery` defaults to preserve today's behavior for existing operator
-clusters; the operator-less environments (infra-v1, lab) select `files`. Exact
-default value is an open question below.
+Backward compatibility is explicitly **not** required. `monitoring.delivery` is the
+single selector (`otlp-only | files | operator`) and **defaults to `files`** — the
+operator-less form that works on the first real target (infra-v1) and the
+portable-by-default stance; defaulting to `operator` would ship dark no-op CRDs
+there, which is the bug this change fixes. The three legacy toggles
+(`metrics.serviceMonitor.enabled`, `metrics.prometheusRule.enabled`,
+`dashboards.enabled`) are **collapsed into this one selector** — one knob, three
+values. `operator` remains opt-in so operator clusters keep the CRD form (the spec
+forbids any single form being mandatory).
 
 ### Lab reference stack
 

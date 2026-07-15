@@ -483,35 +483,63 @@ services:
       # routing) at first init, separate from ZITADEL's `zitadel` database.
       - ./postgres-init:/docker-entrypoint-initdb.d:ro
 
-  # --- observability: Prometheus scrapes all /metrics; Grafana dashboards ------
-  prometheus:
-    # PINNED (box-telemetry-contract): the native OTLP receiver
-    # (--web.enable-otlp-receiver, /api/v1/otlp) is version-gated — stable in
-    # the Prometheus 3 line, verified on this LTS version. Bump deliberately,
-    # re-running the telemetry smoke checks.
-    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.5.0}
-    container_name: zitadel-lab-prometheus
+  # --- observability: VictoriaMetrics stores metrics; vmalert evaluates rules --
+  # Adopt VictoriaMetrics (change: victoriametrics-delivery) — the lean,
+  # PromQL-compatible backend the first production infra (infra-v1) runs, so the lab
+  # dogfoods the SAME backend family. VM ingests the collector's OTLP metrics push
+  # natively (/opentelemetry/v1/metrics) and answers PromQL at /api/v1/*.
+  victoria-metrics:
+    # PINNED: matches infra-v1's VM line. Bump deliberately, re-running the telemetry
+    # smoke checks.
+    image: victoriametrics/victoria-metrics:${VM_VERSION:-v1.147.0}
+    container_name: zitadel-lab-victoria-metrics
     restart: unless-stopped
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --enable-feature=native-histograms
-      # Push-path metrics ingestion (box-telemetry-contract): the collector
-      # forwards boxes' OTLP metrics here; scrape jobs are unaffected.
-      - --web.enable-otlp-receiver
       # Retention as an OWNED budget (telemetry-cost-controls): metrics are the
       # cheapest signal by volume, so they keep the longest window — an explicit,
-      # stated value, not the implicit 15d default. Prometheus reclaims TSDB
-      # blocks past this window. Long-term/downsampled metric retention
-      # (Mimir/Thanos) is the deferred successor change.
-      - --storage.tsdb.retention.time=${PROM_RETENTION:-15d}
+      # stated value. VM reclaims blocks past this window.
+      - -retentionPeriod=${VM_RETENTION:-30d}
+      # Name OTLP-ingested metrics the Prometheus way, so the PromQL in the shipped
+      # rules + dashboards matches (histogram_quantile on *_bucket, *_total counters).
+      - -opentelemetry.usePrometheusNaming=true
+      # Pushed OTLP samples arrive unordered across producers; a small out-of-order
+      # window is the documented companion to push ingestion (was prometheus.yml's).
+      - -search.maxStalenessInterval=5m
     volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # slo-burn-rate-policy: the Sloth-generated SLO recording + multi-window
-      # burn-rate rules (regenerate via monitoring/slo/generate.sh). Loaded via
-      # `rule_files:` in prometheus.yml so a clean checkout evaluates the same policy.
-      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - vm-data:/victoria-metrics-data
     ports:
-      - "9090:9090"
+      - "8428:8428"
+
+  vmalert:
+    # Standalone rule evaluator (Adopt VictoriaMetrics/vmalert) — the operator-
+    # INDEPENDENT delivery form the charts also ship (monitoring.delivery=files). It
+    # loads the SAME Sloth-generated rule files a clean checkout evaluates and ships to
+    # production, evaluating them against VM. This is what makes the lab exercise the
+    # production delivery form (spec: portable-monitoring-delivery).
+    image: victoriametrics/vmalert:${VM_VERSION:-v1.147.0}
+    container_name: zitadel-lab-vmalert
+    restart: unless-stopped
+    command:
+      - -rule=/rules/*.rules.yaml
+      - -datasource.url=http://victoria-metrics:8428
+      # Write recording rules + the ALERTS series back to VM; restore alert state.
+      - -remoteWrite.url=http://victoria-metrics:8428
+      - -remoteRead.url=http://victoria-metrics:8428
+      - -evaluationInterval=5s
+      - -external.label=environment=lab
+      # No alert router in the lab: blackhole the notifier so alerting rules still
+      # FIRE and stay observable via vmalert's /api/v1/alerts + the ALERTS series
+      # (remoteWrite) — without standing up alertmanager (design open-Q resolved).
+      - -notifier.blackhole=true
+    volumes:
+      # slo-burn-rate-policy: the Sloth-generated SLO recording + multi-window burn-rate
+      # rules (regenerate via monitoring/slo/generate.sh). Prometheus-format rule files,
+      # loaded operator-lessly by vmalert.
+      - ./monitoring/prometheus/rules:/rules:ro
+    ports:
+      - "8880:8880"
+    depends_on:
+      - victoria-metrics
 
   grafana:
     image: grafana/grafana:latest
@@ -528,7 +556,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - prometheus
+      - victoria-metrics
       - tempo
       - loki
 
@@ -556,7 +584,9 @@ services:
       # swapping a store is an edit here — producers never change.
       TEMPO_OTLP_ENDPOINT: ${TEMPO_OTLP_ENDPOINT:-tempo:4317}
       LOKI_OTLP_ENDPOINT: ${LOKI_OTLP_ENDPOINT:-http://loki:3100/otlp}
-      PROMETHEUS_OTLP_ENDPOINT: ${PROMETHEUS_OTLP_ENDPOINT:-http://prometheus:9090/api/v1/otlp}
+      # VictoriaMetrics OTLP ingestion base; the otlphttp exporter appends /v1/metrics
+      # -> /opentelemetry/v1/metrics (change: victoriametrics-delivery).
+      VM_OTLP_ENDPOINT: ${VM_OTLP_ENDPOINT:-http://victoria-metrics:8428/opentelemetry}
     volumes:
       - ./monitoring/otel-collector/otel-collector.yaml:/etc/otelcol/otel-collector.yaml:ro
     ports:
@@ -573,7 +603,7 @@ services:
     depends_on:
       - tempo
       - loki
-      - prometheus
+      - victoria-metrics
 
   # Object-storage tier (telemetry-cost-controls): SeaweedFS S3 gateway — the
   # clean-checkout stand-in for cloud object storage (S3/GCS in prod). Apache
@@ -702,6 +732,7 @@ networks:
 
 volumes:
   postgres-data:
+  vm-data:
   tempo-data:
   loki-data:
   # Object-storage tier (telemetry-cost-controls): the emulator's backing store.

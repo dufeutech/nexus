@@ -287,26 +287,30 @@ must emit — is the "Box telemetry contract" section of
   or store never affects request handling; boxes buffer/drop telemetry and
   resume on their own when the collector returns. Producers deliberately do
   not `depends_on` the collector.
-- **Nexus ships its alert rules + dashboards as code (opt-in chart artifacts).**
+- **Nexus ships its alert rules + dashboards as code, in a delivery form you pick.**
   The engine evaluates; nexus authors the content (it needs domain knowledge of the
-  metrics). Enable per chart:
-  - `metrics.prometheusRule.enabled=true` → a `PrometheusRule` CR of app-SLO alerts
+  metrics). One selector, `monitoring.delivery`, chooses HOW the rules + dashboards reach
+  the cluster — the PromQL content is identical either way (change
+  `victoriametrics-delivery`):
+  - `files` (**default**) → operator-INDEPENDENT: a `-slo-rules` ConfigMap (both the
+    app-SLO threshold alerts and the Sloth burn-rate rules, as plain Prometheus-format
+    rule files a standalone evaluator such as **vmalert** loads) + dashboard ConfigMaps
+    for a file-provider Grafana. Works with **no** Prometheus/VictoriaMetrics operator —
+    this is what `infra-v1` runs, and what the local lab dogfoods.
+  - `operator` → Prometheus-Operator CRs: a `PrometheusRule` of app-SLO alerts
     (edge 5xx ratio, routing/enrich p99, authz-gate 403/fail-closed spike,
-    membership-sync/control-plane errors). Consumed by the Prometheus Operator **or**
-    the VictoriaMetrics operator/vmalert. Tune the `> X` values under
-    `metrics.prometheusRule.thresholds`. On the umbrella, enable it on each subchart
-    (`identity-plane.metrics.prometheusRule.enabled`, `routing-plane…`) plus the
-    edge-platform block for the combined edge.
-  - The same flag also ships a **`-slo-burn-rate` `PrometheusRule`** (change
-    `slo-burn-rate-policy`): multi-window error-budget burn-rate alerts (fast burn ⇒
-    `severity=page`, slow burn ⇒ `severity=ticket`), per deployment environment. These
+    membership-sync/control-plane errors), a `-slo-burn-rate` `PrometheusRule`
+    (multi-window burn-rate: fast burn ⇒ `severity=page`, slow ⇒ `severity=ticket`, per
+    environment), a `PodMonitor` for Envoy's admin scrape, and sidecar-discovered
+    dashboard ConfigMaps. Requires that operator. On the umbrella, set it on each subchart
+    (`identity-plane.monitoring.delivery=operator`, `routing-plane…`) plus the umbrella.
+  - `otlp-only` → render neither; metrics still reach the store by OTLP push.
+  - Tune the alert `> X` values under `monitoring.thresholds` (both forms). The burn-rate
     rules are **Sloth-generated** from `monitoring/slo/*.slo.yaml` (regenerate with
     `monitoring/slo/generate.sh`, which stages them into each plane chart's `files/slo/`)
-    — the chart only wraps them, so never hand-edit the embedded rules. Lab and prod
-    evaluate byte-identical rules. On the umbrella, run `helm dependency update` after a
-    regenerate so the repackaged subcharts pick up the refreshed rules.
-  - `dashboards.enabled=true` → Grafana dashboards as ConfigMaps labelled for the
-    Grafana sidecar's auto-discovery (kube-prometheus-stack / grafana chart).
+    — never hand-edit the embedded rules; lab and prod evaluate byte-identical rules. On
+    the umbrella, run `helm dependency update` after a regenerate so the repackaged
+    subcharts pick up the refreshed rules. Validate with `monitoring/slo/check.sh`.
   - **Collector caveat:** the `result`/`op`/`tier` metric attributes several rules and
     dashboard panels key on are LOW-cardinality nexus RED dimensions. Your OTel
     collector MUST keep them (nexus's lab collector does — `monitoring/otel-collector`);
@@ -583,7 +587,9 @@ below is the authoritative per-item detail it points back to.
 
 - [ ] **Store lifecycle is owned**: HA, backups, restore-tested, failover for the
       routing + identity databases (external by design — see below).
-- [ ] **Monitoring wired**: `metrics.serviceMonitor.*` per chart.
+- [ ] **Monitoring wired**: `monitoring.delivery` set per chart (`files` for an
+      operator-less backend like infra-v1's VictoriaMetrics, `operator` for a
+      Prometheus-Operator cluster).
       - verify: alerts at least on edge 5xx / `ext_proc` failures, sidecar/router
         invalidation-feed staleness (`*_last_apply` metrics), and control-plane
         auth failures.

@@ -193,10 +193,10 @@ controlPlane:
     #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: brokers } }
     #     podSelector: { matchLabels: { app: domain-broker } }
     allowFrom: []
-    # REQUIRED when metrics.serviceMonitor.enabled: peers allowed to scrape /metrics
-    # on the ops port :9401 (e.g. your Prometheus). Empty WHILE a ServiceMonitor is
-    # enabled => the chart refuses to render (so scrapes can't be silently dropped).
-    # Leaving the ServiceMonitor disabled keeps this optional.
+    # REQUIRED when monitoring.delivery=operator: peers allowed to scrape /metrics
+    # on the ops port :9401 (e.g. your Prometheus). Empty WHILE the operator form is
+    # selected => the chart refuses to render (so scrapes can't be silently dropped).
+    # The default files / otlp-only forms have no scrape here, so this stays optional.
     allowMetricsFrom: []
     # REQUIRED when controlPlane.ingress.enabled: the ingress-controller peer
     # allowed to reach the admin API on :9400 (it proxies the admin Ingress through
@@ -299,43 +299,51 @@ telemetry:
   environment: ""
 
 # -------------------------------------------------------------------------- #
-# Observability — emit a ServiceMonitor/PodMonitor per component if you run the
-# Prometheus Operator. The tenant-router latency histogram is classic-bucket
-# (aggregatable across instances), served on :9302.
+# Monitoring artifact delivery (portable-monitoring-delivery). ONE selector picks HOW
+# nexus's SLO rules + dashboards reach the cluster; the query CONTENT is the same
+# portable PromQL either way. Metrics themselves ALWAYS travel by OTLP push
+# (box-telemetry-contract) — this only governs rules + dashboards.
+#   files    -> operator-INDEPENDENT (DEFAULT): a rule-file ConfigMap (loaded by a
+#               standalone evaluator such as vmalert) + dashboard ConfigMaps for a
+#               file provider. Works with NO Prometheus/VictoriaMetrics operator
+#               (this is infra-v1's world).
+#   operator -> Prometheus-Operator CRs: PrometheusRule + PodMonitor (Envoy admin
+#               scrape) + sidecar-discovered dashboard ConfigMaps. Requires that operator.
+#   otlp-only-> render NEITHER rules nor dashboards; metrics reach the store by OTLP push.
+# The one remaining scrape target either way is Envoy's own admin stats (:9901); the
+# Rust services push OTLP and are not scraped.
 # -------------------------------------------------------------------------- #
-metrics:
-  serviceMonitor:
-    enabled: false
-    labels: {}
-    interval: "15s"
-  # Nexus-authored app-SLO alert rules as a PrometheusRule CR (twin of serviceMonitor)
-  # — consumed by the Prometheus Operator OR the VictoriaMetrics operator/vmalert.
-  # nexus AUTHORS, your engine EVALUATES. Requires that operator's CRD.
-  prometheusRule:
-    enabled: false
-    # Extra labels so your operator's ruleSelector matches (e.g. release: kube-prom-stack).
-    labels: {}
-    # Alert thresholds — the "> Y" in each rule; tune to your SLOs. The `result`/`op`
-    # rules require your OTel collector to KEEP those metric attributes.
-    thresholds:
-      edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
-      edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
-      routingP99Seconds: 0.05       # tenant-router decision p99
-      rejectPerSecond: 10           # unknown-host rejects (404)/s (needs `result`)
-      unauthorizedPerSecond: 1      # control-plane 401/s (needs `op`)
+monitoring:
+  delivery: files
 
-# -------------------------------------------------------------------------- #
-# Dashboards — nexus-authored Grafana dashboards shipped as ConfigMaps (twin of the
-# PrometheusRule above). The Grafana SIDECAR auto-discovers ConfigMaps carrying the
-# watched label and loads the JSON. Requires the sidecar (kube-prometheus-stack /
-# grafana chart). The dashboards use a `datasource` template variable.
-# -------------------------------------------------------------------------- #
-dashboards:
-  enabled: false
-  label: grafana_dashboard
-  labelValue: "1"
-  folderAnnotation: ""
-  folder: "Nexus"
+  # Alert thresholds — the "> Y" in each hand-authored rule; tune to your SLOs. Used by
+  # both the files and operator forms. The `result`/`op` rules additionally require your
+  # OTel collector to KEEP those metric attributes (nexus's lab collector does; a
+  # stripping collector makes them under-fire).
+  thresholds:
+    edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
+    edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
+    routingP99Seconds: 0.05       # tenant-router decision p99
+    rejectPerSecond: 10           # unknown-host rejects (404)/s (needs `result`)
+    unauthorizedPerSecond: 1      # control-plane 401/s (needs `op`)
+
+  # operator form ONLY: extra labels so your operator's ruleSelector / PodMonitor
+  # selector matches (e.g. release: kube-prom-stack), and the Envoy admin scrape interval.
+  operator:
+    labels: {}
+    scrapeInterval: "15s"
+
+  # Dashboards (nexus-authored Grafana JSON, shipped as ConfigMaps under the "Nexus"
+  # folder). The dashboards use a `datasource` template variable, so they bind to
+  # whatever Prometheus-typed datasource (Prometheus or VictoriaMetrics) you pick.
+  dashboards:
+    # operator form: the label + value a Grafana sidecar watches (kube-prometheus-stack
+    # default), and an OPTIONAL folder annotation the sidecar reads.
+    sidecarLabel: grafana_dashboard
+    sidecarLabelValue: "1"
+    folderAnnotation: ""
+    # both forms: the Grafana folder these dashboards belong to.
+    folder: "Nexus"
 
 # Common pod hardening defaults, applied to the first-party workloads (router,
 # control-plane). All workloads here are stateless; the stores are external.

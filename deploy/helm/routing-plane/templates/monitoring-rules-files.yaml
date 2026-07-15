@@ -1,0 +1,22 @@
+{{- if eq .Values.monitoring.delivery "files" -}}
+# operator-INDEPENDENT delivery (monitoring.delivery=files, DEFAULT): the SAME SLO rules
+# as the operator form, but as a plain rule-file ConfigMap a standalone evaluator (e.g.
+# vmalert) mounts and loads — no Prometheus/VictoriaMetrics operator required (infra-v1).
+# Both keys are portable Prometheus/PromQL rule files:
+#   app-slo.rules.yaml       -> hand-authored threshold alerts (shared "appSloGroups"
+#                               helper; identical to the operator-form PrometheusRule).
+#   slo-burn-rate.rules.yaml -> Sloth-generated multi-window burn-rate rules (the same
+#                               file the operator form embeds).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "routing-plane.fullname" . }}-slo-rules
+  labels:
+    {{- include "routing-plane.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slo-rules
+data:
+  app-slo.rules.yaml: |
+{{ include "routing-plane.appSloGroups" . | indent 4 }}
+  slo-burn-rate.rules.yaml: |
+{{ .Files.Get "files/slo/tenant-router.rules.yaml" | indent 4 }}
+{{- end }}
