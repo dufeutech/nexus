@@ -45,6 +45,13 @@ jobs:
 
       - name: Install Helm
         uses: azure/setup-helm@v4
+        with:
+          # Pin Helm 3.x: Helm 4 pushes OCI 1.1 artifact manifests (empty-config
+          # artifactType), which GHCR rejects with `500 unknown error` on the manifest
+          # PUT. Helm 3's OCI 1.0 config media type is what GHCR accepts — the same
+          # reason the docker image pushes work. Packaging apiVersion-v2 charts is
+          # unaffected. Revisit when GHCR handles OCI 1.1 empty configs.
+          version: v3.21.3
 
       # GHCR OCI repo. Owner may be mixed-case; OCI names must be lowercase.
       - name: Compute registry
@@ -93,7 +100,14 @@ jobs:
               echo "::endgroup::"; continue
             fi
             echo "pushing $name $version -> $REPO"
-            helm push "$tgz" "$REPO"
+            # Retry a handful of times: a registry PUT can blip (5xx) independent of the
+            # artifact. Deterministic errors still fail after the last attempt.
+            n=0
+            until helm push "$tgz" "$REPO"; do
+              n=$((n+1))
+              if [ "$n" -ge 4 ]; then echo "push failed after $n attempts"; exit 1; fi
+              echo "push attempt $n failed; retrying in $((n*5))s"; sleep $((n*5))
+            done
             echo "::endgroup::"
           done
 
