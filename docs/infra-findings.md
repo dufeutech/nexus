@@ -8,8 +8,20 @@ Numbering continues the `N` series (N1–N10 are prior integration findings).
 
 ## N11 — the `edge-platform` umbrella's COMBINED edge does not wire contract signing
 
-**Status:** open · **Found:** 2026-07-15, rendering `edge-platform` `0.2.0` (chart @ `f42554f`,
-appVersion `0.0.7`) · **Severity:** blocks a **signed** go-live via the umbrella.
+**Status:** resolved (`edge-platform` `0.2.1`, change `edge-platform-signing`, commit `284ac46`) ·
+**Found:** 2026-07-15, rendering `edge-platform` `0.2.0` (chart @ `f42554f`, appVersion `0.0.7`) ·
+**Severity:** blocks a **signed** go-live via the umbrella.
+
+> **Resolution (2026-07-15):** the combined edge now wires identity-contract signing identically
+> to the standalone edge, gated on `identity-plane.sidecar.signing.enabled` — signing env (Transit
+> + break-glass), the public `:9210` JWKS port on the pod **and** the combined-edge Service, and
+> the break-glass volumes (consuming the identity subchart's `<release>-identity-plane-signing-*`
+> resources). The env is single-sourced in a shared `identity-plane.signingEnv` template so the two
+> edges cannot drift again, and `scripts/helm-guards-test.sh` now asserts both edges mint + publish
+> when signing is on. The invariant is captured in the `identity-contract-signing` spec
+> ("enabled signing takes effect in every edge topology"). Chart-only — no image change
+> (appVersion stays `0.0.7`); infra picks it up by re-vendoring the `edge-platform` chart at
+> `0.2.1`.
 
 ### What
 
