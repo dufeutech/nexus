@@ -84,6 +84,7 @@ jobs:
             helm package "$chart" -d "$OUT"
           done
 
+          FAILED=""
           for tgz in "$OUT"/*.tgz; do
             # Read name/version from chart metadata (robust vs. hyphens in a version).
             name=$(helm show chart "$tgz" | awk '/^name:/{print $2; exit}')
@@ -101,14 +102,18 @@ jobs:
             fi
             echo "pushing $name $version -> $REPO"
             # Retry a handful of times: a registry PUT can blip (5xx) independent of the
-            # artifact. Deterministic errors still fail after the last attempt.
-            n=0
-            until helm push "$tgz" "$REPO"; do
+            # artifact. Push each chart independently — one bad chart does not mask the
+            # others (a summary at the end fails the job if any chart failed).
+            n=0; pushed=""
+            while :; do
+              if helm push "$tgz" "$REPO"; then pushed=1; break; fi
               n=$((n+1))
-              if [ "$n" -ge 4 ]; then echo "push failed after $n attempts"; exit 1; fi
+              if [ "$n" -ge 4 ]; then echo "push failed after $n attempts"; break; fi
               echo "push attempt $n failed; retrying in $((n*5))s"; sleep $((n*5))
             done
+            if [ -n "$pushed" ]; then echo "OK: $name $version"; else FAILED="$FAILED $name"; fi
             echo "::endgroup::"
           done
 
+          if [ -n "$FAILED" ]; then echo "::error::charts failed to publish:$FAILED"; exit 1; fi
           echo "Charts available at: $REPO/{identity-plane,routing-plane,edge-platform}"
