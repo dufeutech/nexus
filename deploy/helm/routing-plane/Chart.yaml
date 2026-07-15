@@ -15,7 +15,7 @@ version: 0.2.0
 # The first-party image release this chart deploys. It is the DEFAULT image tag (an
 # operator can still override via images.tag / global.image.tag), so it MUST equal the
 # tag the images are published under — keep it in lockstep with the release.
-appVersion: "0.0.5"
+appVersion: "0.0.7"
 keywords:
   - routing
   - tenant

@@ -15,7 +15,7 @@ version: 0.2.0
 # The first-party image release this umbrella deploys. It is the DEFAULT tag for the
 # combined edge's images (operators can override via global.image.tag), so it MUST
 # equal the tag the images are published under — keep it in lockstep with the release.
-appVersion: "0.0.5"
+appVersion: "0.0.7"
 keywords:
   - identity
   - routing
