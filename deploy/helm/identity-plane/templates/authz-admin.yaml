@@ -40,17 +40,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "identity-plane.pgSecretName" . }}
                   key: {{ include "identity-plane.pgSecretKey" . }}
-            {{- if .Values.authzAdmin.authDisabled }}
-            # Explicit opt-out — the surface runs UNAUTHENTICATED (trusted network only).
-            - name: IDENTITY_ADMIN_AUTH_DISABLED
-              value: "true"
-            {{- else }}
-            - name: IDENTITY_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "identity-plane.authzAdminSecretName" . }}
-                  key: {{ include "identity-plane.authzAdminSecretKey" . }}
-            {{- end }}
+            # Admin-auth gate (admin-plane-authorization). Fail-closed posture selector
+            # — pepper (named tokens), legacy+ok (migration), or explicit disable —
+            # rendered by the shared helper, which FAILS render if no valid posture is
+            # set (mirrors the binary's startup refusal).
+            {{- include "identity-plane.adminAuthEnv" . | trim | nindent 12 }}
             # Bootstrap the first administrator from an empty store (R4).
             - name: AUTHZ_ADMIN_ROLE
               value: {{ .Values.authzAdmin.adminRole | quote }}

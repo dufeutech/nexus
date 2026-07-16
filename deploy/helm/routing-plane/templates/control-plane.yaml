@@ -49,19 +49,11 @@ spec:
             # recompile. JSON array, parsed by the control plane's load_pools().
             - name: ROUTING_POOLS
               value: {{ keys .Values.pools | sortAlpha | toJson | quote }}
-            # Admin-token gate (RFC C16). Fail-closed: with auth.enabled the token
-            # comes from the (managed or existing) Secret; otherwise auth is
-            # explicitly disabled for a trusted-network/dev install.
-            {{- if .Values.controlPlane.auth.enabled }}
-            - name: CONTROL_AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "routing-plane.controlAuthSecretName" . }}
-                  key: {{ include "routing-plane.controlAuthSecretKey" . }}
-            {{- else }}
-            - name: CONTROL_AUTH_DISABLED
-              value: "true"
-            {{- end }}
+            # Admin-auth gate (RFC C16 / admin-plane-authorization). Fail-closed
+            # posture selector — pepper (named tokens), legacy+ok (migration), or
+            # explicit disable — rendered by the shared helper, which FAILS render if
+            # no valid posture is set (mirrors the binary's startup refusal).
+            {{- include "routing-plane.adminAuthEnv" . | trim | nindent 12 }}
             {{- $otlp := include "routing-plane.otlpEndpoint" . }}
             {{- if $otlp }}
             # first-party-telemetry: PUSH traces/metrics/logs via OTLP/gRPC to the
