@@ -1,0 +1,57 @@
+suite: umbrella passes admin-auth postures through to both subcharts
+# The umbrella is pure subchart value passthrough (no auth template of its own). These
+# tests assert a posture set under the subchart alias reaches each plane's control
+# surface. `--with-subchart` renders BOTH subcharts + the combined edge, so the
+# suite-level `set` satisfies every unrelated fail-closed guard (external stores, edge
+# origin-trust, JWKS transport); each test then exercises one plane's posture and holds
+# the other at a valid posture so only the intended assertion drives the result.
+set:
+  routing-plane.postgres.existingSecret: rpg
+  identity-plane.postgres.existingSecret: ipg
+  identity-plane.routingPg.existingSecret: iro
+  originEnforcement.external: true
+  identity-plane.originEnforcement.external: true
+  identity-plane.oidc.jwksTls.enabled: true
+tests:
+  - it: routing-plane.controlPlane.auth.tokenPepper reaches control-plane
+    template: charts/routing-plane/templates/control-plane.yaml
+    documentIndex: 0
+    set:
+      identity-plane.authzAdmin.authDisabled: true
+      routing-plane.controlPlane.auth.tokenPepper.existingSecret: cpep
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content:
+            name: ADMIN_TOKEN_PEPPER
+            valueFrom:
+              secretKeyRef:
+                name: cpep
+                key: pepper
+
+  - it: identity-plane.authzAdmin.tokenPepper reaches authz-admin
+    template: charts/identity-plane/templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      routing-plane.controlPlane.auth.enabled: false
+      identity-plane.authzAdmin.tokenPepper.existingSecret: apep
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content:
+            name: ADMIN_TOKEN_PEPPER
+            valueFrom:
+              secretKeyRef:
+                name: apep
+                key: pepper
+
+  - it: guard propagates — no posture on control-plane fails umbrella render
+    template: charts/routing-plane/templates/control-plane.yaml
+    documentIndex: 0
+    set:
+      identity-plane.authzAdmin.authDisabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "no admin auth posture selected for control-plane. Set controlPlane.auth.tokenPepper.* (named tokens), or controlPlane.auth.legacyTokenOk=true with a legacy token (migration), or controlPlane.auth.enabled=false (trusted-network/dev only)."

@@ -7,7 +7,11 @@ description: >-
   (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart (package) version — bump on template changes; independent of appVersion.
-version: 0.1.0
+# 0.2.0: expose the fail-closed admin-auth postures the 0.0.7 authz-admin requires —
+# named-token pepper (authzAdmin.tokenPepper.*) and legacy migration
+# (authzAdmin.legacyTokenOk); render now FAILS if no posture is selected.
+# BREAKING: a token-only authzAdmin config now also requires legacyTokenOk=true.
+version: 0.2.0
 # The first-party image release this chart deploys. It is the DEFAULT image tag (an
 # operator can still override via images.tag / global.image.tag), so it MUST equal the
 # tag the images are published under — keep it in lockstep with the release.

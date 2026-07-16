@@ -108,9 +108,85 @@ token
 
 {{/*
 Whether the chart manages its own control-auth Secret (true) vs an existing one.
+Only meaningful when a legacy token is configured (posture 2); an existingSecret or a
+pepper-only install renders no managed token Secret.
 */}}
 {{- define "routing-plane.ownsControlAuthSecret" -}}
-{{- if .Values.controlPlane.auth.existingSecret -}}false{{- else -}}true{{- end -}}
+{{- if and .Values.controlPlane.auth.token (not .Values.controlPlane.auth.existingSecret) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+Control-plane admin-token PEPPER Secret name/key (posture 1, named tokens). Uses an
+existing Secret when tokenPepper.existingSecret is set, else the chart-managed Secret.
+The pepper is HMAC key material distinct from the legacy bearer token.
+*/}}
+{{- define "routing-plane.controlPepperSecretName" -}}
+{{- if .Values.controlPlane.auth.tokenPepper.existingSecret -}}
+{{- .Values.controlPlane.auth.tokenPepper.existingSecret -}}
+{{- else -}}
+{{- printf "%s-control-pepper" (include "routing-plane.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "routing-plane.controlPepperSecretKey" -}}
+{{- if .Values.controlPlane.auth.tokenPepper.existingSecret -}}
+{{- .Values.controlPlane.auth.tokenPepper.existingSecretKey -}}
+{{- else -}}
+pepper
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chart manages its own pepper Secret (inline value, no existingSecret).
+*/}}
+{{- define "routing-plane.ownsControlPepperSecret" -}}
+{{- if and .Values.controlPlane.auth.tokenPepper.value (not .Values.controlPlane.auth.tokenPepper.existingSecret) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+Admin-auth env block (admin-plane-authorization) — the fail-closed posture selector,
+mirroring routing-rs/control-plane/src/main.rs:144-203. Emits the env vars for the
+selected posture and FAILS render if none is valid, so an unstartable config is caught
+at `helm template`, not at pod crash. Call with root context and `| nindent <n>`.
+
+NOTE (admin-plane-authorization drift): this logic is intentionally DUPLICATED in the
+identity-plane chart (different env names / gate polarity). Helm scopes named templates
+to one chart tree, so a shared partial would break standalone render. The two copies are
+locked against drift by golden tests (helm-unittest), which are the source of truth.
+*/}}
+{{- define "routing-plane.adminAuthEnv" -}}
+{{- $auth := .Values.controlPlane.auth -}}
+{{- $pepperSet := or $auth.tokenPepper.existingSecret $auth.tokenPepper.value -}}
+{{- $legacySet := or $auth.existingSecret $auth.token -}}
+{{- if not $auth.enabled -}}
+- name: CONTROL_AUTH_DISABLED
+  value: "true"
+{{- else -}}
+{{- if and $auth.legacyTokenOk (not $legacySet) -}}
+{{- fail "controlPlane.auth.legacyTokenOk=true but no legacy token is set — set controlPlane.auth.token or controlPlane.auth.existingSecret (mirrors control-plane's 'missing CONTROL_AUTH_TOKEN for legacy mode' refusal)." -}}
+{{- end -}}
+{{- if and (not $pepperSet) (not $auth.legacyTokenOk) -}}
+{{- fail "no admin auth posture selected for control-plane. Set controlPlane.auth.tokenPepper.* (named tokens), or controlPlane.auth.legacyTokenOk=true with a legacy token (migration), or controlPlane.auth.enabled=false (trusted-network/dev only)." -}}
+{{- end -}}
+{{- if $pepperSet }}
+- name: ADMIN_TOKEN_PEPPER
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "routing-plane.controlPepperSecretName" . }}
+      key: {{ include "routing-plane.controlPepperSecretKey" . }}
+{{- end }}
+{{- if $auth.legacyTokenOk }}
+- name: ADMIN_LEGACY_TOKEN_OK
+  value: "true"
+{{- end }}
+{{- if $legacySet }}
+- name: CONTROL_AUTH_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "routing-plane.controlAuthSecretName" . }}
+      key: {{ include "routing-plane.controlAuthSecretKey" . }}
+{{- end }}
+{{- end -}}
 {{- end -}}
 
 {{/*

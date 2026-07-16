@@ -11,10 +11,15 @@ description: >-
   Stores (PostgreSQL, optional Redis) and ZITADEL are external.
 type: application
 # Chart (package) version — bump on template changes; independent of appVersion.
+# 0.3.0: pull in the subcharts' fail-closed admin-auth postures (named-token pepper +
+# legacy migration) via passthrough — no umbrella template change. BREAKING inherited
+# from the subcharts: a token-only control-plane/authz-admin config now also requires
+# the plane's legacyTokenOk=true. Set the postures under routing-plane.controlPlane.auth.*
+# and identity-plane.authzAdmin.* .
 # 0.2.1: wire identity-contract signing into the COMBINED edge (infra N11) — the
 # co-located identity sidecar now mints + publishes JWKS on :9210 like the standalone
 # edge when identity-plane.sidecar.signing.enabled. No image change (appVersion 0.0.7).
-version: 0.2.1
+version: 0.3.0
 # The first-party image release this umbrella deploys. It is the DEFAULT tag for the
 # combined edge's images (operators can override via global.image.tag), so it MUST
 # equal the tag the images are published under — keep it in lockstep with the release.
@@ -29,8 +34,8 @@ maintainers:
   - name: edge-platform
 dependencies:
   - name: routing-plane
-    version: "0.2.0"
+    version: "0.3.0"
     repository: "file://../routing-plane"
   - name: identity-plane
-    version: "0.1.0"
+    version: "0.2.0"
     repository: "file://../identity-plane"

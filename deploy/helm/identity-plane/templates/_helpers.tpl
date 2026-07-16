@@ -163,7 +163,82 @@ token
 {{- end -}}
 
 {{- define "identity-plane.ownsAuthzAdminSecret" -}}
-{{- if or .Values.authzAdmin.existingSecret .Values.authzAdmin.authDisabled -}}false{{- else -}}true{{- end -}}
+{{- if and .Values.authzAdmin.adminToken (not .Values.authzAdmin.existingSecret) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+authz-admin admin-token PEPPER Secret name/key (posture 1, named tokens). Uses an
+existing Secret when tokenPepper.existingSecret is set, else the chart-managed Secret.
+The pepper is HMAC key material distinct from the legacy bearer token.
+*/}}
+{{- define "identity-plane.authzAdminPepperSecretName" -}}
+{{- if .Values.authzAdmin.tokenPepper.existingSecret -}}
+{{- .Values.authzAdmin.tokenPepper.existingSecret -}}
+{{- else -}}
+{{- printf "%s-authz-admin-pepper" (include "identity-plane.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "identity-plane.authzAdminPepperSecretKey" -}}
+{{- if .Values.authzAdmin.tokenPepper.existingSecret -}}
+{{- .Values.authzAdmin.tokenPepper.existingSecretKey -}}
+{{- else -}}
+pepper
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chart manages its own pepper Secret (inline value, no existingSecret).
+*/}}
+{{- define "identity-plane.ownsAuthzAdminPepperSecret" -}}
+{{- if and .Values.authzAdmin.tokenPepper.value (not .Values.authzAdmin.tokenPepper.existingSecret) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+Admin-auth env block (admin-plane-authorization) — the fail-closed posture selector,
+mirroring identity-rs/authz-admin/src/main.rs:705-763. Emits the env vars for the
+selected posture and FAILS render if none is valid, so an unstartable config is caught
+at `helm template`, not at pod crash. Call with root context and `| trim | nindent <n>`.
+
+NOTE (admin-plane-authorization drift): this logic is intentionally DUPLICATED in the
+routing-plane chart (different env names / gate polarity — authDisabled here vs
+auth.enabled there). Helm scopes named templates to one chart tree, so a shared partial
+would break standalone render. The two copies are locked against drift by golden tests
+(helm-unittest), which are the source of truth.
+*/}}
+{{- define "identity-plane.adminAuthEnv" -}}
+{{- $auth := .Values.authzAdmin -}}
+{{- $pepperSet := or $auth.tokenPepper.existingSecret $auth.tokenPepper.value -}}
+{{- $legacySet := or $auth.existingSecret $auth.adminToken -}}
+{{- if $auth.authDisabled -}}
+- name: IDENTITY_ADMIN_AUTH_DISABLED
+  value: "true"
+{{- else -}}
+{{- if and $auth.legacyTokenOk (not $legacySet) -}}
+{{- fail "authzAdmin.legacyTokenOk=true but no legacy token is set — set authzAdmin.adminToken or authzAdmin.existingSecret (mirrors authz-admin's 'missing IDENTITY_ADMIN_TOKEN for legacy mode' refusal)." -}}
+{{- end -}}
+{{- if and (not $pepperSet) (not $auth.legacyTokenOk) -}}
+{{- fail "no admin auth posture selected for authz-admin. Set authzAdmin.tokenPepper.* (named tokens), or authzAdmin.legacyTokenOk=true with a legacy token (migration), or authzAdmin.authDisabled=true (trusted-network/dev only)." -}}
+{{- end -}}
+{{- if $pepperSet }}
+- name: ADMIN_TOKEN_PEPPER
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "identity-plane.authzAdminPepperSecretName" . }}
+      key: {{ include "identity-plane.authzAdminPepperSecretKey" . }}
+{{- end }}
+{{- if $auth.legacyTokenOk }}
+- name: ADMIN_LEGACY_TOKEN_OK
+  value: "true"
+{{- end }}
+{{- if $legacySet }}
+- name: IDENTITY_ADMIN_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "identity-plane.authzAdminSecretName" . }}
+      key: {{ include "identity-plane.authzAdminSecretKey" . }}
+{{- end }}
+{{- end -}}
 {{- end -}}
 
 {{/*

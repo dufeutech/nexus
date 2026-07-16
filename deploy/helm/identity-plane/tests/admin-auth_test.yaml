@@ -1,0 +1,124 @@
+suite: authz-admin fail-closed admin-auth postures
+# Locks the admin-plane-authorization deployment contract for authz-admin against drift
+# from identity-rs/authz-admin/src/main.rs:705-763. Scoped to the authz-admin templates
+# so unrelated edge/networkpolicy guards don't interfere. Mirrors the routing-plane
+# suite (inverted gate polarity: authDisabled here vs auth.enabled there).
+templates:
+  - templates/authz-admin.yaml
+  - templates/secret-authz-admin.yaml
+tests:
+  - it: posture 1 (pepper via existingSecret) renders ADMIN_TOKEN_PEPPER and no legacy env
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.tokenPepper.existingSecret: pepper-sec
+      authzAdmin.tokenPepper.existingSecretKey: pepper
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content:
+            name: ADMIN_TOKEN_PEPPER
+            valueFrom:
+              secretKeyRef:
+                name: pepper-sec
+                key: pepper
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: IDENTITY_ADMIN_TOKEN }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_LEGACY_TOKEN_OK }
+
+  - it: posture 2 (legacy migration) renders IDENTITY_ADMIN_TOKEN + ADMIN_LEGACY_TOKEN_OK, no pepper
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.existingSecret: tok-sec
+      authzAdmin.legacyTokenOk: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_LEGACY_TOKEN_OK, value: "true" }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content:
+            name: IDENTITY_ADMIN_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: tok-sec
+                key: token
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_TOKEN_PEPPER }
+
+  - it: bootstrap combo (pepper + legacy together) renders both, for first-token minting
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.tokenPepper.existingSecret: pepper-sec
+      authzAdmin.existingSecret: tok-sec
+      authzAdmin.legacyTokenOk: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_TOKEN_PEPPER }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: IDENTITY_ADMIN_TOKEN }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_LEGACY_TOKEN_OK, value: "true" }
+
+  - it: posture 3 (disabled) renders IDENTITY_ADMIN_AUTH_DISABLED and no credential env
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.authDisabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: IDENTITY_ADMIN_AUTH_DISABLED, value: "true" }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: ADMIN_TOKEN_PEPPER }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: IDENTITY_ADMIN_TOKEN }
+
+  - it: inline pepper value renders a chart-managed pepper Secret
+    template: templates/secret-authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.tokenPepper.value: devpepper
+    asserts:
+      - isKind: { of: Secret }
+      - equal: { path: metadata.name, value: RELEASE-NAME-identity-plane-authz-admin-pepper }
+      - equal: { path: stringData.pepper, value: devpepper }
+
+  - it: guard — no posture selected fails render (mirrors the binary refusal)
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "no admin auth posture selected for authz-admin. Set authzAdmin.tokenPepper.* (named tokens), or authzAdmin.legacyTokenOk=true with a legacy token (migration), or authzAdmin.authDisabled=true (trusted-network/dev only)."
+
+  - it: guard — legacyTokenOk without a legacy token fails render
+    template: templates/authz-admin.yaml
+    documentIndex: 0
+    set:
+      authzAdmin.legacyTokenOk: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "authzAdmin.legacyTokenOk=true but no legacy token is set — set authzAdmin.adminToken or authzAdmin.existingSecret (mirrors authz-admin's 'missing IDENTITY_ADMIN_TOKEN for legacy mode' refusal)."

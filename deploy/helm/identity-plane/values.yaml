@@ -288,14 +288,45 @@ authzAdmin:
   replicas: 1                   # not on the hot path; idempotent writes
   logFormat: "json"
   logLevel: "INFO"
-  # Admin bearer-token gate, fail-closed (like the routing control-plane's
-  # CONTROL_AUTH_TOKEN). Provide the token via an existing Secret (preferred) or
-  # inline (chart wraps it in a managed Secret). Rendering REQUIRES one of:
-  # adminToken, existingSecret, or authDisabled=true.
+  # Admin-auth gate, fail-closed (mirrors the routing control-plane). The 0.0.7
+  # authz-admin binary REFUSES TO START unless exactly one posture below is selected;
+  # this chart renders that choice and FAILS at `helm template` if none is set, so a
+  # misconfig is caught before the pod CrashLoops.
+  #
+  # Pick ONE posture (pepper and legacy MAY be combined for the bootstrap migration):
+  #   1. PRODUCTION — named tokens:  set tokenPepper.* . The pepper is the HMAC key the
+  #      plane verifies caller tokens (identity.admin_tokens) against; the named tokens
+  #      themselves are minted post-startup via the admin API.
+  #   2. MIGRATION — legacy shared token: set legacyTokenOk=true AND a legacy token
+  #      (adminToken or existingSecret). Honored with a per-use deprecation warning.
+  #      This is ALSO the bootstrap path for posture 1: a fresh admin_tokens store has
+  #      no token to authenticate the first token-minting call, so deploy pepper +
+  #      legacy together, mint named tokens, then drop the legacy token and set
+  #      legacyTokenOk=false to land on pepper-only. (bootstrapAdminSub below seeds the
+  #      authz GRANT, which is orthogonal — it does not mint a token.)
+  #   3. DEV/TRUSTED-NETWORK — unauthenticated: set authDisabled=true.
+  #
+  # BREAKING (0.0.7): a plain legacy token now ALSO requires legacyTokenOk=true. A
+  # token-only config that worked before will now fail render with a message naming
+  # the fix — it can no longer silently run in the deprecated shared-token mode.
+  #
+  # --- posture 2: legacy shared token ---
   existingSecret: ""            # Secret holding the token; key below
   existingSecretKey: "token"
   # Inline token — used only when existingSecret is empty. PREFER existingSecret.
   adminToken: ""
+  # Honor the legacy shared token (migration/bootstrap). REQUIRES a legacy token above;
+  # render fails if set without one (mirrors the binary's refusal).
+  legacyTokenOk: false
+  # --- posture 1: named-token pepper (HMAC key material, NOT a bearer token) ---
+  tokenPepper:
+    # Secret holding the pepper; the prod path (ESO/OpenBao-seeded). Key below.
+    existingSecret: ""
+    existingSecretKey: "pepper"
+    # Inline pepper — used only when existingSecret is empty; the chart wraps it in a
+    # managed Secret. DEV ONLY; prefer existingSecret so it never lives in values.
+    value: ""
+  # --- posture 3: unauthenticated ---
   # Set true ONLY on a trusted network / dev to run the surface UNAUTHENTICATED.
   authDisabled: false
   # Bootstrap the first administrator (nexus-native-authorization R4): the subject

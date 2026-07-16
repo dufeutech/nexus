@@ -48,6 +48,15 @@ routing-plane:
   #   existingSecret: routing-pg     # or postgres.url
   # redis:
   #   enabled: false                 # optional external L2
+  # Admin-auth for the control-plane — FAIL-CLOSED, pick a posture (passthrough to the
+  # subchart; see routing-plane/values.yaml controlPlane.auth for the full contract):
+  # controlPlane:
+  #   auth:
+  #     tokenPepper:
+  #       existingSecret: control-admin-pepper   # posture 1 (prod, named tokens)
+  #     # legacyTokenOk: true                    # posture 2 (migration; needs a legacy token)
+  #     # existingSecret: control-admin-token
+  #     # enabled: false                         # posture 3 (dev, unauthenticated)
 
 # -------------------------------------------------------------------------- #
 # Identity plane (subchart) — deploys authz-admin + membership-sync (its edge is
@@ -65,6 +74,14 @@ identity-plane:
   # set membershipSync.enabled: false to skip it.
   # routingPg:
   #   existingSecret: <release>-routing-plane-pg    # or routingPg.url
+  # Admin-auth for authz-admin — FAIL-CLOSED, pick a posture (passthrough to the
+  # subchart; see identity-plane/values.yaml authzAdmin for the full contract):
+  # authzAdmin:
+  #   tokenPepper:
+  #     existingSecret: authz-admin-pepper       # posture 1 (prod, named tokens)
+  #   # legacyTokenOk: true                      # posture 2 (migration; needs a legacy token)
+  #   # existingSecret: authz-admin-token
+  #   # authDisabled: true                       # posture 3 (dev, unauthenticated)
 
 # -------------------------------------------------------------------------- #
 # The combined tenant-first edge (RFC C17). Filter order:

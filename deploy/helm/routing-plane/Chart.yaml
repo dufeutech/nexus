@@ -8,10 +8,14 @@ description: >-
   independent (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart version — bump on template changes.
+# 0.3.0: expose the fail-closed admin-auth postures the 0.0.7 control-plane requires —
+# named-token pepper (controlPlane.auth.tokenPepper.*) and legacy migration
+# (controlPlane.auth.legacyTokenOk); render now FAILS if no posture is selected.
+# BREAKING: a token-only auth.enabled config now also requires legacyTokenOk=true.
 # 0.2.0: control-plane /metrics + /healthz moved to a dedicated ops port :9401
 # (off the broker-only admin :9400); probes retargeted to :9401; NetworkPolicy
 # gains allowIngressControllerFrom / allowProbesFrom + fail-closed guards.
-version: 0.2.0
+version: 0.3.0
 # The first-party image release this chart deploys. It is the DEFAULT image tag (an
 # operator can still override via images.tag / global.image.tag), so it MUST equal the
 # tag the images are published under — keep it in lockstep with the release.
