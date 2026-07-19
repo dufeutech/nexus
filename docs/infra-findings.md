@@ -148,15 +148,28 @@ Even if infra were to build the front tier itself, the chart does not currently 
    `edge-service.yaml:13-14` **deliberately** keeps off the Service (*"the sidecar/router debug +
    metrics ports are deliberately NOT here"*). An external front tier has no supported address to
    call for on-demand authorization.
-2. **PROXY protocol is unsupported.** `grep -ri "proxy_protocol\|proxy-protocol" .` → **zero matches**
-   repo-wide. Infra's SNI router sends `send-proxy` to every backend, so any front tier must either
-   accept the PROXY header or infra must special-case the backend and lose the real client IP.
+2. **No PROXY-protocol listener filter is ever configured.** Envoy itself *supports* PROXY protocol
+   (via the `proxy_protocol` listener filter — the `envoy-types` crate vendors its descriptor), but
+   `edge-configmap.yaml`'s listener declares **no `listener_filters` at all**, and the chart exposes
+   no value to add one. Infra's SNI router sends `send-proxy` to every backend, so today a front
+   tier must either terminate the PROXY header itself or infra must special-case the backend and
+   lose the real client IP.
+
+   This one may be cheap to close: exposing a `listener_filters` passthrough (or simply a
+   `proxy_protocol: enabled` flag) on the edge listener would let an L4 router front the edge
+   directly with the client IP preserved — useful independently of the custom-domain question.
 
 ### Evidence (reproduce)
 
 ```
-grep -ril caddy deploy/helm/            # -> no matches (compose-only feature)
-grep -ri  "proxy_protocol" .            # -> no matches (no PROXY protocol support)
+grep -ril caddy deploy/helm/                    # -> no matches (compose-only feature)
+
+# no PROXY-protocol listener filter is configured anywhere in the charts or compose config:
+grep -ri "proxy_protocol" deploy/       # -> no matches
+grep -ri "listener_filters" deploy/     # -> no matches (the edge listener declares none at all)
+# NB: scope to deploy/ (all Envoy config lives there). An unscoped `grep -ri proxy_protocol .`
+# also hits identity-rs/target/**/envoy_types-*.d — Cargo build artifacts for the vendored
+# envoy-types crate (Envoy's own xDS descriptors), not nexus configuration.
 
 helm template edge deploy/helm/edge-platform \
   --set identity-plane.sidecar.signing.enabled=true
