@@ -1,0 +1,110 @@
+{{- /*
+Customer-domain TLS front tier Deployment (deployment-front-tier-parity, design D1).
+
+A SEPARATE workload from the combined edge — independent :443 lifecycle and scaling; the
+edge :10000 stays up alongside for parallel-run / rollback. Caddy/CertMagic terminates TLS
+on demand (ask-gated) and forwards cleartext to the edge Service with the original Host.
+*/ -}}
+{{- if .Values.frontTier.enabled }}
+{{- $ft := .Values.frontTier }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "edge-platform.frontTierFullname" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+spec:
+  replicas: {{ $ft.replicas }}
+  selector:
+    matchLabels:
+      {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "edge-platform.labels" . | nindent 8 }}
+        {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 8 }}
+      annotations:
+        # Roll the pods when the Caddyfile (or the PROXY toggle that renders it) changes.
+        checksum/caddyfile: {{ include (print $.Template.BasePath "/front-tier-config.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: front-tier
+          image: {{ include "edge-platform.image" (dict "repo" $ft.image.repository "tag" $ft.image.tag "ctx" .) }}
+          imagePullPolicy: {{ $ft.image.pullPolicy }}
+          securityContext: {{- toYaml $ft.securityContext | nindent 12 }}
+          env:
+            # Shared, durable CertMagic store (D4) — session/direct routing-DB URL, DML-only role.
+            - name: CADDY_STORAGE_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "edge-platform.frontTierStorageSecret" . }}
+                  key: {{ include "edge-platform.frontTierStorageSecretKey" . }}
+            # On-demand issuance gate (D3): the dedicated in-cluster ask Service -> tenant-router :9300.
+            - name: AUTHORIZE_URL
+              value: {{ printf "http://%s:9300/authorize" (include "edge-platform.askServiceName" .) | quote }}
+            # Cleartext upstream: the combined edge Service (Host preserved by the Caddyfile).
+            - name: EDGE_UPSTREAM
+              value: {{ printf "%s-edge:%v" (include "edge-platform.fullname" .) .Values.edge.service.port | quote }}
+            - name: ACME_CA_DIR
+              value: {{ $ft.acme.caDir | quote }}
+            - name: ACME_EMAIL
+              value: {{ $ft.acme.email | quote }}
+            # ACME account key (D5): mounted from a Secret into an in-memory volume.
+            - name: ACME_ACCOUNT_KEY_FILE
+              value: /etc/caddy/acme/account.key
+            # readOnlyRootFilesystem: point Caddy's writable dirs at in-memory emptyDir mounts.
+            - name: XDG_DATA_HOME
+              value: /data
+            - name: XDG_CONFIG_HOME
+              value: /config
+          ports:
+            - { name: https, containerPort: 443 }
+            - { name: http, containerPort: 80 }
+          readinessProbe:
+            tcpSocket: { port: https }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: https }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml $ft.resources | nindent 12 }}
+          volumeMounts:
+            - { name: caddyfile, mountPath: /etc/caddy, readOnly: true }
+            # ACME account key — Secret volumes are tmpfs-backed (in-memory), satisfying D5.
+            - { name: acme-account, mountPath: /etc/caddy/acme, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /config }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: {{ include "edge-platform.frontTierFullname" . }}
+        - name: acme-account
+          secret:
+            secretName: {{ include "edge-platform.frontTierAcmeSecret" . }}
+            items:
+              - key: {{ include "edge-platform.frontTierAcmeSecretKey" . }}
+                path: account.key
+        - name: data
+          emptyDir: { medium: Memory }
+        - name: config
+          emptyDir: { medium: Memory }
+        - name: tmp
+          emptyDir: { medium: Memory }
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

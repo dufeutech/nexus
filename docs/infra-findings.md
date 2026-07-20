@@ -201,3 +201,14 @@ instructs operators to point DNS at a `:443` listener that a Helm install never 
 _Raised by infra-v1 (entry-layer `:443` cutover). Infra's SNI router is live and pre-positioned; the
 cutover is held until there is a nexus front tier to point it at, or an explicit statement that infra
 should build one._
+
+**RESOLVED** (change `helm-front-tier-tls`) — the preferred resolution shipped. The `edge-platform`
+umbrella now renders the front tier under `frontTier.*`: a front-tier Deployment + Service on
+`:443`/`:80` (the vendored `Caddyfile` mounted from a ConfigMap), a dedicated `ask` ClusterIP Service
+exposing `tenant-router:9300` for on-demand issuance (the deliberate local-only posture of the
+admin/metrics ports is preserved), the CertMagic Postgres store and `ACME_ACCOUNT_KEY_FILE` wired
+from Secrets, and **opt-in PROXY-protocol acceptance** at both the front tier's `:443` and the edge
+Envoy listener (`edge.proxyProtocol.enabled`) so an L4 SNI router preserves the real client IP.
+Default off — an existing release is unaffected until `frontTier.enabled=true`. Remaining before the
+cutover: a lab bring-up (chart `frontTier` enabled end-to-end, incl. the ACME account-key seed) and
+flipping `frontTier.acme.caDir` from LE staging to production.

@@ -1,0 +1,30 @@
+{{- /*
+The on-demand-issuance authorization gate, exposed in-cluster (deployment-front-tier-parity, D3).
+
+tenant-router serves /authorize on :9300 (rt-debug). The edge Service deliberately does NOT
+publish that port (edge-service.yaml — admin/debug/metrics stay local-only). But the front
+tier runs in its OWN pod, so it needs a stable address for the ask gate. This DEDICATED
+ClusterIP Service gives it exactly that — it selects the edge pods and exposes ONLY :9300,
+leaving the deliberate local-only posture of admin (9901) / metrics (9302) intact.
+
+Rendered only when the front tier is enabled (the only consumer). The NetworkPolicy in
+networkpolicy-ask.yaml restricts who may reach :9300 to the front-tier pods.
+*/ -}}
+{{- if .Values.frontTier.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "edge-platform.askServiceName" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 4 }}
+  ports:
+    - name: authorize
+      port: 9300
+      targetPort: rt-debug
+      protocol: TCP
+{{- end }}

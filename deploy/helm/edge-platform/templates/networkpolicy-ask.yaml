@@ -1,0 +1,45 @@
+{{- /*
+Restrict the on-demand-issuance ask gate to the front tier (deployment-front-tier-parity, D3).
+
+The ask Service exposes tenant-router :9300 in-cluster. This policy narrows who may reach
+that port on the edge pods to the front-tier pods (+ any extraAllowFrom). It is written to
+be ADDITIVE-safe: applying a NetworkPolicy makes a pod default-deny for the covered
+policyTypes, so the data-plane listener (:10000) and the public JWKS (:9210, when signing is
+on) are explicitly re-permitted from any source — their reachability is UNCHANGED. Only :9300
+becomes front-tier-only.
+
+Opt-in (frontTier.askNetworkPolicy.enabled) and requires a CNI that enforces NetworkPolicy.
+*/ -}}
+{{- if and .Values.frontTier.enabled .Values.frontTier.askNetworkPolicy.enabled }}
+{{- $iv := index .Values "identity-plane" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "edge-platform.frontTierFullname" . }}-ask
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "edge") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    # Data plane (:10000) + public JWKS (:9210) — reachability UNCHANGED (any source).
+    # A rule with ports and no `from` permits those ports from anywhere, so applying
+    # this policy does not cut off the edge's existing traffic.
+    - ports:
+        - { protocol: TCP, port: 10000 }
+        {{- if $iv.sidecar.signing.enabled }}
+        - { protocol: TCP, port: 9210 }
+        {{- end }}
+    # Ask gate (:9300) — front-tier pods ONLY.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 14 }}
+        {{- with .Values.frontTier.askNetworkPolicy.extraAllowFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 9300 }
+{{- end }}

@@ -1,0 +1,29 @@
+{{- /*
+Customer-domain TLS front tier Service (deployment-front-tier-parity). The public HTTPS
+entry point the go-live DNS cutover points at — :443 (and :80 for ACME HTTP / redirect),
+matching the compose front tier. ClusterIP by default (an L4 SNI router or LB fronts it);
+set frontTier.service.type=LoadBalancer to expose :443 directly.
+*/ -}}
+{{- if .Values.frontTier.enabled }}
+{{- $ft := .Values.frontTier }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "edge-platform.frontTierFullname" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+spec:
+  type: {{ $ft.service.type }}
+  selector:
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ $ft.service.httpsPort }}
+      targetPort: https
+      protocol: TCP
+    - name: http
+      port: {{ $ft.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

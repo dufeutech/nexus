@@ -162,6 +162,94 @@ edge:
     tls:
       enabled: true
       secretName: "edge-platform-tls"
+  # ------------------------------------------------------------------------ #
+  # Client-IP preservation at the EDGE listener (edge-client-ip-preservation).
+  # OPT-IN, default off. When true, Envoy adds a proxy_protocol listener filter
+  # so the edge can sit DIRECTLY behind an L4 SNI router that prepends the real
+  # client address (independent of the front tier). A disabled listener reads
+  # the peer address unchanged — today's behavior. When enabled, the listener
+  # REJECTS connections that arrive without the PROXY header (never mis-parses).
+  # ------------------------------------------------------------------------ #
+  proxyProtocol:
+    enabled: false
+
+# -------------------------------------------------------------------------- #
+# Customer-domain TLS front tier (deployment-front-tier-parity). Closes infra
+# finding N12: without this the Helm deploy ships no :443 terminator for
+# bring-your-own tenant domains, so the go-live DNS cutover has nothing to point
+# at. Caddy/CertMagic (ADOPTED — carried over from custom-domains-tls) terminates
+# TLS on demand and forwards cleartext to the combined edge. Default off: an
+# existing release is unaffected until you opt in.
+#
+# Prereqs when enabled: (1) the routing DB carries the CertMagic schema
+# (routing-rs/store-postgres/migrations/0001_certmagic_store.sql) and a DML-only
+# role; (2) the ACME account key is delivered to acmeAccount.existingSecret
+# out-of-band (ESO / OpenBao Secrets Operator / a K8s-auth role — the chart does
+# NOT bundle a secrets operator, mirroring identity signing). See deploy/caddy/README.md.
+# -------------------------------------------------------------------------- #
+frontTier:
+  enabled: false
+  image:
+    repository: caddy-front/caddy
+    # Tag resolution mirrors the edge: per-image tag -> global.image.tag -> appVersion.
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 2
+  service:
+    # ClusterIP when an L4 SNI router (in-cluster or external LB) fronts it;
+    # set LoadBalancer to expose :443 directly.
+    type: ClusterIP
+    httpsPort: 443
+    httpPort: 80
+  # ACME issuance. caDir defaults to LE STAGING so a lab bring-up (task 6.3) never
+  # burns real issuance budget — set the LE PRODUCTION directory for go-live.
+  acme:
+    caDir: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    email: ""          # REQUIRED when enabled (the ACME account email)
+  # ACME account key (D5). Delivery is OUT-OF-BAND: point existingSecret at a Secret
+  # populated by your secrets pipeline. keyPem is a dev-only inline fallback.
+  acmeAccount:
+    existingSecret: ""             # e.g. front-tier-acme-account
+    existingSecretKey: account.key
+    keyPem: ""                     # dev only -> chart-managed Secret
+  # CertMagic durable store (D4): the SAME routing Postgres, a DML-only role, a
+  # SESSION/DIRECT connection (CertMagic locks — never a transaction-mode pooler).
+  storage:
+    existingSecret: ""             # e.g. front-tier-storage-pg
+    existingSecretKey: url
+    url: ""                        # dev only -> chart-managed Secret
+  # Client-IP preservation at the front tier (edge-client-ip-preservation).
+  # OPT-IN, default off: accept PROXY protocol on :443 so an L4 router preserves
+  # the real client address. Enable in lockstep with the fronting router.
+  proxyProtocol:
+    enabled: false
+    allow: []                      # CIDRs permitted to send PROXY (empty => any peer)
+    timeout: "5s"
+  # Restrict the ask gate (:9300) to the front-tier pods (D3). OPT-IN, default off
+  # (like originEnforcement.networkPolicy — not every CNI enforces NetworkPolicy).
+  # When enabled, the edge's data plane (:10000) and JWKS (:9210) stay reachable
+  # unchanged; only :9300 is narrowed to the front tier. Requires a CNI that
+  # enforces NetworkPolicy.
+  askNetworkPolicy:
+    enabled: false
+    extraAllowFrom: []             # additional peers permitted to reach :9300
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits: { cpu: "1", memory: "256Mi" }
+  # The front tier binds :443/:80 (privileged ports), so — unlike the combined edge
+  # which drops ALL capabilities — it adds NET_BIND_SERVICE. It is still non-root
+  # and readOnlyRootFilesystem; Caddy's writable dirs are in-memory emptyDir mounts.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+    capabilities:
+      drop: ["ALL"]
+      add: ["NET_BIND_SERVICE"]
 
 # -------------------------------------------------------------------------- #
 # Origin enforcement (edge-origin-trust). The x-workspace-*/x-user-*/
