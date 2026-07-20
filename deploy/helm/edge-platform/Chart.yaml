@@ -11,6 +11,13 @@ description: >-
   Stores (PostgreSQL, optional Redis) and ZITADEL are external.
 type: application
 # Chart (package) version — bump on template changes; independent of appVersion.
+# 0.4.0: ship the customer-domain TLS front tier (infra N12) under frontTier.* — a
+# front-tier Deployment/Service on :443/:80 (Caddy/CertMagic on-demand TLS), a dedicated
+# in-cluster ask Service exposing tenant-router :9300, and opt-in PROXY-protocol
+# acceptance at both the front tier and the edge listener (edge.proxyProtocol). All
+# default-off, so an existing release is unaffected until frontTier.enabled=true. This is
+# a FEATURE ADD over 0.3.0 (new templates), so it forces a minor bump — a consumer that
+# vendored 0.3.0 (admin-auth, no front tier) must re-vendor 0.4.0 to get the front tier.
 # 0.3.0: pull in the subcharts' fail-closed admin-auth postures (named-token pepper +
 # legacy migration) via passthrough — no umbrella template change. BREAKING inherited
 # from the subcharts: a token-only control-plane/authz-admin config now also requires
@@ -19,7 +26,7 @@ type: application
 # 0.2.1: wire identity-contract signing into the COMBINED edge (infra N11) — the
 # co-located identity sidecar now mints + publishes JWKS on :9210 like the standalone
 # edge when identity-plane.sidecar.signing.enabled. No image change (appVersion 0.0.7).
-version: 0.3.0
+version: 0.4.0
 # The first-party image release this umbrella deploys. It is the DEFAULT tag for the
 # combined edge's images (operators can override via global.image.tag), so it MUST
 # equal the tag the images are published under — keep it in lockstep with the release.
