@@ -207,9 +207,9 @@ The identity plane MAY reuse a previously signed `x-identity-contract` for subse
 
 ### Requirement: Enabled signing takes effect in every edge topology
 
-When a deployment enables identity-contract signing, **every** edge through which the identity
-plane enriches requests SHALL mint the signed `x-identity-contract` and publish its verification
-material — independently of how the plane's components are composed. This SHALL hold both for a
+A deployment that enables identity-contract signing SHALL mint the signed `x-identity-contract` and
+publish its verification material at **every** edge through which the identity plane enriches
+requests — independently of how the plane's components are composed. This SHALL hold both for a
 dedicated identity edge and for a co-located edge that runs identity enrichment alongside other
 planes on a single data path. A deployment SHALL NOT serve enriched traffic through an edge that
 omits the signature, or that fails to expose the published verification material to consumers,
