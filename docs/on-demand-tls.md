@@ -114,6 +114,21 @@ tracks current CertMagic before bumping Caddy.)
   fail-closed; a 5xx or timeout there blocks issuance (correct — never issue a
   cert you can't authorize).
 
+## Go-live gates (before onboarding volume)
+
+Two external prerequisites carried over from the `custom-domains-tls` rollout — they
+gate the *production* switch, not the implementation (which is shipped), and clear
+against live infrastructure / Let's Encrypt:
+
+- **Request the LE per-account new-order rate-limit override** before onboarding real
+  volume. On-demand issues one order per net-new domain on first handshake; the default
+  per-account new-order limit throttles a fast onboarding curve. File the override with
+  Let's Encrypt for the production ACME account ahead of the ramp. (Renewals ride the ARI
+  exemption and are not governed by this limit.)
+- **Observe an ARI-driven renewal in production**: confirm a certificate nearing expiry
+  renews in advance and that renewal does **not** consume net-new issuance budget (the ARI
+  exemption is actually in effect), before relying on unattended renewal at population scale.
+
 ## Kubernetes cutover (Helm `edge-platform`, `frontTier.*`)
 
 The front tier ships in the `edge-platform` umbrella (change `helm-front-tier-tls`,
@@ -140,4 +155,3 @@ Service (`<release>-edge-platform-ask:9300`), not loopback.
 5. **Rollback.** Point the router/DNS back at the prior entry point and set
    `frontTier.enabled=false`. The edge never went down; issued certs persist in the shared
    store for a re-cutover.
-```
