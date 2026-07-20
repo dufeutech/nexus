@@ -170,3 +170,58 @@ umbrella-wide `global.image.tag` -> the chart `appVersion`.
 {{- $tag := .tag | default (dig "image" "tag" "" (.ctx.Values.global | default dict)) | default .ctx.Chart.AppVersion -}}
 {{- printf "%s:%s" .repo $tag -}}
 {{- end -}}
+
+{{/*
+Customer-domain TLS front tier (deployment-front-tier-parity). Names for its own
+Deployment/Service and the dedicated ask Service that fronts tenant-router :9300.
+*/}}
+{{- define "edge-platform.frontTierFullname" -}}
+{{- printf "%s-front-tier" (include "edge-platform.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "edge-platform.askServiceName" -}}
+{{- printf "%s-ask" (include "edge-platform.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Front-tier CertMagic Postgres store Secret (D4). existingSecret wins; otherwise the
+chart-managed <fullname>-front-tier-storage Secret rendered from frontTier.storage.url
+(dev convenience). MUST resolve to a session/direct routing-DB URL for a DML-only role.
+*/}}
+{{- define "edge-platform.frontTierStorageSecret" -}}
+{{- $ft := .Values.frontTier -}}
+{{- if $ft.storage.existingSecret -}}
+{{- $ft.storage.existingSecret -}}
+{{- else -}}
+{{- printf "%s-storage" (include "edge-platform.frontTierFullname" .) -}}
+{{- end -}}
+{{- end -}}
+{{- define "edge-platform.frontTierStorageSecretKey" -}}
+{{- $ft := .Values.frontTier -}}
+{{- if $ft.storage.existingSecret -}}
+{{- $ft.storage.existingSecretKey | default "url" -}}
+{{- else -}}
+url
+{{- end -}}
+{{- end -}}
+
+{{/*
+Front-tier ACME account-key Secret (D5). existingSecret — populated OUT-OF-BAND (ESO /
+OpenBao Secrets Operator / a K8s-auth role), mirroring identity signing — wins; otherwise
+the chart-managed <fullname>-front-tier-acme Secret from frontTier.acmeAccount.keyPem (dev).
+*/}}
+{{- define "edge-platform.frontTierAcmeSecret" -}}
+{{- $ft := .Values.frontTier -}}
+{{- if $ft.acmeAccount.existingSecret -}}
+{{- $ft.acmeAccount.existingSecret -}}
+{{- else -}}
+{{- printf "%s-acme" (include "edge-platform.frontTierFullname" .) -}}
+{{- end -}}
+{{- end -}}
+{{- define "edge-platform.frontTierAcmeSecretKey" -}}
+{{- $ft := .Values.frontTier -}}
+{{- if $ft.acmeAccount.existingSecret -}}
+{{- $ft.acmeAccount.existingSecretKey | default "account.key" -}}
+{{- else -}}
+account.key
+{{- end -}}
+{{- end -}}

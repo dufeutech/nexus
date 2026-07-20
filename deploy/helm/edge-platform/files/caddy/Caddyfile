@@ -1,0 +1,79 @@
+# Customer-domain TLS front tier — HELM-VENDORED copy of deploy/caddy/Caddyfile.
+#
+# Kept in sync with the canonical compose file (deploy/caddy/Caddyfile); the ONLY
+# divergence is the Helm-guarded `servers { listener_wrappers ... }` block below,
+# which Helm can express as opt-in but Caddy's env substitution cannot. This copy
+# exists because Helm's .Files can only read paths inside the chart — the same
+# reason the Cedar policy set is vendored under files/policy/. It is rendered
+# through `tpl`, so Helm double-brace actions are processed while `{$...}` env
+# refs and `{host}` placeholders pass through untouched as Caddy tokens.
+#
+# Every non-templated value is env-driven so this stays byte-compatible with compose.
+# See deploy/caddy/README.md for the build (xcaddy), the env contract, and ACME
+# account-key injection from OpenBao.
+
+{
+	# --- Keys: ECDSA P-256, locked in from day one (design D5) ------------------ #
+	key_type p256
+
+	# --- Issuer list: Let's Encrypt now; second issuer is CONFIG-ONLY ----------- #
+	# ARI is automatic on Caddy 2.8+ (LE supports it): steady-state renewal of a
+	# large population rides LE's ARI rate-limit exemption. Do NOT disable ARI.
+	cert_issuer acme {
+		dir {$ACME_CA_DIR}
+		email {$ACME_EMAIL}
+	}
+
+	# --- Shared, durable cert store: Postgres behind CertMagic's Storage -------- #
+	# We OWN the schema (routing-rs/store-postgres/migrations/0001_certmagic_store.sql),
+	# so DDL is disabled here and the DB role is DML-only. MUST be a session/direct
+	# connection (CertMagic locks) — never a transaction-mode pooler.
+	storage postgres {
+		connection_string {$CADDY_STORAGE_PG_URL}
+		disable_ddl true
+	}
+
+	# --- On-demand issuance, authorization-gated -------------------------------- #
+	# Before issuing for an SNI, Caddy GETs {ask}?domain=<sni> and issues IFF 2xx.
+	# nexus /authorize is fail-closed and negative-caches refusals, so an unknown-
+	# hostname flood places ZERO CA orders. AUTHORIZE_URL points at the in-cluster
+	# ask Service (edge-platform ask-service.yaml), which fronts tenant-router :9300.
+	on_demand_tls {
+		ask {$AUTHORIZE_URL}
+	}
+{{- if .Values.frontTier.proxyProtocol.enabled }}
+
+	# --- Client-IP preservation (edge-client-ip-preservation) ------------------- #
+	# OPT-IN (frontTier.proxyProtocol.enabled): accept PROXY protocol so an L4 SNI
+	# router in front preserves the real client address. proxy_protocol MUST precede
+	# tls (unwrap the header, then terminate). Default off: this block is absent and
+	# the listener treats every connection as direct.
+	servers {
+		listener_wrappers {
+			proxy_protocol {
+				{{- with .Values.frontTier.proxyProtocol.allow }}
+				allow {{ join " " . }}
+				{{- end }}
+				timeout {{ .Values.frontTier.proxyProtocol.timeout | default "5s" }}
+			}
+			tls
+		}
+	}
+{{- end }}
+}
+
+# The tenant-domain listener. `on_demand` ENABLES on-demand issuance for this site.
+# A hostname the `ask` gate refuses — or one with no valid stored cert while the
+# issuer is down — fails the handshake CLOSED: no default/self-signed/catch-all cert.
+https:// {
+	tls {
+		on_demand
+	}
+	# Forward cleartext to the existing tenant-first Envoy edge. TLS terminates here;
+	# identity enrichment, the auth gate, and tenant resolution are UNCHANGED downstream.
+	# Host is pinned explicitly (D8): routing keys on it, so preserve the client's
+	# original Host verbatim rather than relying on reverse_proxy's implicit default.
+	reverse_proxy {$EDGE_UPSTREAM} {
+		header_up Host {host}
+	}
+}

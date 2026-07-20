@@ -128,4 +128,30 @@ against live infrastructure / Let's Encrypt:
 - **Observe an ARI-driven renewal in production**: confirm a certificate nearing expiry
   renews in advance and that renewal does **not** consume net-new issuance budget (the ARI
   exemption is actually in effect), before relying on unattended renewal at population scale.
-```
+
+## Kubernetes cutover (Helm `edge-platform`, `frontTier.*`)
+
+The front tier ships in the `edge-platform` umbrella (change `helm-front-tier-tls`,
+closing infra finding N12). In k8s the front tier is a **separate Deployment/Service**
+from the combined edge — Caddy reaches `/authorize` through a dedicated in-cluster `ask`
+Service (`<release>-edge-platform-ask:9300`), not loopback.
+
+1. **Prereqs.** Apply the CertMagic schema
+   (`routing-rs/store-postgres/migrations/0001_certmagic_store.sql`) to the routing DB and
+   create a DML-only role; put its **session/direct** URL in a Secret
+   (`frontTier.storage.existingSecret`). Deliver the ACME account key **out-of-band** into
+   `frontTier.acmeAccount.existingSecret` (ESO / OpenBao Secrets Operator / a K8s-auth role).
+2. **Enable, staging first.** `frontTier.enabled=true`, `frontTier.acme.email=…`; leave
+   `frontTier.acme.caDir` at the LE **staging** default. Bring up a lab, drive an authorized
+   host end-to-end (handshake → `ask` → issue → serve), confirm an unauthorized host fails
+   the handshake closed.
+3. **Client IP (optional).** If an L4 SNI router fronts `:443`, set
+   `frontTier.proxyProtocol.enabled=true` (and `edge.proxyProtocol.enabled=true` if the
+   router fronts the edge directly) **in lockstep with the router** — an enabled listener
+   rejects un-framed connections.
+4. **Go live.** Flip `frontTier.acme.caDir` to the LE **production** directory, then point
+   the SNI router / customer DNS at the front-tier Service `:443`. The combined edge stays
+   up alongside (`:10000`), so this is a parallel run.
+5. **Rollback.** Point the router/DNS back at the prior entry point and set
+   `frontTier.enabled=false`. The edge never went down; issued certs persist in the shared
+   store for a re-cutover.

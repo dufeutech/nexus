@@ -67,5 +67,9 @@ https:// {
 	}
 	# Forward cleartext to the existing tenant-first Envoy edge. TLS terminates here;
 	# identity enrichment, the auth gate, and tenant resolution are UNCHANGED downstream.
-	reverse_proxy {$EDGE_UPSTREAM}
+	# Host is pinned explicitly (D8): routing keys on it, so preserve the client's
+	# original Host verbatim rather than relying on reverse_proxy's implicit default.
+	reverse_proxy {$EDGE_UPSTREAM} {
+		header_up Host {host}
+	}
 }

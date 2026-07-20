@@ -83,3 +83,132 @@ the combined-edge sidecar.
 
 _Raised by infra-v1 (change `edge-platform-deploy`). Infra's overlay already carries the intended
 signing config; it is inert until this is wired._
+
+---
+
+## N12 — the Helm path ships no TLS-terminating front tier, so custom-domain TLS is unreachable on k8s
+
+**Status:** open ·
+**Found:** 2026-07-19, against `edge-platform` `0.3.0` (chart @ `976d182`, appVersion `0.0.7`) ·
+**Severity:** blocks the **public `:443` cutover** for a Kubernetes deployment, and with it the
+tenant custom-domain feature entirely.
+
+### What
+
+The on-demand customer-domain TLS front tier (`65d3e53`, "add on-demand customer-domain TLS front
+tier") exists **only as a Docker Compose service**. There is no Kubernetes packaging of it:
+
+- `grep -ril caddy deploy/helm/` → **zero matches**.
+- The only thing in the repo that binds `:443` is the compose `caddy` service
+  (`deploy/compose/docker-compose.yaml:333-358`, `"${TLS_PORT:-443}:443"`).
+- `deploy/caddy/README.md:99-104` states this outright as unbuilt future work: *"**Helm:** mount
+  this `Caddyfile` via a ConfigMap …, **add a front-tier Deployment/Service**, and inject
+  `ACME_ACCOUNT_KEY_FILE`…"*. That Deployment/Service does not exist.
+- `openspec/changes/custom-domains-tls/` is still unarchived, and a grep for `helm|kubernetes|k8s`
+  across the whole change directory returns nothing — the design never covered the k8s path.
+
+What the Helm chart actually exposes is a plaintext HTTP data plane:
+
+- `edge-platform/templates/edge-service.yaml:9-18` — `ClusterIP`, single data-plane port `http: 80`.
+- `edge-platform/templates/edge-deployment.yaml:168-169` — Envoy container ports are `http: 10000`
+  and `admin: 9901` only.
+- `edge-platform/templates/edge-configmap.yaml:50` — the Envoy listener is `0.0.0.0:10000` with **no
+  downstream `transport_socket`**. The only TLS contexts (`:358-363`) are *upstream* (JWKS/OIDC).
+  Envoy does not terminate TLS.
+- `edge-platform/templates/edge-ingress.yaml:15-19` — a stock Ingress expecting a **pre-existing**
+  `secretName`, defaulted to a cert-manager wildcard (`values.yaml:154-164`). That is a **finite**
+  host set issued ahead of time — not on-demand issuance, no `ask` gate, no CertMagic store.
+
+### Why it matters
+
+For a Kubernetes deployment there is **nothing that can serve a tenant's custom domain**. The
+documented operator instruction — `docs/runbook-custom-domains-tls.md:20-23`, *"point customer DNS at
+the front tier's public address (the caddy `:443` listener / its load balancer), **NOT** at Envoy
+directly"* — has no referent on k8s. `docs/on-demand-tls.md:3-11` scopes the feature to "the
+TLS-terminating edge (**Caddy today, in the ingress/infra layer**)", but the chart the ingress layer
+is told to front does not include it.
+
+This is currently blocking infra's public `:443` cutover. Infra's L4 SNI router is live and already
+owns `:80/:443` on every node, pre-positioned to hand customer/tenant domains to a nexus-owned
+front tier — which is the boundary `deploy/README.md` and infra's own `entry-layer` spec both
+describe. There is no service to hand them to, so the edge is deployed but **not publicly exposed**.
+
+There is also an ambiguity worth resolving explicitly, because the two docs point opposite ways:
+`deploy/README.md:4-9,631-634` says *"TLS is handled **before** this service — it is not in scope
+here"*, which reads as **infra owns all TLS**; but on-demand issuance for customer domains is not
+something infra *can* own — it requires the `ask` callback into `tenant-router` and the shared
+CertMagic store, both nexus-side concerns. So "not in scope here" is true for first-party domains and
+**not** true for tenant custom domains, and today nothing owns the latter on k8s.
+
+### Two blockers, not one
+
+Even if infra were to build the front tier itself, the chart does not currently permit it:
+
+1. **The `ask` gate is unreachable.** `tenant-router` serves `/authorize` on `:9300`, which
+   `edge-service.yaml:13-14` **deliberately** keeps off the Service (*"the sidecar/router debug +
+   metrics ports are deliberately NOT here"*). An external front tier has no supported address to
+   call for on-demand authorization.
+2. **No PROXY-protocol listener filter is ever configured.** Envoy itself *supports* PROXY protocol
+   (via the `proxy_protocol` listener filter — the `envoy-types` crate vendors its descriptor), but
+   `edge-configmap.yaml`'s listener declares **no `listener_filters` at all**, and the chart exposes
+   no value to add one. Infra's SNI router sends `send-proxy` to every backend, so today a front
+   tier must either terminate the PROXY header itself or infra must special-case the backend and
+   lose the real client IP.
+
+   This one may be cheap to close: exposing a `listener_filters` passthrough (or simply a
+   `proxy_protocol: enabled` flag) on the edge listener would let an L4 router front the edge
+   directly with the client IP preserved — useful independently of the custom-domain question.
+
+### Evidence (reproduce)
+
+```
+grep -ril caddy deploy/helm/                    # -> no matches (compose-only feature)
+
+# no PROXY-protocol listener filter is configured anywhere in the charts or compose config:
+grep -ri "proxy_protocol" deploy/       # -> no matches
+grep -ri "listener_filters" deploy/     # -> no matches (the edge listener declares none at all)
+# NB: scope to deploy/ (all Envoy config lives there). An unscoped `grep -ri proxy_protocol .`
+# also hits identity-rs/target/**/envoy_types-*.d — Cargo build artifacts for the vendored
+# envoy-types crate (Envoy's own xDS descriptors), not nexus configuration.
+
+helm template edge deploy/helm/edge-platform \
+  --set identity-plane.sidecar.signing.enabled=true
+# -> the edge Service exposes http:80 (+ jwks:9210); no :443, no TLS listener,
+#    no :9300 authorize port. Envoy listener is 0.0.0.0:10000, plaintext.
+```
+
+### Suggested fix (nexus-side)
+
+Preferred — **ship the front tier in Helm**, as `deploy/caddy/README.md:99-104` already anticipates:
+
+- a front-tier Deployment + Service binding `:443`, with the `Caddyfile` mounted from a ConfigMap;
+- on-demand TLS pointed at the existing `ask` endpoint, with the CertMagic Postgres store
+  (`certmagic_data` / `certmagic_locks`) wired from the same config the compose tier uses;
+- `ACME_ACCOUNT_KEY_FILE` injectable from a Secret;
+- **PROXY protocol accepted on `:443`** (`servers.listener_wrappers: [{proxy_protocol}, {tls}]`), so
+  an L4 SNI router in front preserves the client IP;
+- forward cleartext to the edge Service on `:80` with the original `Host` preserved.
+
+If that is not the intended direction, the alternative is to **declare the k8s custom-domain path
+explicitly out of scope** and document the contract an operator must satisfy to build it — in which
+case please also expose `tenant-router`'s `/authorize` (`:9300`) on a Service (a dedicated one is
+fine; it need not join the data-plane Service), since without it the `ask` gate cannot be reached
+and the feature is not implementable downstream at all.
+
+Either resolution unblocks infra. What does not work is the current state, where the runbook
+instructs operators to point DNS at a `:443` listener that a Helm install never creates.
+
+_Raised by infra-v1 (entry-layer `:443` cutover). Infra's SNI router is live and pre-positioned; the
+cutover is held until there is a nexus front tier to point it at, or an explicit statement that infra
+should build one._
+
+**RESOLVED** (change `helm-front-tier-tls`) — the preferred resolution shipped. The `edge-platform`
+umbrella now renders the front tier under `frontTier.*`: a front-tier Deployment + Service on
+`:443`/`:80` (the vendored `Caddyfile` mounted from a ConfigMap), a dedicated `ask` ClusterIP Service
+exposing `tenant-router:9300` for on-demand issuance (the deliberate local-only posture of the
+admin/metrics ports is preserved), the CertMagic Postgres store and `ACME_ACCOUNT_KEY_FILE` wired
+from Secrets, and **opt-in PROXY-protocol acceptance** at both the front tier's `:443` and the edge
+Envoy listener (`edge.proxyProtocol.enabled`) so an L4 SNI router preserves the real client IP.
+Default off — an existing release is unaffected until `frontTier.enabled=true`. Remaining before the
+cutover: a lab bring-up (chart `frontTier` enabled end-to-end, incl. the ACME account-key seed) and
+flipping `frontTier.acme.caDir` from LE staging to production.

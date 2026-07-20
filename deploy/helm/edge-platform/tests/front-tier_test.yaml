@@ -1,0 +1,158 @@
+suite: customer-domain TLS front tier (deployment-front-tier-parity, edge-client-ip-preservation)
+# Pin the release name so rendered resource names are stable in assertions.
+release:
+  name: ep
+# Suite-level `set` satisfies every UNRELATED fail-closed guard (external stores, edge
+# origin-trust, JWKS transport, admin postures) so each test drives only its own assertion.
+set:
+  routing-plane.postgres.existingSecret: rpg
+  identity-plane.postgres.existingSecret: ipg
+  identity-plane.routingPg.existingSecret: iro
+  originEnforcement.external: true
+  identity-plane.originEnforcement.external: true
+  identity-plane.oidc.jwksTls.enabled: true
+  routing-plane.controlPlane.auth.enabled: false
+  identity-plane.authzAdmin.authDisabled: true
+tests:
+  # -------- default off: an existing release is unaffected --------
+  - it: renders no front tier by default
+    templates:
+      - templates/front-tier-deployment.yaml
+      - templates/front-tier-service.yaml
+      - templates/front-tier-config.yaml
+      - templates/ask-service.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: leaves the edge listener with no PROXY filter by default
+    template: templates/edge-configmap.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["envoy.yaml"]
+          pattern: listener_filters
+
+  # -------- enabled: the parity behaviors render --------
+  - it: exposes the customer-domain HTTPS entry point on :443
+    template: templates/front-tier-service.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - isKind:
+          of: Service
+      - contains:
+          path: spec.ports
+          content: { name: https, port: 443, targetPort: https, protocol: TCP }
+      - contains:
+          path: spec.ports
+          content: { name: http, port: 80, targetPort: http, protocol: TCP }
+
+  - it: exposes the ask gate on a dedicated Service (:9300 -> rt-debug), not the data plane
+    template: templates/ask-service.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - contains:
+          path: spec.ports
+          content: { name: authorize, port: 9300, targetPort: rt-debug, protocol: TCP }
+
+  - it: front-tier pod boots under a hardened SecurityContext (non-root, RO rootfs, NET_BIND_SERVICE only)
+    template: templates/front-tier-deployment.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: ["ALL"]
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          value: ["NET_BIND_SERVICE"]
+      # readOnlyRootFilesystem is only viable because Caddy's writable dirs are in-memory.
+      - contains:
+          path: spec.template.spec.volumes
+          content: { name: data, emptyDir: { medium: Memory } }
+
+  - it: wires on-demand issuance to the ask Service and forwards to the edge with Host preserved
+    template: templates/front-tier-deployment.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: AUTHORIZE_URL, value: "http://ep-edge-platform-ask:9300/authorize" }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: EDGE_UPSTREAM, value: "ep-edge-platform-edge:80" }
+
+  # -------- client-IP preservation (opt-in) --------
+  - it: adds the PROXY listener filter to the edge when enabled
+    template: templates/edge-configmap.yaml
+    set:
+      edge.proxyProtocol.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["envoy.yaml"]
+          pattern: envoy\.filters\.listener\.proxy_protocol
+
+  - it: renders the Caddy proxy_protocol listener wrapper when enabled
+    template: templates/front-tier-config.yaml
+    documentIndex: 0
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+      frontTier.proxyProtocol.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["Caddyfile"]
+          pattern: listener_wrappers
+
+  # -------- fail closed on misconfiguration --------
+  # The guards live in front-tier-config.yaml but surface through the deployment's
+  # checksum-annotation include of that template, so assert against the deployment.
+  - it: fails closed when enabled without an ACME email
+    template: templates/front-tier-deployment.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.storage.existingSecret: ftpg
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - failedTemplate:
+          errorMessage: "frontTier.enabled but frontTier.acme.email is empty — the ACME account requires an email. Set frontTier.acme.email."
+
+  - it: fails closed when enabled without a certificate store
+    template: templates/front-tier-deployment.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.acmeAccount.existingSecret: ftacme
+    asserts:
+      - failedTemplate: {}
+
+  - it: fails closed when enabled without an ACME account key
+    template: templates/front-tier-deployment.yaml
+    set:
+      frontTier.enabled: true
+      frontTier.acme.email: ops@example.com
+      frontTier.storage.existingSecret: ftpg
+    asserts:
+      - failedTemplate: {}

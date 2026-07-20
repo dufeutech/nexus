@@ -48,6 +48,16 @@ data:
         - name: listener_0
           address:
             socket_address: { address: 0.0.0.0, port_value: 10000 }
+          {{- if .Values.edge.proxyProtocol.enabled }}
+          # edge-client-ip-preservation (OPT-IN): decode PROXY protocol so the edge
+          # can sit DIRECTLY behind an L4 router that prepends the client address.
+          # Strict by default — allow_requests_without_proxy_protocol is false, so an
+          # un-framed connection is REJECTED rather than read with the router's address.
+          listener_filters:
+            - name: envoy.filters.listener.proxy_protocol
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
+          {{- end }}
           filter_chains:
             - filters:
                 - name: envoy.filters.network.http_connection_manager

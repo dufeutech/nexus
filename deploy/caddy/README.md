@@ -99,9 +99,16 @@ order; peers wait and serve the resulting cert (`certificate-store-durability`).
 - **Compose lab:** the `caddy` service in `../compose/docker-compose.yaml` mounts this
   `Caddyfile`, depends on `tenant-router` (for `ask`) and `envoy` (the upstream), and
   publishes `:443`/`:80`.
-- **Helm:** mount this `Caddyfile` via a ConfigMap (the Cedar-policy pattern —
-  `edge-platform/files/policy` → ConfigMap glob), add a front-tier Deployment/Service,
-  and inject `ACME_ACCOUNT_KEY_FILE` from the Transit-backed secret.
+- **Helm:** shipped by the `edge-platform` umbrella under `frontTier.*` (closes infra
+  finding N12). A vendored copy of this `Caddyfile` (`edge-platform/files/caddy/Caddyfile`,
+  kept in sync — its only divergence is a Helm-guarded `listener_wrappers` block) is
+  mounted from a ConfigMap; the chart adds a front-tier Deployment + Service on `:443`/`:80`,
+  a dedicated `ask` Service fronting `tenant-router:9300`, and injects
+  `ACME_ACCOUNT_KEY_FILE` and `CADDY_STORAGE_PG_URL` from Secrets. The ACME account key is
+  delivered **out-of-band** via `frontTier.acmeAccount.existingSecret` (ESO / OpenBao Secrets
+  Operator / a Kubernetes-auth role — the chart bundles no secrets operator, mirroring
+  identity signing). Enable with `frontTier.enabled=true`; see the chart `values.yaml`
+  `frontTier` block and `deploy/helm/edge-platform/tests/front-tier_test.yaml`.
 
 ## Adding a second CA (config-only — design D4)
 

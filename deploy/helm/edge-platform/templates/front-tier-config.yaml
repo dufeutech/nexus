@@ -1,0 +1,61 @@
+{{- /*
+Customer-domain TLS front tier — config + dev-secret fallbacks (deployment-front-tier-parity).
+
+The Caddyfile is DATA (config-adapter discipline): the vendored files/caddy/Caddyfile is
+rendered through `tpl` so the single opt-in `servers { listener_wrappers }` block can be
+Helm-guarded while every other value stays Caddy env-driven and byte-compatible with compose.
+
+Fail-closed guards mirror the origin-enforcement pattern: a front tier that cannot reach its
+store, its ACME account key, or an account email is a misconfiguration, not a silent partial.
+*/ -}}
+{{- if .Values.frontTier.enabled }}
+{{- $ft := .Values.frontTier }}
+{{- if not $ft.acme.email }}
+{{- fail "frontTier.enabled but frontTier.acme.email is empty — the ACME account requires an email. Set frontTier.acme.email." }}
+{{- end }}
+{{- if and (not $ft.storage.existingSecret) (not $ft.storage.url) }}
+{{- fail "frontTier.enabled but no certificate store is configured — set frontTier.storage.existingSecret (prod: a Secret with a session/direct routing-DB URL for a DML-only role) or frontTier.storage.url (dev inline). Without it CertMagic has nowhere durable to share certs." }}
+{{- end }}
+{{- if and (not $ft.acmeAccount.existingSecret) (not $ft.acmeAccount.keyPem) }}
+{{- fail "frontTier.enabled but no ACME account key is configured — set frontTier.acmeAccount.existingSecret (prod: delivered out-of-band via ESO / OpenBao Secrets Operator / a K8s-auth role, D5) or frontTier.acmeAccount.keyPem (dev inline). The long-lived account key is never committed to the chart." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edge-platform.frontTierFullname" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+data:
+  Caddyfile: |
+{{ tpl (.Files.Get "files/caddy/Caddyfile") . | indent 4 }}
+{{- if and $ft.storage.url (not $ft.storage.existingSecret) }}
+---
+{{- /* Dev-only chart-managed store Secret. Prod sets storage.existingSecret instead. */ -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "edge-platform.frontTierStorageSecret" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+type: Opaque
+stringData:
+  url: {{ $ft.storage.url | quote }}
+{{- end }}
+{{- if and $ft.acmeAccount.keyPem (not $ft.acmeAccount.existingSecret) }}
+---
+{{- /* Dev-only chart-managed ACME account key. Prod sets acmeAccount.existingSecret (D5). */ -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "edge-platform.frontTierAcmeSecret" . }}
+  labels:
+    {{- include "edge-platform.labels" . | nindent 4 }}
+    {{- include "edge-platform.selectorLabels" (dict "ctx" . "component" "front-tier") | nindent 4 }}
+type: Opaque
+stringData:
+  account.key: |
+    {{- $ft.acmeAccount.keyPem | nindent 4 }}
+{{- end }}
+{{- end }}
