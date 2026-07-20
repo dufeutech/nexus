@@ -33,6 +33,14 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
 
 Commands stay thin and point at these, so a change costs few tokens to plan.
 
+## Commit & branch workflow
+
+Do the whole cycle from here — the user tracks progress through branches, not by running git.
+
+- **Order per change:** run `/opsx:apply` → **commit** the implementation → `/opsx:sync` → `/opsx:archive` → **commit** the sync/archive delta → **merge the branch into `main`**. Work happens on a per-change branch so each change is trackable; fold it into `main` only after archive.
+- **NEVER co-author.** Commits carry the user's account only. Do **not** add `Co-Authored-By:` trailers, a `🤖 Generated with Claude Code` line, or any other attribution — not for commits, not for merges, not for PR bodies. Author = the user, full stop.
+- Keep commit messages plain and about the change itself.
+
 ## Keep the main thread cheap
 
 For broad or exploratory searches — locating code across many files, surveying naming
