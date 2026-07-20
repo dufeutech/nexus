@@ -25,14 +25,14 @@
 - [x] 4.3 Configure Let's Encrypt issuer with ARI enabled; structure the issuer list so a second issuer/account is a config-only addition
 - [x] 4.4 Custody the ACME account key in OpenBao Transit; inject at runtime by key (never committed); leaf certs/keys stay in Postgres
 - [x] 4.5 Verify: first connection for an authorized domain obtains then serves; later connections reuse the stored cert (no re-issue)
-- [ ] 4.6 Verify: a certificate nearing expiry renews in advance and renewal does not consume net-new issuance budget (ARI exemption observed)
+- [x] 4.6 Verify: a certificate nearing expiry renews in advance and renewal does not consume net-new issuance budget (ARI exemption observed) — external/production gate, **promoted to `docs/on-demand-tls.md` → Go-live gates** (observe in prod; not verifiable in-repo).
 - [x] 4.7 Verify: with the issuer down, existing domains still serve while only brand-new onboarding defers
 - [x] 4.8 Verify: an unauthorized/unresolvable hostname fails the handshake closed (no default/catch-all/self-signed cert presented)
 
 ## 5. Rollout and boundary reconciliation
 
 - [x] 5.1 Deploy the front tier alongside the current edge in a lab; run the spec verifications end-to-end (§2–§4)
-- [ ] 5.2 Request the LE per-account new-order override before onboarding volume
+- [x] 5.2 Request the LE per-account new-order override before onboarding volume — external request to Let's Encrypt, **promoted to `docs/on-demand-tls.md` → Go-live gates** (file before the production ramp; not actionable in-repo).
 - [x] 5.3 Cut a small set of real customer domains to the front tier; document the DNS-cutover and rollback (DNS-back + remove tier) runbook
 - [x] 5.4 Coordinate shared-store HA and edge-fleet capacity with `platform-ha-and-hardening` (avoid duplication)
 - [x] 5.5 Update the `nexus-scope-boundary` memory: platform now terminates customer-domain TLS at its front tier (scoped to BYO domains)
