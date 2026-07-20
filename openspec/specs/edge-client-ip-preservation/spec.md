@@ -1,11 +1,22 @@
-## ADDED Requirements
+# edge-client-ip-preservation
+
+## Purpose
+
+The contract for recovering the real client source address when the platform is fronted by a
+layer-4 router that hands off connections while prepending the original client's address. Preservation
+applies at the customer-domain TLS front tier and MAY be enabled at the edge listener so either tier
+can sit directly behind such a router; it is off by default, and an enabled listener rejects an
+un-framed connection rather than mis-parsing it. This spec is language-agnostic and states only the
+observable behavior.
+
+## Requirements
 
 ### Requirement: The real client address is preserved behind a connection-preserving front router
 
-When the platform is fronted by a layer-4 router that hands off connections while prepending the
-original client's address, the platform MUST be able to recover and act on the real client address
-rather than the router's address. This applies at the customer-domain TLS front tier, and MAY be
-enabled at the edge listener so that either tier can sit directly behind such a router.
+The platform MUST be able to recover and act on the real client source address rather than a fronting
+router's address when it is fronted by a layer-4 router that hands off connections while prepending
+the original client's address. This applies at the customer-domain TLS front tier, and MAY be enabled
+at the edge listener so that either tier can sit directly behind such a router.
 
 #### Scenario: The front tier recovers the original client address
 

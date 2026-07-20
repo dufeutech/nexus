@@ -1,4 +1,15 @@
-## ADDED Requirements
+# deployment-front-tier-parity
+
+## Purpose
+
+The contract that the customer-domain TLS front tier (on-demand HTTPS for bring-your-own domains) is
+provided by every deployment method the platform publishes as production-capable — not just one — and
+that the issuance-authorization gate the serving tier depends on is reachable within the deployment
+boundary. A production-capable deployment that terminates customer-domain TLS but cannot reach its own
+issuance gate, or that ships no HTTPS entry point at all, is a defect. This spec is language-agnostic
+and states only the observable behavior.
+
+## Requirements
 
 ### Requirement: Every supported deployment method provides the customer-domain TLS front tier
 
@@ -25,10 +36,11 @@ point) MUST succeed on any such method without an operator hand-building the tie
 
 ### Requirement: The issuance-authorization gate is reachable by the serving tier within the deployment
 
-On-demand certificate issuance is gated by an authorization decision from the platform's issuance
-gate (owned by `certificate-issuance-authorization`). The deployment MUST make that gate reachable
-by the tier that terminates customer-domain TLS. A deployment in which the serving tier cannot reach
-the gate MUST NOT issue certificates unauthorized as a fallback; such a deployment is invalid.
+The deployment MUST make the platform's issuance-authorization gate (owned by
+`certificate-issuance-authorization`) reachable by the tier that terminates customer-domain TLS,
+since on-demand certificate issuance is gated by that authorization decision. A deployment in which
+the serving tier cannot reach the gate MUST NOT issue certificates unauthorized as a fallback; such a
+deployment is invalid.
 
 #### Scenario: The serving tier can consult the gate for a first-seen hostname
 
