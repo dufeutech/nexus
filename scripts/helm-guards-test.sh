@@ -39,7 +39,7 @@ expect_fail() {
 
 # Minimum viable values per chart (mirrors ci.yml).
 IP_BASE=(--set postgres.url=postgres://u:p@h:5432/identity
-         --set authzAdmin.adminToken=ci-dummy
+         --set authzAdmin.adminToken=ci-dummy --set authzAdmin.legacyTokenOk=true
          --set routingPg.url=postgres://u:p@h:5432/routing)
 IP_ORIGIN_NP=(--set originEnforcement.networkPolicy.enabled=true
               --set originEnforcement.networkPolicy.backendSelector.app=backend)
@@ -89,10 +89,10 @@ ok "$([ "$N" = "0" ] && echo 1 || echo 0)" "empty allowlist renders 0 non-enrich
 echo "== edge-platform (umbrella): same guards on the combined edge =="
 $HELM dependency update "$CHARTS/edge-platform" >/dev/null
 EP_BASE=(--set identity-plane.postgres.url=postgres://u:p@h:5432/identity
-         --set identity-plane.authzAdmin.adminToken=ci-dummy
+         --set identity-plane.authzAdmin.adminToken=ci-dummy --set identity-plane.authzAdmin.legacyTokenOk=true
          --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing
          --set routing-plane.postgres.url=postgres://u:p@h:5432/routing
-         --set routing-plane.controlPlane.auth.token=ci-dummy)
+         --set routing-plane.controlPlane.auth.token=ci-dummy --set routing-plane.controlPlane.auth.legacyTokenOk=true)
 EP_ORIGIN_NP=(--set originEnforcement.networkPolicy.enabled=true
               --set originEnforcement.networkPolicy.backendSelector.app=backend)
 expect_fail "umbrella: no origin-enforcement choice refuses to render" "origin-enforcement" \

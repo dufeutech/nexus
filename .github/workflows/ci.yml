@@ -159,7 +159,9 @@ jobs:
           # jwksTls + originEnforcement are fail-closed guards: rendering an
           # identity-enriched edge requires an explicit choice for each
           # (edge-trust-anchor-integrity / edge-origin-trust).
-          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing \
+          # admin-plane-authorization is fail-closed: a legacy token alone is not a
+          # posture — it needs the explicit legacyTokenOk opt-in (migration posture).
+          ARGS="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set authzAdmin.legacyTokenOk=true --set routingPg.url=postgres://u:p@h:5432/routing \
                 --set oidc.jwksTls.enabled=true \
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint identity-plane $ARGS
@@ -172,8 +174,9 @@ jobs:
       - name: Lint & render routing-plane
         run: |
           # Render both the plain and the opt-in read-split (ROUTING_PG_READ_URL) paths.
-          # controlPlane.auth is fail-closed: a token (or auth.enabled=false) is required.
-          BASE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
+          # controlPlane.auth is fail-closed: a legacy token needs the legacyTokenOk
+          # opt-in (migration posture), or use auth.enabled=false (disabled).
+          BASE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy --set controlPlane.auth.legacyTokenOk=true"
           helm lint routing-plane $BASE
           helm template rel routing-plane $BASE >/dev/null
           # Operator delivery form (files is the default, rendered above).
@@ -187,10 +190,10 @@ jobs:
         run: |
           helm dependency update edge-platform
           ARGS="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity \
-                --set identity-plane.authzAdmin.adminToken=ci-dummy \
+                --set identity-plane.authzAdmin.adminToken=ci-dummy --set identity-plane.authzAdmin.legacyTokenOk=true \
                 --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing \
                 --set routing-plane.postgres.url=postgres://u:p@h:5432/routing \
-                --set routing-plane.controlPlane.auth.token=ci-dummy \
+                --set routing-plane.controlPlane.auth.token=ci-dummy --set routing-plane.controlPlane.auth.legacyTokenOk=true \
                 --set identity-plane.oidc.jwksTls.enabled=true \
                 --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           helm lint edge-platform $ARGS
@@ -238,10 +241,11 @@ jobs:
       - name: Render every chart under each delivery form
         working-directory: deploy/helm
         run: |
-          IDENT="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set routingPg.url=postgres://u:p@h:5432/routing --set oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
-          ROUTE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy"
+          # admin-plane-authorization fail-closed: legacy token + legacyTokenOk opt-in (migration posture).
+          IDENT="--set postgres.url=postgres://u:p@h:5432/identity --set authzAdmin.adminToken=ci-dummy --set authzAdmin.legacyTokenOk=true --set routingPg.url=postgres://u:p@h:5432/routing --set oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
+          ROUTE="--set postgres.url=postgres://u:p@h:5432/routing --set controlPlane.auth.token=ci-dummy --set controlPlane.auth.legacyTokenOk=true"
           helm dependency update edge-platform >/dev/null
-          EDGE="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity --set identity-plane.authzAdmin.adminToken=ci-dummy --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing --set routing-plane.postgres.url=postgres://u:p@h:5432/routing --set routing-plane.controlPlane.auth.token=ci-dummy --set identity-plane.oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
+          EDGE="--set identity-plane.postgres.url=postgres://u:p@h:5432/identity --set identity-plane.authzAdmin.adminToken=ci-dummy --set identity-plane.authzAdmin.legacyTokenOk=true --set identity-plane.routingPg.url=postgres://u:p@h:5432/routing --set routing-plane.postgres.url=postgres://u:p@h:5432/routing --set routing-plane.controlPlane.auth.token=ci-dummy --set routing-plane.controlPlane.auth.legacyTokenOk=true --set identity-plane.oidc.jwksTls.enabled=true --set originEnforcement.networkPolicy.enabled=true --set originEnforcement.networkPolicy.backendSelector.app=backend"
           for mode in files operator otlp-only; do
             echo "== monitoring.delivery=$mode =="
             helm template rel identity-plane $IDENT --set monitoring.delivery=$mode >/dev/null
