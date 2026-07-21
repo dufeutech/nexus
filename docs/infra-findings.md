@@ -282,3 +282,69 @@ complete and **verified green on the live cluster** — the CertMagic schema + D
 the ACME account + store Secrets (ESO), the front-tier/ask Services and NetworkPolicy all come up; only
 the pods can't pull. `frontTier.enabled` is held at `false` (cluster kept healthy, substrate ready) and
 flips to `true` the moment `ghcr.io/dufeutech/caddy-front` exists and is pinned._
+
+## N14 — the CertMagic migration is search_path-dependent, so tables land in the wrong schema
+
+**Status:** resolved (this change) · **Found:** 2026-07-21, front tier live on the infra cluster ·
+**Severity:** front-tier `CrashLoopBackOff` — the customer-domain TLS terminator cannot start.
+
+### What
+
+`routing-rs/store-postgres/migrations/0001_certmagic_store.sql` (and its compose mirror
+`postgres-init/40-certmagic-store.sql`) `CREATE`s its tables **unqualified**:
+
+```sql
+\connect routing
+CREATE TABLE IF NOT EXISTS certmagic_data ( … );
+CREATE TABLE IF NOT EXISTS certmagic_locks ( … );
+```
+
+Where an unqualified `CREATE` lands depends on the applying role's `search_path` (`"$user", public`).
+On a database where the store is owned by a dedicated role **and a schema of that role's name exists**
+— e.g. infra runs the routing store as owner `routing`, and a `routing` schema exists — `"$user"`
+resolves to `routing`, so the tables are created in **`routing.*`**, not `public`. The Caddy DB role
+(`caddy`), whose `search_path` resolves to `public`, then cannot see them:
+
+```
+Error: loading initial config: … creating storage value: pq: relation "certmagic_data" does not exist
+```
+
+The migration's own header says these live "in the routing database's **PUBLIC** schema" — the intent
+was always public; the SQL just didn't enforce it. The compose lab doesn't hit this because its store
+role's `search_path` resolves straight to `public` (no same-named schema in front of it).
+
+### Why it matters
+
+It's a silent, environment-dependent placement bug: the same migration "succeeds" (exit 0, tables
+created) yet puts the tables where the consumer can't find them, and only on a realistic multi-schema
+/ dedicated-owner deployment — exactly the k8s target. The front tier then crash-loops on startup with
+a confusing "relation does not exist" despite a green migration.
+
+### Evidence (reproduce)
+
+```bash
+# as a role `r` that owns a schema named `r`, apply the migration, then look:
+psql -d routing -c "\dt routing.certmagic_*"   # -> tables ARE here (unintended)
+psql -d routing -c "\dt public.certmagic_*"    # -> "Did not find any relation" (where Caddy looks)
+# Caddy (storage postgres, role caddy) then: pq: relation "certmagic_data" does not exist
+```
+
+### Suggested fix (nexus-side)
+
+**Schema-qualify the DDL** (done in this change): `CREATE TABLE IF NOT EXISTS public.certmagic_data …`
+/ `… public.certmagic_locks …` in both the migration and the compose mirror, so placement is
+deterministic regardless of the applying role's `search_path`. (Equivalent alternatives: a leading
+`SET search_path TO public;`, or `SELECT set_config('search_path','public',false)`.) The Caddy DB role
+already needs only `USAGE` on `public` + DML on those two tables — which now matches where they live.
+
+Verified against a real Postgres 16 reproducing the bug scenario (role `routing` owning a same-named
+schema, `search_path "$user", public`): the unqualified DDL lands in `routing.*` (0 in `public`); the
+qualified migration lands in `public.*` and the `caddy` role resolves `certmagic_data` with no
+"relation does not exist". One precondition surfaced and now documented in the migration header:
+**PG15+ requires the applying role to hold `CREATE` on `public`** (Postgres 15 dropped the default
+grant to `PUBLIC`), else the qualified `CREATE` fails `permission denied for schema public` — infra's
+provisioning already grants this, so it is a documented precondition, not an added burden.
+
+_Raised by infra-v1 (change `edge-front-tier-cutover`). Infra worked around it in its provisioning Job
+(forces `search_path=public` via `PGOPTIONS`, drops the mis-placed tables, grants on `public.*`) and
+the front tier is now live + healthy on staging; this schema-qualification is the durable upstream fix._
