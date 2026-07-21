@@ -8,7 +8,7 @@ FROM caddy:${CADDY_VERSION}-builder AS build
 # Pin the module to a commit in real builds: --with github.com/yroc92/postgres-storage@<sha>
 RUN xcaddy build --with github.com/yroc92/postgres-storage
 
-FROM caddy:${CADDY_VERSION}
+FROM caddy:${CADDY_VERSION} AS caddy
 COPY --from=build /usr/bin/caddy /usr/bin/caddy
 # The Caddyfile is MOUNTED read-only by the orchestrator (native config, not baked),
 # so a config change never rebuilds the image.

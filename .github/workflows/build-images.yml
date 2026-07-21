@@ -43,6 +43,10 @@ jobs:
           # Routing plane — one workspace, two targets (../routing-rs)
           - { name: tenant-router,        context: routing-rs,  target: tenant-router }
           - { name: control-plane,        context: routing-rs,  target: control-plane }
+          # Customer-domain TLS front tier — stock Caddy + the xcaddy postgres-storage module
+          # (deploy/caddy/Dockerfile). The edge-platform umbrella's frontTier.image pulls this
+          # (infra finding N13 — the Helm front tier shipped but its image was never published).
+          - { name: caddy-front,          context: deploy/caddy, target: caddy }
     steps:
       - name: Checkout
         uses: actions/checkout@v5

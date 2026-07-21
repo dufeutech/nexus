@@ -212,3 +212,66 @@ Envoy listener (`edge.proxyProtocol.enabled`) so an L4 SNI router preserves the 
 Default off — an existing release is unaffected until `frontTier.enabled=true`. Remaining before the
 cutover: a lab bring-up (chart `frontTier` enabled end-to-end, incl. the ACME account-key seed) and
 flipping `frontTier.acme.caDir` from LE staging to production.
+
+## N13 — the front-tier Caddy image is never published, so `frontTier.enabled=true` cannot pull
+
+### What
+
+The N12 front tier ships as Helm templates + a `Dockerfile`, but the **image itself is not published
+to any registry**. `build-images.yml` builds only the five Rust planes (`identity-sidecar-rs`,
+`identity-authz-admin`, `identity-membership-sync`, `tenant-router`, `control-plane`); the Caddy
+front-tier image (`deploy/caddy/Dockerfile` — stock Caddy + the `xcaddy` `postgres-storage` module)
+is built **only locally for the compose lab** (`deploy/caddy/docker-compose.lab.yaml` →
+`caddy-front/caddy:lab`). The chart default `frontTier.image.repository: caddy-front/caddy`
+(`deploy/helm/edge-platform/values.yaml`) is a bare name that resolves to nothing on a cluster.
+
+### Why it matters
+
+It is the exact analogue of the N12 chart gap, one layer down: the *capability* is code-complete but
+the *artifact a cluster consumes* was never produced. On a real k8s bring-up the front-tier pods go
+straight to `ImagePullBackOff` — the feature cannot run. Stock `caddy:2.8` cannot substitute: without
+the `postgres-storage` module the `storage postgres { … }` global option fails to load, so the shared
+CertMagic store (the whole point of N12) is unavailable. So today `frontTier.enabled=true` is a
+non-starter downstream regardless of how correct the templates are.
+
+### Evidence (reproduce)
+
+```bash
+# the front-tier image is not in the build matrix (only the 5 planes are):
+grep -A2 'matrix' .github/workflows/build-images.yml | grep -E 'name:'
+# -> identity-sidecar-rs, identity-authz-admin, identity-membership-sync, tenant-router, control-plane
+#    (no caddy / caddy-front)
+
+# it exists only as a local lab build, never pushed:
+grep -rn 'caddy-front' deploy/caddy/*.yaml deploy/helm/edge-platform/values.yaml
+# -> compose builds caddy-front/caddy:lab; the chart default repository is the bare `caddy-front/caddy`
+
+# live symptom on the infra cluster after frontTier.enabled=true:
+#   kubectl -n edge get pods -l app.kubernetes.io/component=front-tier
+#   -> edge-…-front-tier-…  0/1  ImagePullBackOff   (caddy-front/caddy:<appVersion> is unpullable)
+```
+
+### Suggested fix (nexus-side)
+
+**Publish the front-tier image alongside the five planes** — a one-line matrix add (done in this
+change): `- { name: caddy-front, context: deploy/caddy, target: caddy }` in `build-images.yml`, which
+publishes `ghcr.io/<owner>/caddy-front` on the next `v*` tag / manual dispatch (the Dockerfile's final
+stage is named `caddy` so it is a clean build target). Then:
+
+- set the chart default `frontTier.image.repository` to the published path (or the umbrella's global
+  image registry) so `frontTier.enabled=true` pulls without an operator override; and
+- **pin the `postgres-storage` module to a commit** in the Dockerfile (`--with …@<sha>`, as its own
+  comment and design D3 already call for) before the first published build, so the image is
+  reproducible and the DDL-off / DML-only-role posture stays verified against a known module.
+
+### Note — image publish trigger
+
+`build-images.yml` fires on `v*` tags (and manual dispatch), but the front tier landed under the
+`charts-2026-07-20` tag, not a `v*`. So publishing the new image needs either a fresh `v*` tag or a
+manual "Run workflow" with push enabled — otherwise the matrix entry exists but no image is produced.
+
+_Raised by infra-v1 (entry-layer `:443` cutover, change `edge-front-tier-cutover`). The infra side is
+complete and **verified green on the live cluster** — the CertMagic schema + DML-only `caddy` role,
+the ACME account + store Secrets (ESO), the front-tier/ask Services and NetworkPolicy all come up; only
+the pods can't pull. `frontTier.enabled` is held at `false` (cluster kept healthy, substrate ready) and
+flips to `true` the moment `ghcr.io/dufeutech/caddy-front` exists and is pinned._
