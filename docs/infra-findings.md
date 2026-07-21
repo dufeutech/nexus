@@ -337,6 +337,14 @@ deterministic regardless of the applying role's `search_path`. (Equivalent alter
 `SET search_path TO public;`, or `SELECT set_config('search_path','public',false)`.) The Caddy DB role
 already needs only `USAGE` on `public` + DML on those two tables — which now matches where they live.
 
+Verified against a real Postgres 16 reproducing the bug scenario (role `routing` owning a same-named
+schema, `search_path "$user", public`): the unqualified DDL lands in `routing.*` (0 in `public`); the
+qualified migration lands in `public.*` and the `caddy` role resolves `certmagic_data` with no
+"relation does not exist". One precondition surfaced and now documented in the migration header:
+**PG15+ requires the applying role to hold `CREATE` on `public`** (Postgres 15 dropped the default
+grant to `PUBLIC`), else the qualified `CREATE` fails `permission denied for schema public` — infra's
+provisioning already grants this, so it is a documented precondition, not an added burden.
+
 _Raised by infra-v1 (change `edge-front-tier-cutover`). Infra worked around it in its provisioning Job
 (forces `search_path=public` via `PGOPTIONS`, drops the mis-placed tables, grants on `public.*`) and
 the front tier is now live + healthy on staging; this schema-qualification is the durable upstream fix._

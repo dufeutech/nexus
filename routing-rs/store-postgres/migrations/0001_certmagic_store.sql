@@ -22,7 +22,11 @@
 -- nexus's routing tables. The tables are PUBLIC-schema-qualified EXPLICITLY (infra N14):
 -- applied as a role whose search_path prepends its own same-named schema (e.g. the
 -- `routing` DB owner, when a `routing` schema exists), an UNqualified CREATE would land
--- in `routing.*` — and Caddy's role, resolving `public`, then can't see them. Leaf
+-- in `routing.*` — and Caddy's role, resolving `public`, then can't see them.
+-- Precondition (PG15+): the applying role needs CREATE on `public` — Postgres 15 removed
+-- the default CREATE grant to PUBLIC, so a non-owner applier (e.g. `routing`) otherwise
+-- gets `permission denied for schema public` here; infra's provisioning grants it
+-- out-of-band alongside the caddy-role DML grants. Leaf
 -- certificates, private keys, OCSP staples and issuance
 -- metadata are all CertMagic key/value blobs in `certmagic_data.value` (bytea); the
 -- long-lived ACME ACCOUNT key is NOT here — it is custodied in OpenBao Transit (D8).
