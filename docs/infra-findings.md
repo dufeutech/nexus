@@ -212,3 +212,73 @@ Envoy listener (`edge.proxyProtocol.enabled`) so an L4 SNI router preserves the 
 Default off — an existing release is unaffected until `frontTier.enabled=true`. Remaining before the
 cutover: a lab bring-up (chart `frontTier` enabled end-to-end, incl. the ACME account-key seed) and
 flipping `frontTier.acme.caDir` from LE staging to production.
+
+## N13 — the front-tier Caddy image is never published, so `frontTier.enabled=true` cannot pull
+
+### What
+
+The N12 front tier ships as Helm templates + a `Dockerfile`, but the **image itself is not published
+to any registry**. `build-images.yml` builds only the five Rust planes (`identity-sidecar-rs`,
+`identity-authz-admin`, `identity-membership-sync`, `tenant-router`, `control-plane`); the Caddy
+front-tier image (`deploy/caddy/Dockerfile` — stock Caddy + the `xcaddy` `postgres-storage` module)
+is built **only locally for the compose lab** (`deploy/caddy/docker-compose.lab.yaml` →
+`caddy-front/caddy:lab`). The chart default `frontTier.image.repository: caddy-front/caddy`
+(`deploy/helm/edge-platform/values.yaml`) is a bare name that resolves to nothing on a cluster.
+
+### Why it matters
+
+It is the exact analogue of the N12 chart gap, one layer down: the *capability* is code-complete but
+the *artifact a cluster consumes* was never produced. On a real k8s bring-up the front-tier pods go
+straight to `ImagePullBackOff` — the feature cannot run. Stock `caddy:2.8` cannot substitute: without
+the `postgres-storage` module the `storage postgres { … }` global option fails to load, so the shared
+CertMagic store (the whole point of N12) is unavailable. So today `frontTier.enabled=true` is a
+non-starter downstream regardless of how correct the templates are.
+
+### Evidence (reproduce)
+
+```bash
+# the front-tier image is not in the build matrix (only the 5 planes are):
+grep -A2 'matrix' .github/workflows/build-images.yml | grep -E 'name:'
+# -> identity-sidecar-rs, identity-authz-admin, identity-membership-sync, tenant-router, control-plane
+#    (no caddy / caddy-front)
+
+# it exists only as a local lab build, never pushed:
+grep -rn 'caddy-front' deploy/caddy/*.yaml deploy/helm/edge-platform/values.yaml
+# -> compose builds caddy-front/caddy:lab; the chart default repository is the bare `caddy-front/caddy`
+
+# live symptom on the infra cluster after frontTier.enabled=true:
+#   kubectl -n edge get pods -l app.kubernetes.io/component=front-tier
+#   -> edge-…-front-tier-…  0/1  ImagePullBackOff   (caddy-front/caddy:<appVersion> is unpullable)
+```
+
+### Suggested fix (nexus-side)
+
+**Publish the front-tier image alongside the five planes.** All three nexus-side parts are done in
+this change:
+
+- **build matrix** — `- { name: caddy-front, context: deploy/caddy, target: caddy }` in
+  `build-images.yml` (the Dockerfile's final stage is named `caddy` for a clean build target), so a
+  `v*` tag / manual dispatch publishes `ghcr.io/<owner>/caddy-front`;
+- **chart default** — `frontTier.image.repository: ghcr.io/dufeutech/caddy-front` (was the bare
+  `caddy-front/caddy`, which resolves to docker.io → `ImagePullBackOff`), so `frontTier.enabled=true`
+  pulls without an operator override; the tag resolves to the umbrella's appVersion (`0.0.7`); and
+- **module pin** — the Dockerfile pins `postgres-storage@276797aefe401b738781692d278a158c53b99208`
+  (the module HEAD that introduced the optional-DDL flag the `disable_ddl true` posture depends on),
+  so the published image is reproducible and the DML-only-role posture stays verified against a known
+  module. The compose lab shares this Dockerfile, so lab and cluster build the same module.
+
+### Note — image publish trigger
+
+`build-images.yml` fires on `v*` tags (and manual dispatch), but the front tier landed under the
+`charts-2026-07-20` tag, not a `v*`. The chart pulls `caddy-front:0.0.7` (appVersion), but `v0.0.7`
+was cut before the `caddy-front` matrix entry existed, so that image tag has no build yet. Producing
+it: **manual "Run workflow" on build-images with `tag=0.0.7`, push enabled**. This is safe to run
+from `main` — no commit has touched `identity-rs/` or `routing-rs/` since `v0.0.7`, so the five Rust
+planes rebuild byte-for-byte identical and only the missing `caddy-front:0.0.7` is genuinely new (no
+existing release image is mutated). Alternatively cut a fresh `v*` (which also rebuilds all six).
+
+_Raised by infra-v1 (entry-layer `:443` cutover, change `edge-front-tier-cutover`). The infra side is
+complete and **verified green on the live cluster** — the CertMagic schema + DML-only `caddy` role,
+the ACME account + store Secrets (ESO), the front-tier/ask Services and NetworkPolicy all come up; only
+the pods can't pull. `frontTier.enabled` is held at `false` (cluster kept healthy, substrate ready) and
+flips to `true` the moment `ghcr.io/dufeutech/caddy-front` exists and is pinned._

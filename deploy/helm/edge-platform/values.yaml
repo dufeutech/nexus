@@ -190,7 +190,10 @@ edge:
 frontTier:
   enabled: false
   image:
-    repository: caddy-front/caddy
+    # Published by build-images.yml (the caddy-front matrix entry) to GHCR alongside
+    # the five Rust planes (infra N13). A bare name would resolve to docker.io and
+    # ImagePullBackOff, so the default is the fully-qualified GHCR path.
+    repository: ghcr.io/dufeutech/caddy-front
     # Tag resolution mirrors the edge: per-image tag -> global.image.tag -> appVersion.
     tag: ""
     pullPolicy: IfNotPresent
