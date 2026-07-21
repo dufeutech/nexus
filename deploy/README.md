@@ -52,18 +52,20 @@ half (real origin enforcement, secrets, pins, stores, monitoring).
 
 ## Build the images
 
-All five images come from the two Rust workspaces, selected by Docker build
-target (each workspace shares one `core` crate). They are published to **public
-GHCR**, so clusters pull them with no registry credentials and no `imagePullSecret`.
+Six images. Five come from the two Rust workspaces, selected by Docker build
+target (each workspace shares one `core` crate); the sixth is the customer-domain
+TLS front tier (stock Caddy + the `xcaddy` `postgres-storage` module, built from
+`caddy/`). They are published to **public GHCR**, so clusters pull them with no
+registry credentials and no `imagePullSecret`.
 
 ### In CI (recommended) — GitHub Actions → GHCR
 
-The `Build images` workflow (`.github/workflows/build-images.yml`) builds all five
+The `Build images` workflow (`.github/workflows/build-images.yml`) builds all six
 and pushes them to GitHub Container Registry. It runs automatically on a `v*` tag,
 and has a **manual "Run workflow" button**: GitHub → **Actions** → **Build images**
 → **Run workflow** (optionally enter a tag like `0.1.0`; the short commit SHA is
 always tagged). Auth uses the built-in `GITHUB_TOKEN` — no secrets to set up. The
-images land at `ghcr.io/<owner>/{identity-sidecar-rs,identity-authz-admin,identity-membership-sync,tenant-router,control-plane}`.
+images land at `ghcr.io/<owner>/{identity-sidecar-rs,identity-authz-admin,identity-membership-sync,tenant-router,control-plane,caddy-front}`.
 
 [![Build images](https://github.com/OWNER/REPO/actions/workflows/build-images.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/build-images.yml)
 
@@ -86,7 +88,9 @@ docker build --target membership-sync -t REGISTRY/identity-membership-sync:0.1.0
 # routing plane
 docker build --target tenant-router -t REGISTRY/tenant-router:0.1.0 ../routing-rs
 docker build --target control-plane -t REGISTRY/control-plane:0.1.0 ../routing-rs
-docker push REGISTRY/...   # all five
+# customer-domain TLS front tier (stock Caddy + xcaddy postgres-storage; context ./caddy)
+docker build --target caddy         -t REGISTRY/caddy-front:0.1.0 ./caddy
+docker push REGISTRY/...   # all six
 ```
 
 (The compose stack can build them for you — see below.)

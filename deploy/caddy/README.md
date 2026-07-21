@@ -26,14 +26,21 @@ interface** — so nexus core has no compile-time dependency on it. See the chan
 
 ## Build (the Postgres storage module is not in stock Caddy)
 
-```bash
-xcaddy build --with github.com/yroc92/postgres-storage
+`Dockerfile` bakes the module into the image via `xcaddy`, pinned to a commit for
+reproducibility (infra N13 / design D3):
+
+```dockerfile
+RUN xcaddy build --with github.com/yroc92/postgres-storage@276797a
 ```
 
-Bake that into the edge image. Pin the module to a commit and re-verify it still tracks
-current CertMagic before bumping Caddy. (`certmagic-sqlstorage` is a schema-identical
-alternative — same `certmagic_data` / `certmagic_locks` tables — so the migration and
-`disable_ddl true` posture below apply to either; the Storage interface is the seam.)
+Published to GHCR by `build-images.yml` as `ghcr.io/<owner>/caddy-front` alongside the
+five Rust planes, so the Helm `frontTier.image` default (`ghcr.io/dufeutech/caddy-front`,
+tag = the umbrella's appVersion) pulls it with no operator override. The compose lab builds
+the **same** `Dockerfile`, so lab and cluster share the pinned module. Re-verify it still
+tracks current CertMagic before bumping the pin or Caddy. (`certmagic-sqlstorage` is a
+schema-identical alternative — same `certmagic_data` / `certmagic_locks` tables — so the
+migration and `disable_ddl true` posture below apply to either; the Storage interface is
+the seam.)
 
 ## Environment contract
 
