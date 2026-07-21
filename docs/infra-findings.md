@@ -253,22 +253,29 @@ grep -rn 'caddy-front' deploy/caddy/*.yaml deploy/helm/edge-platform/values.yaml
 
 ### Suggested fix (nexus-side)
 
-**Publish the front-tier image alongside the five planes** — a one-line matrix add (done in this
-change): `- { name: caddy-front, context: deploy/caddy, target: caddy }` in `build-images.yml`, which
-publishes `ghcr.io/<owner>/caddy-front` on the next `v*` tag / manual dispatch (the Dockerfile's final
-stage is named `caddy` so it is a clean build target). Then:
+**Publish the front-tier image alongside the five planes.** All three nexus-side parts are done in
+this change:
 
-- set the chart default `frontTier.image.repository` to the published path (or the umbrella's global
-  image registry) so `frontTier.enabled=true` pulls without an operator override; and
-- **pin the `postgres-storage` module to a commit** in the Dockerfile (`--with …@<sha>`, as its own
-  comment and design D3 already call for) before the first published build, so the image is
-  reproducible and the DDL-off / DML-only-role posture stays verified against a known module.
+- **build matrix** — `- { name: caddy-front, context: deploy/caddy, target: caddy }` in
+  `build-images.yml` (the Dockerfile's final stage is named `caddy` for a clean build target), so a
+  `v*` tag / manual dispatch publishes `ghcr.io/<owner>/caddy-front`;
+- **chart default** — `frontTier.image.repository: ghcr.io/dufeutech/caddy-front` (was the bare
+  `caddy-front/caddy`, which resolves to docker.io → `ImagePullBackOff`), so `frontTier.enabled=true`
+  pulls without an operator override; the tag resolves to the umbrella's appVersion (`0.0.7`); and
+- **module pin** — the Dockerfile pins `postgres-storage@276797aefe401b738781692d278a158c53b99208`
+  (the module HEAD that introduced the optional-DDL flag the `disable_ddl true` posture depends on),
+  so the published image is reproducible and the DML-only-role posture stays verified against a known
+  module. The compose lab shares this Dockerfile, so lab and cluster build the same module.
 
 ### Note — image publish trigger
 
 `build-images.yml` fires on `v*` tags (and manual dispatch), but the front tier landed under the
-`charts-2026-07-20` tag, not a `v*`. So publishing the new image needs either a fresh `v*` tag or a
-manual "Run workflow" with push enabled — otherwise the matrix entry exists but no image is produced.
+`charts-2026-07-20` tag, not a `v*`. The chart pulls `caddy-front:0.0.7` (appVersion), but `v0.0.7`
+was cut before the `caddy-front` matrix entry existed, so that image tag has no build yet. Producing
+it: **manual "Run workflow" on build-images with `tag=0.0.7`, push enabled**. This is safe to run
+from `main` — no commit has touched `identity-rs/` or `routing-rs/` since `v0.0.7`, so the five Rust
+planes rebuild byte-for-byte identical and only the missing `caddy-front:0.0.7` is genuinely new (no
+existing release image is mutated). Alternatively cut a fresh `v*` (which also rebuilds all six).
 
 _Raised by infra-v1 (entry-layer `:443` cutover, change `edge-front-tier-cutover`). The infra side is
 complete and **verified green on the live cluster** — the CertMagic schema + DML-only `caddy` role,

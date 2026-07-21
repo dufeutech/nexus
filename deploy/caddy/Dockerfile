@@ -5,8 +5,11 @@
 ARG CADDY_VERSION=2.8
 
 FROM caddy:${CADDY_VERSION}-builder AS build
-# Pin the module to a commit in real builds: --with github.com/yroc92/postgres-storage@<sha>
-RUN xcaddy build --with github.com/yroc92/postgres-storage
+# Pinned to a commit for reproducible builds (infra N13 / design D3). This is the module
+# HEAD that introduced the optional-DDL flag — the exact feature the Caddyfile's
+# `storage postgres { disable_ddl true }` relies on, so the DML-only-role posture stays
+# verified against a known module. Re-verify it still tracks current CertMagic before bumping.
+RUN xcaddy build --with github.com/yroc92/postgres-storage@276797aefe401b738781692d278a158c53b99208
 
 FROM caddy:${CADDY_VERSION} AS caddy
 COPY --from=build /usr/bin/caddy /usr/bin/caddy
