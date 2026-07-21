@@ -19,7 +19,11 @@
 -- Location: this lives in the `routing` database's PUBLIC schema (the same managed
 -- Postgres as the routing store — one backup/HA story, per docs/on-demand-tls.md),
 -- deliberately SEPARATE from the `routing.*` schema so cert blobs never collide with
--- nexus's routing tables. Leaf certificates, private keys, OCSP staples and issuance
+-- nexus's routing tables. The tables are PUBLIC-schema-qualified EXPLICITLY (infra N14):
+-- applied as a role whose search_path prepends its own same-named schema (e.g. the
+-- `routing` DB owner, when a `routing` schema exists), an UNqualified CREATE would land
+-- in `routing.*` — and Caddy's role, resolving `public`, then can't see them. Leaf
+-- certificates, private keys, OCSP staples and issuance
 -- metadata are all CertMagic key/value blobs in `certmagic_data.value` (bytea); the
 -- long-lived ACME ACCOUNT key is NOT here — it is custodied in OpenBao Transit (D8).
 --
@@ -33,7 +37,7 @@
 -- Key/value blob store: one row per CertMagic storage key (cert, key, metadata,
 -- OCSP staple). `key` is CertMagic's storage path; `value` is the opaque blob;
 -- `modified` drives CertMagic's freshness/stat checks.
-CREATE TABLE IF NOT EXISTS certmagic_data (
+CREATE TABLE IF NOT EXISTS public.certmagic_data (
     key      text PRIMARY KEY,
     value    bytea,
     modified timestamptz DEFAULT current_timestamp
@@ -43,7 +47,7 @@ CREATE TABLE IF NOT EXISTS certmagic_data (
 -- a lock keyed by the issuance path before ordering a certificate; peers wait on it
 -- and then serve the resulting cert rather than each placing their own CA order.
 -- `expires` bounds a lock so a crashed holder cannot wedge issuance forever.
-CREATE TABLE IF NOT EXISTS certmagic_locks (
+CREATE TABLE IF NOT EXISTS public.certmagic_locks (
     key     text PRIMARY KEY,
     expires timestamptz DEFAULT current_timestamp
 );

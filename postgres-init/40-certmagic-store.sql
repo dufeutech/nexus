@@ -16,13 +16,13 @@
 
 \connect routing
 
-CREATE TABLE IF NOT EXISTS certmagic_data (
+CREATE TABLE IF NOT EXISTS public.certmagic_data (
     key      text PRIMARY KEY,
     value    bytea,
     modified timestamptz DEFAULT current_timestamp
 );
 
-CREATE TABLE IF NOT EXISTS certmagic_locks (
+CREATE TABLE IF NOT EXISTS public.certmagic_locks (
     key     text PRIMARY KEY,
     expires timestamptz DEFAULT current_timestamp
 );
