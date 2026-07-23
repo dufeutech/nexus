@@ -20,6 +20,7 @@ groups:
           sum(rate(envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="edge"}[5m]))
             / sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m]))
             > {{ $t.edge5xxRatio }}
+            and sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m])) > {{ $t.edgeMinRps }}
         for: 5m
         labels: { severity: critical, plane: edge }
         annotations:
@@ -28,7 +29,7 @@ groups:
             More than {{ $t.edge5xxRatio }} of combined-edge responses were 5xx over
             5m — the edge or a backend pool is failing. Envoy admin stats (scraped).
       - alert: NexusEdgeLatencyHigh
-        expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }}
+        expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }} and sum(rate(envoy_http_downstream_rq_time_count{envoy_http_conn_manager_prefix="edge"}[5m])) > {{ $t.edgeMinRps }}
         for: 10m
         labels: { severity: warning, plane: edge }
         annotations:

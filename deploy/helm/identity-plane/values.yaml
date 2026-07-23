@@ -444,7 +444,9 @@ monitoring:
   thresholds:
     edge5xxRatio: 0.02              # edge 5xx / all responses over 5m (Envoy, scraped)
     edgeP99Milliseconds: 500        # edge downstream request p99 (Envoy rq_time is ms)
+    edgeMinRps: 0.2                 # min edge req/s (≈60 req/5m) before the ratio/p99 edge alerts may fire
     enrichP99Seconds: 0.05          # sidecar ext_proc p99
+    enrichMinRps: 0.2               # min enrich req/s (≈60 req/5m) before the p99 enrich alert may fire
     forbiddenPerSecond: 5           # authz gate 403 policy-denials/s (needs `result`)
     failClosedPerSecond: 0.1        # sidecar fail-closed 503/s — should be ~0 (needs `result`)
     membershipErrorsPerSecond: 0.5  # membership-sync errors/s
