@@ -32,5 +32,5 @@
 - [x] 6.1 `helm template` each of the three subcharts (operator + files form); every guarded `expr` renders with a balanced `and` and the correct `0.2` floor.
 - [x] 6.2 Diffed the rendered `nexus-edge.slo` group across all three charts: the two edge `expr`s (incl. the floor) are **byte-identical** in all three. (The only cross-chart difference is the pre-existing `description` wording — "combined-edge" vs "edge" — which predates this change and is out of scope; the spec requires the *floor* to be identical, which holds.)
 - [x] 6.3 `promtool check rules` (prom/prometheus:v2.53.0 via Docker) against all three rendered rule files: SUCCESS (2 + 9 + 6 rules); the guarded exprs parse.
-- [ ] 6.4 `/opsx:sync` the `service-slo-policy` delta into the main spec; `/opsx:archive` the change.
-- [ ] 6.5 Signal infra (`alert-noise-retune`) that upstream guards have landed: drop the local `NexusRoutingLatencyHigh` patch in `files/nexus-rules/*.yml` and re-vendor from this repo.
+- [x] 6.4 `/opsx:sync`ed the `service-slo-policy` delta into the main spec (all 37 specs validate) and `/opsx:archive`d the change.
+- [ ] 6.5 **Hand-off (downstream, not this repo):** infra's `alert-noise-retune` change owns dropping the local `NexusRoutingLatencyHigh` patch in `files/nexus-rules/*.yml` and re-vendoring from this repo now that the upstream guards have landed.
