@@ -23,7 +23,11 @@ slos:
     sli:
       events:
         error_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[{{.window}}]))
-        total_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}]))
+        # Min-sample floor (N15): gate the ratio on >=60 samples in the window so idle
+        # traffic can't page on noise. 60 = the repo's existing bar (enrichMinRps 0.2 ≈
+        # 60 req/5m), applied per-window via increase(); below it the denominator is empty
+        # so the SLI (and every burn-rate alert built on it) yields no series.
+        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[{{.window}}])) > 60)
     alerting:
       name: IdentitySidecarAvailability
       labels:
@@ -50,7 +54,9 @@ slos:
             -
             sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_bucket{result!~"not_ready|unavailable_closed",le="0.1"}[{{.window}}]))
           )
-        total_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))
+        # Min-sample floor (N15): see the availability SLO above. Denominator is the
+        # successful-enrichment count, so the floor gates on served-request volume per window.
+        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}])) > 60)
     alerting:
       name: IdentitySidecarLatency
       labels:
