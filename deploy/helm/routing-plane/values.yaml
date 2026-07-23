@@ -352,7 +352,9 @@ monitoring:
   thresholds:
     edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
     edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
+    edgeMinRps: 0.2               # min edge req/s (≈60 req/5m) before the ratio/p99 edge alerts may fire
     routingP99Seconds: 0.05       # tenant-router decision p99
+    routingMinRps: 0.2            # min routing req/s (≈60 req/5m) before the p99 routing alert may fire
     rejectPerSecond: 10           # unknown-host rejects (404)/s (needs `result`)
     unauthorizedPerSecond: 1      # control-plane 401/s (needs `op`)
 

@@ -26,7 +26,7 @@ groups:
             unreachable) for 10m. Host→workspace resolution fails closed while it is
             down, so requests cannot be routed.
       - alert: NexusRoutingLatencyHigh
-        expr: histogram_quantile(0.99, sum by (le) (rate(router_ext_proc_duration_seconds_bucket[5m]))) > {{ $t.routingP99Seconds }}
+        expr: histogram_quantile(0.99, sum by (le) (rate(router_ext_proc_duration_seconds_bucket[5m]))) > {{ $t.routingP99Seconds }} and sum(rate(router_ext_proc_duration_seconds_count[5m])) > {{ $t.routingMinRps }}
         for: 10m
         labels: { severity: warning, plane: routing }
         annotations:
@@ -65,6 +65,7 @@ groups:
           sum(rate(envoy_http_downstream_rq_xx{envoy_response_code_class="5",envoy_http_conn_manager_prefix="edge"}[5m]))
             / sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m]))
             > {{ $t.edge5xxRatio }}
+            and sum(rate(envoy_http_downstream_rq_xx{envoy_http_conn_manager_prefix="edge"}[5m])) > {{ $t.edgeMinRps }}
         for: 5m
         labels: { severity: critical, plane: edge }
         annotations:
@@ -73,7 +74,7 @@ groups:
             More than {{ $t.edge5xxRatio }} of edge responses were 5xx over 5m — the
             edge or a backend pool is failing. Envoy admin stats (scraped).
       - alert: NexusEdgeLatencyHigh
-        expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }}
+        expr: histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{envoy_http_conn_manager_prefix="edge"}[5m]))) > {{ $t.edgeP99Milliseconds }} and sum(rate(envoy_http_downstream_rq_time_count{envoy_http_conn_manager_prefix="edge"}[5m])) > {{ $t.edgeMinRps }}
         for: 10m
         labels: { severity: warning, plane: edge }
         annotations:

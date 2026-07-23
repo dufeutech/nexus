@@ -305,6 +305,7 @@ monitoring:
   thresholds:
     edge5xxRatio: 0.02            # edge 5xx / all responses over 5m (Envoy, scraped)
     edgeP99Milliseconds: 500      # edge downstream request p99 (Envoy rq_time is ms)
+    edgeMinRps: 0.2               # min edge req/s (≈60 req/5m) before the ratio/p99 edge alerts may fire
 
   # operator form ONLY: extra labels so your operator's ruleSelector matches
   # (e.g. release: kube-prom-stack).
