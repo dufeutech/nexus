@@ -330,7 +330,14 @@ must emit — is the "Box telemetry contract" section of
     dashboard ConfigMaps. Requires that operator. On the umbrella, set it on each subchart
     (`identity-plane.monitoring.delivery=operator`, `routing-plane…`) plus the umbrella.
   - `otlp-only` → render neither; metrics still reach the store by OTLP push.
-  - Tune the alert `> X` values under `monitoring.thresholds` (both forms). The burn-rate
+  - Tune the alert `> X` values under `monitoring.thresholds` (both forms). The same block
+    also holds the **low-traffic floors** (`edgeMinRps` / `enrichMinRps` / `routingMinRps`,
+    default `0.2` rps ≈ 60 req/5m): the ratio- and p99-over-rate alerts (`NexusEdge5xxHigh`,
+    `NexusEdgeLatencyHigh`, `NexusIdentityEnrichLatencyHigh`, `NexusRoutingLatencyHigh`) carry
+    an `and sum(rate(<count>[5m])) > <floor>` guard so a near-idle service can't turn a handful
+    of requests into a "40% error rate" or a cold-path p99 — they only fire once request rate
+    clears the floor. `edgeMinRps` is identical across all three subcharts (the edge alerts are
+    duplicated), so the rendered edge rule is the same wherever it comes from. The burn-rate
     rules are **Sloth-generated** from `monitoring/slo/*.slo.yaml` (regenerate with
     `monitoring/slo/generate.sh`, which stages them into each plane chart's `files/slo/`)
     — never hand-edit the embedded rules; lab and prod evaluate byte-identical rules. On
