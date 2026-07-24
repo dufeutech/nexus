@@ -23,11 +23,12 @@ slos:
     sli:
       events:
         error_query: sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[{{.window}}]))
-        # Min-sample floor (N15): gate the ratio on >=60 samples in the window so idle
-        # traffic can't page on noise. 60 = the repo's existing bar (enrichMinRps 0.2 ≈
-        # 60 req/5m), applied per-window via increase(); below it the denominator is empty
-        # so the SLI (and every burn-rate alert built on it) yields no series.
-        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[{{.window}}])) > 60)
+        # Min-sample floor (N15→N16): gate the ratio on a >0.2 req/s rate over the window
+        # so idle traffic can't page on noise. 0.2 req/s = the repo's enrichMinRps bar,
+        # applied window-independently via rate() — the SAME floor on every window. (N15's
+        # per-window increase()>60 count was a no-op on long windows; N16.) Below the floor
+        # the denominator is empty so the SLI (and every burn-rate alert built on it) yields no series.
+        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[{{.window}}])) > 0.2)
     alerting:
       name: IdentitySidecarAvailability
       labels:
@@ -54,9 +55,9 @@ slos:
             -
             sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_bucket{result!~"not_ready|unavailable_closed",le="0.1"}[{{.window}}]))
           )
-        # Min-sample floor (N15): see the availability SLO above. Denominator is the
-        # successful-enrichment count, so the floor gates on served-request volume per window.
-        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}])) > 60)
+        # Min-sample floor (N15→N16): see the availability SLO above. Denominator is the
+        # successful-enrichment rate, so the floor gates on served-request rate (req/s) per window.
+        total_query: (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[{{.window}}])) > 0.2)
     alerting:
       name: IdentitySidecarLatency
       labels:

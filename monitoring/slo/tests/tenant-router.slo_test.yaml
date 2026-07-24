@@ -17,35 +17,39 @@ tests:
   - interval: 1m
     input_series:
       # production: every resolution is a fail-closed 503 (result="not_ready") ->
-      # error ratio = 1.0 (a total outage) for ~65m so every rate window has data.
-      # 20/min => increase(total[5m]) = 100, above the 60-sample floor (N15) so the SLI
-      # is defined on every window (this test asserts a firing outage, not idle noise).
+      # error ratio = 1.0 (a total outage) at 60/min = 1 req/s, sustained ~6h.
+      # Under the 0.2 req/s rate floor (N15→N16) the ticket's slow-burn arm corroborates
+      # a long window (2h AND 1d), so the 1d window must itself clear 0.2 req/s before the
+      # ticket can fire — at 1 req/s it clears by ~288m, so we evaluate at 360m with all of
+      # 5m/30m/1h/2h/6h/1d saturated ≥0.2 req/s. (A real service always carries this day of
+      # history; the synthetic counter starts at 0, hence the runway.) This is the
+      # above-floor complement to the N16 suppression case below.
       - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
-        values: '0+20x65'
+        values: '0+60x365'
       # staging: healthy — only successful hits, and a flat-zero not_ready counter ->
       # error ratio = 0.0 (its budget must stay untouched while production burns).
-      # Also above the floor (20/min) so its SLI is defined and asserted at 0.
+      # Also above the floor (1 req/s) so its SLI is defined and asserted at 0.
       - series: 'router_ext_proc_requests_total{result="hit", deployment_environment_name="staging"}'
-        values: '0+20x65'
+        values: '0+60x365'
       - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="staging"}'
-        values: '0x65'
+        values: '0x365'
 
     # --- SLI recording rule is per-environment and outcome-derived --------------
     promql_expr_test:
       - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="production"}'
-        eval_time: 60m
+        eval_time: 360m
         exp_samples:
           - labels: 'slo:sli_error:ratio_rate5m{deployment_environment_name="production", plane="routing", sloth_id="tenant-router-availability", sloth_service="tenant-router", sloth_slo="availability", sloth_window="5m"}'
             value: 1
       - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="staging"}'
-        eval_time: 60m
+        eval_time: 360m
         exp_samples:
           - labels: 'slo:sli_error:ratio_rate5m{deployment_environment_name="staging", plane="routing", sloth_id="tenant-router-availability", sloth_service="tenant-router", sloth_slo="availability", sloth_window="5m"}'
             value: 0
 
     # --- fast burn pages (and tickets) for production only ----------------------
     alert_rule_test:
-      - eval_time: 60m
+      - eval_time: 360m
         alertname: TenantRouterAvailability
         exp_alerts:
           - exp_labels:
@@ -135,15 +139,15 @@ tests:
 
   # ---------------------------------------------------------------------------
   # N15 — the min-sample floor: a bad ratio at near-idle traffic does NOT alert.
-  # A total outage (error ratio 1.0) but only ~2 requests / 5m: over ~1h of data every
-  # burn window holds < 60 samples, below the floor authored into total_query, so the
-  # SLI is undefined on every window and neither page nor ticket can fire. Without the
-  # floor this is exactly the go-live false page (idle-traffic noise, not an incident).
+  # A total outage (error ratio 1.0) but only ~2 requests / 5m = ~0.0067 req/s: below the
+  # 0.2 req/s rate floor authored into total_query on EVERY window, so the SLI is undefined
+  # and neither page nor ticket can fire. Without the floor this is exactly the go-live
+  # false page (idle-traffic noise, not an incident).
   # ---------------------------------------------------------------------------
   - interval: 5m
     input_series:
-      # 2 not_ready per 5m and nothing else: error ratio would be 1.0, but only ~24
-      # samples accumulate even in the 6h window over this hour — all below the 60 floor.
+      # 2 not_ready per 5m and nothing else: error ratio would be 1.0, but 0.0067 req/s is
+      # below the 0.2 req/s floor on every window.
       - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
         values: '0+2x12'
     promql_expr_test:
@@ -151,12 +155,48 @@ tests:
       - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="production"}'
         eval_time: 55m
         exp_samples: []
-      # ...and on the longest burn window too (still under 60 samples this hour), so
-      # there is no window on which the burn-rate alert can evaluate.
+      # ...and on the longest burn window too (0.0067 req/s << 0.2), so there is no window
+      # on which the burn-rate alert can evaluate.
       - expr: 'slo:sli_error:ratio_rate6h{sloth_slo="availability", deployment_environment_name="production"}'
         eval_time: 55m
         exp_samples: []
     alert_rule_test:
       - eval_time: 55m
+        alertname: TenantRouterAvailability
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # N16 — the regression the N15 count floor let through: a long-window bad ratio whose
+  # sample COUNT clears an equivalent 60-count but whose RATE is below 0.2 req/s is STILL
+  # withheld. ~0.12 req/s (7 req/min: 1 not_ready + 6 hit) sustained for ~7h. On the 6h
+  # window that is ~2,600 samples — far above N15's flat increase()>60 count (which is why
+  # TenantRouterLatency kept paging), yet 0.12 req/s < 0.2, so the rate floor empties the
+  # SLI on every window and NEITHER page nor ticket fires. The direct N16 fix, now tested.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      # 1 not_ready + 6 hit per minute => 7 req/min = 0.1167 req/s, error ratio 1/7 ≈ 0.143
+      # (the live N16 signature). Count over 6h ≈ 2,520 (>> 60); rate 0.1167 req/s (< 0.2).
+      - series: 'router_ext_proc_requests_total{result="not_ready", deployment_environment_name="production"}'
+        values: '0+1x420'
+      - series: 'router_ext_proc_requests_total{result="hit", deployment_environment_name="production"}'
+        values: '0+6x420'
+    promql_expr_test:
+      # The 6h sample COUNT is far above an old-style 60 floor (would have been "enough")...
+      - expr: 'sum(increase(router_ext_proc_requests_total{deployment_environment_name="production"}[6h])) > bool 60'
+        eval_time: 420m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      # ...but the RATE floor empties the SLI on the long window (0.1167 req/s < 0.2)...
+      - expr: 'slo:sli_error:ratio_rate6h{sloth_slo="availability", deployment_environment_name="production"}'
+        eval_time: 420m
+        exp_samples: []
+      # ...and on the short window too.
+      - expr: 'slo:sli_error:ratio_rate5m{sloth_slo="availability", deployment_environment_name="production"}'
+        eval_time: 420m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 420m
         alertname: TenantRouterAvailability
         exp_alerts: []

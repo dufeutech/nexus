@@ -343,11 +343,13 @@ must emit — is the "Box telemetry contract" section of
     — never hand-edit the embedded rules; lab and prod evaluate byte-identical rules. On
     the umbrella, run `helm dependency update` after a regenerate so the repackaged
     subcharts pick up the refreshed rules. Validate with `monitoring/slo/check.sh`.
-    The burn-rate SLIs carry the **same low-traffic guard** as a per-window minimum-**sample**
-    floor authored into each SLI's `total_query` (`and (sum(increase(<denom>[{{.window}}])) > 60)`;
-    60 ≈ the `*MinRps` `0.2` bar per 5m, but sample-count so long windows still monitor
-    low-traffic tenants) — so the `TenantRouter*` / `IdentitySidecar*` pages can't fire on
-    idle noise either (N15). Because it lives in the Sloth source, it survives regeneration.
+    The burn-rate SLIs carry the **same low-traffic guard** as a window-independent minimum-**rate**
+    floor authored into each SLI's `total_query` (`and (sum(rate(<denom>[{{.window}}])) > 0.2)`; the
+    identical `*MinRps` `0.2 req/s` bar on every window) — so the `TenantRouter*` / `IdentitySidecar*`
+    pages can't fire on idle noise either. This replaced N15's per-window `increase(...) > 60` sample
+    *count*, which was a no-op on long windows (60 samples / 6h ≈ 0.003 req/s), so the latency page
+    kept firing at ~0.12 req/s (N16); a rate is the only floor that is scale-invariant across the
+    5m→3d burn windows. Because it lives in the Sloth source, it survives regeneration.
   - **Collector caveat:** the `result`/`op`/`tier` metric attributes several rules and
     dashboard panels key on are LOW-cardinality nexus RED dimensions. Your OTel
     collector MUST keep them (nexus's lab collector does — `monitoring/otel-collector`);
