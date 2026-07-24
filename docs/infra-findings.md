@@ -455,3 +455,82 @@ _Raised by infra-v1 (surfaced from a live go-live page; relates to infra change 
 which added the same floor to the infra-owned routing rules and explicitly flagged the vendored Sloth
 SLOs as the remaining gap). Infra can silence/interim-patch the vendored copy, but that is reverted on
 the next chart re-vendor — the durable fix is the floor in the Sloth source spec here._
+
+## N16 — N15's per-window *sample* floor (`increase>60`) is too weak on long windows; `TenantRouterLatency` still pages on a wall-clock-bound cold miss
+
+**Status:** open · **Found:** 2026-07-24, one day after N15 shipped (`app.dufeut.com` still low-traffic) ·
+**Severity:** false **page** (+ ticket) — the same `severity: page` burn-rate alert N15 was meant to
+quiet is still firing continuously on a non-incident.
+
+### What
+
+N15 shipped a **per-window minimum-sample** floor — `and (increase(<denom>[{{.window}}]) > 60)`.
+That guard is **window-length-dependent**, so it is trivially cleared on the long windows that drive
+the slow-burn page. `TenantRouterLatency`'s surviving arm is `(30m > 6·0.01) and (6h > 6·0.01)`; at a
+steady ~0.12 req/s the 30m denominator is ~210 and the 6h is ~1525 — both ≫ 60, so the floor never
+engages, yet the traffic is still far too low for a 1%-budget latency page to carry signal. `60`
+samples over a 6h window is **0.0028 req/s** — three orders of magnitude below the `0.2 req/s`
+significance bar N15's own text cites (`routingMinRps` ≈ 60 req / **5m**). The floor only does what it
+says on the *5m* window; on 30m/1h/6h it is nearly a no-op.
+
+Compounding it, the latency SLI's *numerator* here is **wall-clock-bound, not traffic-proportional**:
+the router emits almost exactly **one** slow (100–250 ms) ext_proc hit **per minute** regardless of
+total volume — the signature of a fixed cache-TTL cold miss (a ~60 s route/cert/tenant lookup that
+re-cools once a minute). Against steady low traffic that pins the error ratio at a constant
+`slow_per_min / total_per_min` (live: 1 / 7 = **0.143**) that never decays. A *sample*-count floor can
+never suppress this — the denominator is above the floor while the numerator is a constant per unit
+time. Only a **rate** floor (req/**s**, identical across windows) does.
+
+### Why it matters
+
+N15 is marked resolved, but the page it targeted is **still firing** (both `page` and `ticket`) a day
+later, now on above-sample-floor data — so operators still see it, and worse, it now looks "real"
+(passes the floor). The 0.143 ratio also is *not* the go-live burst decaying (N15's evidence showed a
+6h SLI of 0.94 trailing cold-starts); it is a stable structural artifact that will persist until real
+traffic dilutes the fixed 1/min miss (at 700 req/min it is 0.14 % → meets the 99 %-under-100 ms SLO).
+
+### Evidence (reproduce)
+
+Live on the infra cluster, 2026-07-24 (queried from inside the cluster against `victoria-metrics`):
+
+```
+# firing (both severities):
+ALERTS{alertname="TenantRouterLatency", alertstate="firing"}  severity=page AND severity=ticket
+
+# error ratio — flat, does NOT decay (contrast N15's 6h=0.94 burst):
+slo:sli_error:ratio_rate5m{sloth_id="tenant-router-latency"}   = absent   (<60 in 5m → floor engages here only)
+slo:sli_error:ratio_rate30m  = 0.1428   slo:sli_error:ratio_rate1h = 0.1428   slo:sli_error:ratio_rate6h = 0.36
+
+# slow (>100ms) vs total, by window — slow is pinned at 1.0/min, total at 7.0/min:
+window   slow   total   slow/min   total/min
+  5m       5      35       1.0        7.0
+ 15m      15     105       1.0        7.0
+ 30m      30     210       1.0        7.0      (30 slow all in the 100–250ms bucket; none >250ms)
+  1h      60     420       1.0        7.0
+# => ratio = 1/7 structurally; 30m/6h denominators (210 / 1525) are far above the `>60` floor.
+```
+
+(Histogram note: the Rust OTel SDK exports **delta** temporality, so intermediate `le` buckets are
+non-monotonic under `increase()`; only `le=0.1` and `+Inf` — the two the SLI uses — are trustworthy.)
+
+### Suggested fix (nexus-side)
+
+Two independent fixes; do both:
+
+1. **Alerting — make the floor a rate, or scale it by window.** In the Sloth source `total_query`,
+   replace the flat `increase(<denom>[{{.window}}]) > 60` with a window-independent **rate** floor —
+   `sum by (deployment_environment_name) (rate(<denom>[{{.window}}])) > 0.2` (the `0.2 req/s`
+   `routingMinRps` bar N15 already cites) — or, if a sample floor is preferred, scale it by window
+   length so it stays ≈ 0.2 req/s on every window instead of a flat 60. This is the durable
+   false-page defense; a flat per-window sample count cannot provide it. Applies to the latency **and**
+   availability SLIs on both `tenant-router` and `identity-sidecar`.
+
+2. **Workload — kill the ~1/min ext_proc cold miss.** Independently of alerting, one routed request per
+   minute paying 100–250 ms (vs ~≤5 ms hot-path for the other ~85 %) is a real UX cost — every minute a
+   visitor eats the cold path. Investigate the ~60 s cache TTL in the router's route/cert/tenant lookup
+   and add keep-warm / background refresh so the steady state has no periodic cold miss. This also
+   removes the structural `1/7` that makes the SLO unachievable at low traffic.
+
+_Raised by infra-v1 (live investigation the day after N15 shipped). Infra is dropping a time-boxed
+Alertmanager silence on `TenantRouterLatency` as an interim; the durable fix is here (both the
+rate-floor in the Sloth source and the cold-miss in the router). Cross-ref N15._
