@@ -10,7 +10,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[5m])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[5m]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[5m])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[5m]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[5m])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -21,7 +21,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[30m])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[30m]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[30m])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[30m]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[30m])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -32,7 +32,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[1h])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[1h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -43,7 +43,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[2h])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[2h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[2h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[2h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[2h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -54,7 +54,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[6h])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[6h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[6h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[6h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[6h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -65,7 +65,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[1d])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1d]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[1d])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1d]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[1d])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -76,7 +76,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total{result="not_ready"}[3d])))
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[3d]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_requests_total[3d])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[3d]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_requests_total[3d])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-availability
@@ -211,7 +211,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[5m]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[5m])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[5m]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[5m])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -227,7 +227,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[30m]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[30m])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[30m]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[30m])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -243,7 +243,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[1h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -259,7 +259,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[2h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[2h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[2h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[2h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -275,7 +275,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[6h]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[6h])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[6h]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[6h])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -291,7 +291,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1d]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[1d])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1d]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[1d])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency
@@ -307,7 +307,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[3d]))) and (sum by (deployment_environment_name) (increase(router_ext_proc_duration_seconds_count{result="hit"}[3d])) > 60))
+      ((sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[3d]))) and (sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[3d])) > 0.2))
     labels:
       plane: routing
       sloth_id: tenant-router-latency

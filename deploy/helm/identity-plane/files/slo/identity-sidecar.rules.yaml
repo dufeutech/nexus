@@ -10,7 +10,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[5m])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[5m]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[5m])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[5m]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[5m])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -21,7 +21,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[30m])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[30m]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[30m])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[30m]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[30m])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -32,7 +32,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[1h])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[1h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -43,7 +43,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[2h])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[2h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[2h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[2h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[2h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -54,7 +54,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[6h])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[6h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[6h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[6h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[6h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -65,7 +65,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[1d])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1d]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[1d])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1d]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[1d])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -76,7 +76,7 @@ groups:
     expr: |
       (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total{result=~"not_ready|unavailable_closed"}[3d])))
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[3d]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_requests_total[3d])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[3d]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_requests_total[3d])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-availability
@@ -211,7 +211,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[5m]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[5m])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[5m]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[5m])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -227,7 +227,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[30m]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[30m])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[30m]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[30m])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -243,7 +243,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -259,7 +259,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[2h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[2h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[2h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[2h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -275,7 +275,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[6h]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[6h])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[6h]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[6h])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -291,7 +291,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1d]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1d])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1d]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[1d])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency
@@ -307,7 +307,7 @@ groups:
       )
       )
       /
-      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[3d]))) and (sum by (deployment_environment_name) (increase(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[3d])) > 60))
+      ((sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[3d]))) and (sum by (deployment_environment_name) (rate(sidecar_ext_proc_duration_seconds_count{result!~"not_ready|unavailable_closed"}[3d])) > 0.2))
     labels:
       plane: identity
       sloth_id: identity-sidecar-latency

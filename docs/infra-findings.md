@@ -458,9 +458,11 @@ the next chart re-vendor — the durable fix is the floor in the Sloth source sp
 
 ## N16 — N15's per-window *sample* floor (`increase>60`) is too weak on long windows; `TenantRouterLatency` still pages on a wall-clock-bound cold miss
 
-**Status:** open · **Found:** 2026-07-24, one day after N15 shipped (`app.dufeut.com` still low-traffic) ·
-**Severity:** false **page** (+ ticket) — the same `severity: page` burn-rate alert N15 was meant to
-quiet is still firing continuously on a non-incident.
+**Status:** alerting arm **resolved** (change `slo-latency-rate-floor`; the burn-rate floor is now a
+window-independent `rate(<denom>[{{.window}}]) > 0.2 req/s`) · workload arm (fix #2, the ~1/min
+ext_proc cold miss) **open** · **Found:** 2026-07-24, one day after N15 shipped (`app.dufeut.com`
+still low-traffic) · **Severity:** false **page** (+ ticket) — the same `severity: page` burn-rate
+alert N15 was meant to quiet was still firing continuously on a non-incident.
 
 ### What
 
@@ -534,3 +536,17 @@ Two independent fixes; do both:
 _Raised by infra-v1 (live investigation the day after N15 shipped). Infra is dropping a time-boxed
 Alertmanager silence on `TenantRouterLatency` as an interim; the durable fix is here (both the
 rate-floor in the Sloth source and the cold-miss in the router). Cross-ref N15._
+
+**Resolution (fix #1, alerting) — change `slo-latency-rate-floor`.** The per-window sample-count
+floor (`increase(<denom>[{{.window}}]) > 60`) was replaced by a window-independent request-rate
+floor (`rate(<denom>[{{.window}}]) > 0.2`) on all four SLIs (availability + latency, both
+`tenant-router` and `identity-sidecar`), regenerated through the existing Sloth toolchain. `0.2 req/s`
+is the repo's documented `routingMinRps`/`enrichMinRps` significance bar, so the burn-rate family now
+shares one floor value with the hand-authored threshold alerts. The `service-slo-policy` spec was
+sharpened to mandate a rate (identical on every window) and forbid a per-window count; a burn-rate
+unit test now pins the exact N16 case (a 6h window whose sample *count* clears an equivalent 60-count
+but whose *rate* is < 0.2 req/s is withheld). Industry grounding: this adopts GitLab
+metrics-catalog's `minimumOpsRateForMonitoring` primitive — a rate is the only scale-invariant floor
+across the 5m→3d burn windows (a single count can't fit that span). **Fix #2 (the ~1/min ext_proc
+cold miss) remains open** as a separate workload change; it is a real UX cost but out of scope for
+the alerting fix._
