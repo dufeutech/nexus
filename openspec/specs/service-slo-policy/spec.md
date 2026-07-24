@@ -80,11 +80,17 @@ SHALL be authored at the SLO policy's source of truth so it is preserved through
 generation and through any downstream vendoring of the rules — a consumer MUST NOT have
 to re-add it.
 
-When an alert corroborates a condition across more than one evaluation window, the floor
-SHALL be applied to each window against that same window's request volume, not against a
-single fixed window. A window whose volume clears the floor SHALL remain eligible to
-fire even while a shorter window with insufficient volume is withheld, so that a service
-which is too quiet to judge over a short window can still be judged over a longer one.
+The floor SHALL be a **request rate** — a volume per unit time (requests per second) —
+and SHALL be the **same rate on every evaluation window**. It SHALL NOT be expressed as a
+per-window sample *count*, because a fixed count is window-length-dependent: a count that
+is a meaningful floor on a short window becomes an effective no-op on a long window
+(a count sufficient for a 5-minute window corresponds to a far smaller, insignificant rate
+over a 6-hour window), leaving the long, slow-burn windows unfloored. When an alert
+corroborates a condition across more than one evaluation window, the floor SHALL be
+applied to each window against that same window's request **rate**. A window whose rate
+clears the floor SHALL remain eligible to fire even while a shorter window with
+insufficient rate is withheld, so that a service which is too quiet to judge over a short
+window can still be judged over a longer one.
 
 The floor SHALL be expressed against the objective's own denominator: the total-request
 rate for an availability/ratio objective, and the histogram count rate for a
@@ -127,16 +133,25 @@ produced it.
 #### Scenario: A multi-window alert floors each window on its own sample volume
 
 - **WHEN** a burn-rate alert corroborates a shorter and a longer evaluation window, and
-  the shorter window's request volume is below the floor while the longer window's volume
-  is above it
+  the shorter window's request rate is below the floor while the longer window's rate is
+  above it
 - **THEN** the shorter window SHALL be withheld while the longer window remains eligible
   to evaluate, so a low-traffic objective is still monitored over the window where its
   sample is sufficient
 
+#### Scenario: A long-window count that clears a sample count but not the rate is still withheld
+
+- **WHEN** a low-traffic service's request volume over a long evaluation window exceeds
+  what an equivalent fixed sample count would have required, yet its request **rate** over
+  that window remains below the objective's minimum sample rate
+- **THEN** the alert SHALL be withheld on that window, because the floor is evaluated as a
+  window-independent rate rather than as a per-window count that a long window trivially
+  clears
+
 ### Requirement: A floored availability signal keeps a traffic-independent unavailability backstop
 
-When an availability or error-ratio alert is subject to a minimum-sample floor, the
-low-traffic region the floor withholds SHALL remain covered by a separate unavailability
+An availability or error-ratio alert subject to a minimum-sample floor SHALL keep the
+low-traffic region the floor withholds covered by a separate unavailability
 signal that does not depend on request volume, so a genuine outage that coincides with
 near-zero traffic is still surfaced. That backstop SHALL derive from an operator-owned
 readiness or health indicator of the service rather than from the request ratio itself.
