@@ -571,3 +571,64 @@ deploy verification** — infra to confirm the deployed `ROUTING_CACHE_TTL` (cod
 TTL or 60 s connection lifetime exists in code) and that the structural low-traffic SLI error ratio
 falls to ~0 after rollout. The same pattern applies to the identity-sidecar api-key cache but does not
 lift cleanly (`moka::sync`, hard per-entry `expires_at`, reverse index) — tracked as a follow-on._
+
+**Post-deploy investigation (infra, 2026-07-24 — live fleet).** Infra queried the running cluster
+to close A and scope the sidecar follow-on. Raw queries + values live in
+`infra-v1/N16-SIDECAR-HANDOFF.md`; the durable outcomes for nexus:
+
+- **Fix #2 is NOT deployed yet.** The live combined edge still runs `tenant-router:0.0.7` (pod age
+  7d+, not rolled). `router-keep-warm-resolve` merged to `main` *after* `v0.0.7` was tagged and no
+  new release has been cut, so A.2 ("symptom gone after rollout") is unanswerable until nexus cuts a
+  release **and** infra re-vendors the chart + `ops release promote`. What infra captured is the
+  **pre-deploy baseline**: `slow(>100ms) = 60/h = 1.0/min` against ~8/min total (the structural
+  `~1/8`), unchanged from the original measurement.
+- **⚠️ Reconciliation flag — the period does not match the TTL.** Deployed `ROUTING_CACHE_TTL` and
+  `ROUTING_L2_TTL` are **both 600 s** (code defaults), but the measured cold-miss period is **~60 s**.
+  A 600 s entry lifetime cannot produce a 1/min miss, so the periodic refill is **not** L1/L2 entry
+  expiry — it points to a distinct ~60 s mechanism (a Redis/L2 connection idle-cycle, a per-minute
+  control-plane poll/invalidation, or a ~60 s upstream/DB connection max-lifetime). **This is a live
+  concern for the shipped fix:** keep-warm renews the 600 s cache entry, so if the real driver is a
+  60 s connection/poll cycle, keep-warm may not remove the symptom. The reproduction test proved the
+  *cache-expiry* mechanism exists in isolation; it did not prove that is what fires every 60 s in
+  prod. **Post-rollout, re-run the slow-count first — if the 1/min cadence persists, reopen: the
+  cause is the 60 s cycle, not the cache.**
+- **Measurement caveat.** The Rust OTel SDK exports **delta** temporality, so
+  `histogram_quantile(0.99, rate(..._bucket[5m]))` is unreliable (intermediate `le` buckets are
+  non-monotonic under `rate()`); only `le=0.1` and `+Inf` are trustworthy. Use the slow-hit **count**
+  (`increase(count{result="hit"}) - increase(bucket{le="0.1"})`), not p99, as the N16 symptom signal.
+- **Sidecar follow-on → NO-BUILD (resolved, closed).** The `sidecar-keep-warm-apikey` follow-on noted
+  above is **not proceeding.** Doubly confirmed on the live fleet: (1) the api-key resolve cache is
+  **disabled in prod** (`APIKEY_RESOLVE_CACHE_*` all unset → `ENABLED` defaults false; every resolve
+  is already a live indexed SELECT; the cache's own metrics don't even exist), and (2) the sidecar
+  shows **zero** slow (>100 ms) hits — no symptom to fix. If the api-key cache is ever enabled in
+  prod, re-open only the Q3 symptom check. No nexus code change; no proposal.
+
+**UPDATE — fix #2 now DEPLOYED + load-tested (infra, 2026-07-24, later same day).** Nexus release
+`v0.0.8` was cut (appVersion 0.0.7→0.0.8; CI built all six images; plane OCI charts published) and
+infra rolled the edge to 0.0.8 (all six images repinned by digest; ArgoCD Synced/Healthy;
+`app.dufeut.com` 200; keep-warm live — new `router_time_to_warm_seconds` metric present). A sustained
+synthetic load (~2/s → ~970/min reaching the router) was driven to close A.2:
+
+- **Operationally RESOLVED.** Under sustained traffic the latency SLI (the value that pages) =
+  **0.11 % (5m)** / ~0 (30m) vs the pre-fix **14.3 %**; slow/total over 15m = 15 / 9680 = **0.15 %** —
+  far under the 1 % objective and the 6 % page threshold. Combined with fix #1's rate-floor, the
+  false page cannot fire at any real traffic level.
+- **Underlying ~1/min cadence: INCONCLUSIVE, leaning "persists."** The *absolute* slow count is still
+  ~15/15m ≈ **1/min**, and `router_cache_misses_total` holds a steady **2/min (1/min per pod),
+  load-independent and NOT invalidation-driven** (`router_last_invalidation_timestamp_seconds = 0`).
+  So the SLI-ratio collapse looks like **traffic dilution, not the slow-count going to zero** — i.e.
+  the reconciliation flag above stands: keep-warm renews the 600 s entry, but a distinct **~60 s
+  mechanism** (Redis/L2 idle-cycle, per-minute poll, or ~60 s DB/upstream connection max-lifetime)
+  appears to still fire one cold refill/min. Could not get a clean verdict — see next.
+- **Blocker on precise verification = the delta-temporality histogram.** At load the `le` buckets go
+  non-monotonic (the 30m latency SLI came back **negative** — `le=0.1` bucket > total count), so the
+  slow-hit count is unreadable at precision. Client-side latency can't substitute (node→public-IP
+  hairpin + the front tier not honoring keepalive give a flat ~320 ms TLS/RTT floor that swamps the
+  single-digit-ms ext_proc time).
+
+**Two residuals for nexus (both now operationally harmless):** (1) **Observability** — switch the
+router/sidecar OTLP histograms from **delta → cumulative** temporality so the latency SLI is actually
+readable; today it yields negative ratios and blocks any precise SLO check. (2) **Root-cause** — with
+the histogram fixed, confirm whether keep-warm removes the ~1/min cold event or whether the separate
+~60 s mechanism drives it (reopen A.1). N16's operational goal — no false page — is **met**; these are
+quality/observability follow-ups, not a live incident._
