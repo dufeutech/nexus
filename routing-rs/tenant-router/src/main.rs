@@ -26,11 +26,14 @@ mod strip;
 mod response;
 mod serve;
 mod api;
+#[cfg(test)]
+mod test_support;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::env::var;
 
@@ -51,7 +54,7 @@ use cache_redis::RedisCache;
 use invalidations_nats::NatsInvalidations;
 use store_postgres::{PgInvalidations, PgRoutingStore};
 
-use crate::state::{AppState, METRICS};
+use crate::state::{refresh_point, AppState, METRICS};
 use crate::serve::{env, shutdown_signal, watch_invalidations, Router};
 
 /// Build the Tokio runtime, sizing the worker pool from `TOKIO_WORKER_THREADS`
@@ -151,6 +154,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .build(),
         store,
         l2_ttl,
+        // Keep-warm refresh point derived from the L1 lifetime (D2): refresh a
+        // resident, actively-read entry once it is halfway to expiry, leaving ample
+        // margin to complete the refresh off the request path before hard expiry.
+        refresh_after: refresh_point(Duration::from_secs(ttl)),
+        refreshing: Arc::new(Mutex::new(HashSet::new())),
         ready: Arc::new(AtomicBool::new(false)),
         last_apply_ms: Arc::new(AtomicU64::new(0)),
         warm_ms: Arc::new(AtomicU64::new(0)),

@@ -139,23 +139,20 @@ async fn resolve(State(s): State<AppState>, Path(host): Path<String>) -> impl In
 mod tests {
     use crate::api;
     use crate::state::AppState;
-    use std::collections::HashMap;
+    use crate::test_support::{build_state, FakeStore};
     use std::env::var;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use async_trait::async_trait;
+    use std::time::Duration;
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::routing::get;
     use axum::Router as AxumRouter;
-    use moka::future::Cache;
     use tokio::time::sleep;
-    use router_core::audit::AuditCtx;
-    use router_core::auth::{AuthPolicy, RouteAuth};
-    use router_core::domain::{Pool, WorkspaceConfig};
-    use router_core::store::{BoxError, CreateOutcome, DomainRecord, DomainUpsert, RoutingStore};
     use tower::util::ServiceExt;
+
+    /// A generous L1 lifetime for the `/authorize`-vs-router tests, which exercise
+    /// resolution/negative-caching within one request burst and never test expiry.
+    const TEST_TTL: Duration = Duration::from_secs(30);
 
     /// A handler that outlives the timeout must be terminated with 408 rather
     /// than pinning the task.
@@ -216,179 +213,9 @@ mod tests {
     // subdomain, a nested miss, an apex-with-only-a-wildcard, and an unknown host.
     // ----------------------------------------------------------------------- //
 
-    /// An in-memory `RoutingStore` answering only the three reads `resolve` makes:
-    /// the exact/wildcard domain lookup, the workspace config, and the (pass-through)
-    /// auth policy. Every other control-plane method returns a loud `Err` — the
-    /// parity test never drives them, and a stray call should fail rather than lie.
-    struct FakeStore {
-        /// verified `(domain, is_wildcard)` → `workspace_id`.
-        domains: HashMap<(String, bool), String>,
-        /// Count of `lookup_domain` calls — lets the negative-cache test assert that
-        /// a repeat flood collapses to a single store evaluation.
-        lookups: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl RoutingStore for FakeStore {
-        async fn lookup_domain(
-            &self,
-            domain: &str,
-            wildcard: bool,
-        ) -> Result<Option<String>, BoxError> {
-            let _ = self.lookups.fetch_add(1, Ordering::Relaxed);
-            Ok(self.domains.get(&(domain.to_owned(), wildcard)).cloned())
-        }
-
-        async fn get_workspace(
-            &self,
-            workspace_id: &str,
-        ) -> Result<Option<WorkspaceConfig>, BoxError> {
-            // Any workspace a domain row points at has a trivial config — the parity
-            // test only cares whether resolution succeeds, not the config's contents.
-            Ok(Some(WorkspaceConfig {
-                workspace_id: workspace_id.to_owned(),
-                name: String::new(),
-                plan: "free".to_owned(),
-                target_pool: Pool::new("application"),
-                features: vec![],
-                updated_at: None,
-            }))
-        }
-
-        async fn get_auth_policy(&self, _workspace_id: &str) -> Result<AuthPolicy, BoxError> {
-            Ok(AuthPolicy::default())
-        }
-
-        // --- control-plane surface: never exercised by the parity test ---------- //
-        async fn create_workspace(
-            &self,
-            _cfg: &WorkspaceConfig,
-            _owner_account: Option<&str>,
-            _idempotency_key: Option<&str>,
-            _actx: &AuditCtx,
-        ) -> Result<CreateOutcome, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn update_workspace(
-            &self,
-            _cfg: &WorkspaceConfig,
-            _actx: &AuditCtx,
-        ) -> Result<bool, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn upsert_domain(
-            &self,
-            _up: &DomainUpsert<'_>,
-            _actx: &AuditCtx,
-        ) -> Result<(), BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn create_pending_domain(
-            &self,
-            _domain: &str,
-            _workspace_id: &str,
-            _actx: &AuditCtx,
-        ) -> Result<bool, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn set_domain_verified(
-            &self,
-            _domain: &str,
-            _verified: bool,
-            _actx: &AuditCtx,
-        ) -> Result<(), BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn delete_domain(
-            &self,
-            _domain: &str,
-            _wildcard: bool,
-            _actx: &AuditCtx,
-        ) -> Result<(), BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn domains_for_workspace(
-            &self,
-            _workspace_id: &str,
-        ) -> Result<Vec<String>, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn get_domain(
-            &self,
-            _domain: &str,
-            _wildcard: bool,
-        ) -> Result<Option<DomainRecord>, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn count_domains_for_workspace(&self, _workspace_id: &str) -> Result<u32, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn pending_domains(&self) -> Result<Vec<String>, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn expire_pending_domains(&self, _ttl_secs: i64) -> Result<Vec<String>, BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn upsert_auth_route(
-            &self,
-            _workspace_id: &str,
-            _prefix: &str,
-            _auth: &RouteAuth,
-            _actx: &AuditCtx,
-        ) -> Result<(), BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-        async fn delete_auth_route(
-            &self,
-            _workspace_id: &str,
-            _prefix: &str,
-            _actx: &AuditCtx,
-        ) -> Result<(), BoxError> {
-            Err("FakeStore: control-plane surface is not exercised by the \
-                 /authorize-vs-router parity test"
-                .into())
-        }
-    }
-
-    /// Build a ready `AppState` over the fake store (L1-only, no L2), so the real
-    /// `api::router` handlers resolve through it.
-    fn state_over(store: FakeStore) -> AppState {
-        AppState {
-            l1: Cache::builder().max_capacity(1024).build(),
-            l2: None,
-            neg: Cache::builder().max_capacity(1024).build(),
-            store: Arc::new(store),
-            l2_ttl: 60,
-            ready: Arc::new(AtomicBool::new(true)),
-            last_apply_ms: Arc::new(AtomicU64::new(0)),
-            warm_ms: Arc::new(AtomicU64::new(0)),
-            start: Instant::now(),
-        }
-    }
+    // The in-memory `FakeStore` and the `AppState` builder live in
+    // `crate::test_support` (single source of truth), shared with the resolve
+    // keep-warm tests.
 
     /// Fire one GET at a fresh router over `state` and return its status.
     async fn get_status(state: &AppState, uri: &str) -> StatusCode {
@@ -402,11 +229,11 @@ mod tests {
     #[tokio::test]
     async fn authorize_and_router_resolve_the_identical_host_set() {
         // Seed: an exact `shop.example.com` row and a wildcard `example.com` row.
-        let domains = HashMap::from([
+        let store = Arc::new(FakeStore::new([
             (("shop.example.com".to_owned(), false), "ws_exact".to_owned()),
             (("example.com".to_owned(), true), "ws_wild".to_owned()),
-        ]);
-        let state = state_over(FakeStore { domains, lookups: Arc::new(AtomicUsize::new(0)) });
+        ]));
+        let state = build_state(store, TEST_TTL);
 
         // (host, should_resolve): the router routes exactly these, so the cert gate
         // must authorize exactly these.
@@ -446,8 +273,8 @@ mod tests {
     #[tokio::test]
     async fn ask_negative_cache_collapses_repeat_unknown_host_flood() {
         // Empty store → every host is unknown and fails closed.
-        let lookups = Arc::new(AtomicUsize::new(0));
-        let state = state_over(FakeStore { domains: HashMap::new(), lookups: lookups.clone() });
+        let store = Arc::new(FakeStore::empty());
+        let state = build_state(store.clone(), TEST_TTL);
 
         // Hammer the gate with the SAME unknown host many times.
         for _ in 0..50 {
@@ -459,7 +286,7 @@ mod tests {
         // the remembered refusal. `resolve` makes at most two lookups per
         // evaluation (exact, then wildcard-parent), so a single evaluation is
         // ≤ 2 store lookups — proving the flood did not re-evaluate per connection.
-        let n = lookups.load(Ordering::Relaxed);
+        let n = store.lookups();
         assert!(
             n <= 2,
             "negative cache must collapse a repeat flood to one evaluation; saw {n} store lookups",
@@ -471,10 +298,7 @@ mod tests {
     /// consume the issuance budget reserved for approved ones.
     #[tokio::test]
     async fn ask_distinct_unknown_host_flood_authorizes_nothing() {
-        let state = state_over(FakeStore {
-            domains: HashMap::new(),
-            lookups: Arc::new(AtomicUsize::new(0)),
-        });
+        let state = build_state(Arc::new(FakeStore::empty()), TEST_TTL);
         for i in 0..200 {
             let host = format!("junk-{i}.example.com");
             let status = get_status(&state, &format!("/authorize?domain={host}")).await;

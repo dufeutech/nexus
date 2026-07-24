@@ -460,7 +460,8 @@ the next chart re-vendor — the durable fix is the floor in the Sloth source sp
 
 **Status:** alerting arm **resolved** (change `slo-latency-rate-floor`; the burn-rate floor is now a
 window-independent `rate(<denom>[{{.window}}]) > 0.2 req/s`) · workload arm (fix #2, the ~1/min
-ext_proc cold miss) **open** · **Found:** 2026-07-24, one day after N15 shipped (`app.dufeut.com`
+ext_proc cold miss) **implemented** (change `router-keep-warm-resolve`; nexus-side code complete,
+pending deploy verification) · **Found:** 2026-07-24, one day after N15 shipped (`app.dufeut.com`
 still low-traffic) · **Severity:** false **page** (+ ticket) — the same `severity: page` burn-rate
 alert N15 was meant to quiet was still firing continuously on a non-incident.
 
@@ -547,6 +548,26 @@ sharpened to mandate a rate (identical on every window) and forbid a per-window 
 unit test now pins the exact N16 case (a 6h window whose sample *count* clears an equivalent 60-count
 but whose *rate* is < 0.2 req/s is withheld). Industry grounding: this adopts GitLab
 metrics-catalog's `minimumOpsRateForMonitoring` primitive — a rate is the only scale-invariant floor
-across the 5m→3d burn windows (a single count can't fit that span). **Fix #2 (the ~1/min ext_proc
-cold miss) remains open** as a separate workload change; it is a real UX cost but out of scope for
-the alerting fix._
+across the 5m→3d burn windows (a single count can't fit that span). Fix #2 (the ~1/min ext_proc
+cold miss) is addressed separately by the workload change below; it is a real UX cost but out of
+scope for the alerting fix._
+
+**Resolution (fix #2, workload) — change `router-keep-warm-resolve`.** The resolve path
+(`routing-rs/tenant-router`) was lazy-on-miss with no refresh-ahead, so a resident entry's TTL expiry
+landed the full store refill (up to 4 Postgres + 2 Redis hops) on the next live request — one slow
+ext_proc hit per lifetime window per hot key, the structural `1/7`. Since cache correctness is already
+push-based (control-plane `NOTIFY` evicts changed keys), the TTL is only a staleness backstop, so the
+fix keeps a resident, actively-read entry warm **in the background**: past a refresh point derived from
+the existing `ROUTING_CACHE_TTL` (lifetime / 2, no new knob), a read serves the value already held and
+spawns a single coalesced background refresh that re-inserts (renewing the value and the L1 lifetime),
+so a continuously-read host never reaches hard expiry on the request path. First-ever hosts still
+resolve on demand; `NOTIFY` invalidation is unchanged; a persistently-failing refresh hard-expires at
+the lifetime and falls back to on-demand (bounded staleness). Build-vs-adopt (`/opsx:decide`): **Extend
+Moka** — its coalesced loaders already give the "one refresh per key" the spec needs, and Moka has no
+native refresh-ahead, so a thin stale-while-revalidate layer (RFC 5861) over the in-use cache is the
+proportionate choice. A deterministic reproduction test drives the real resolve path and settled the
+mechanism: 7 request-path refills across ~7 lifetime windows before the fix, 0 after. **Still pending:
+deploy verification** — infra to confirm the deployed `ROUTING_CACHE_TTL` (code defaults 600 s; no 60 s
+TTL or 60 s connection lifetime exists in code) and that the structural low-traffic SLI error ratio
+falls to ~0 after rollout. The same pattern applies to the identity-sidecar api-key cache but does not
+lift cleanly (`moka::sync`, hard per-entry `expires_at`, reverse index) — tracked as a follow-on._
