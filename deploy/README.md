@@ -343,6 +343,11 @@ must emit — is the "Box telemetry contract" section of
     — never hand-edit the embedded rules; lab and prod evaluate byte-identical rules. On
     the umbrella, run `helm dependency update` after a regenerate so the repackaged
     subcharts pick up the refreshed rules. Validate with `monitoring/slo/check.sh`.
+    The burn-rate SLIs carry the **same low-traffic guard** as a per-window minimum-**sample**
+    floor authored into each SLI's `total_query` (`and (sum(increase(<denom>[{{.window}}])) > 60)`;
+    60 ≈ the `*MinRps` `0.2` bar per 5m, but sample-count so long windows still monitor
+    low-traffic tenants) — so the `TenantRouter*` / `IdentitySidecar*` pages can't fire on
+    idle noise either (N15). Because it lives in the Sloth source, it survives regeneration.
   - **Collector caveat:** the `result`/`op`/`tier` metric attributes several rules and
     dashboard panels key on are LOW-cardinality nexus RED dimensions. Your OTel
     collector MUST keep them (nexus's lab collector does — `monitoring/otel-collector`);

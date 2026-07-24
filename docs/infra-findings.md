@@ -348,3 +348,110 @@ provisioning already grants this, so it is a documented precondition, not an add
 _Raised by infra-v1 (change `edge-front-tier-cutover`). Infra worked around it in its provisioning Job
 (forces `search_path=public` via `PGOPTIONS`, drops the mis-placed tables, grants on `public.*`) and
 the front tier is now live + healthy on staging; this schema-qualification is the durable upstream fix._
+
+---
+
+## N15 — the tenant-router Sloth SLOs have no min-traffic floor, so they page on idle-traffic noise
+
+**Status:** resolved (change `slo-sloth-source-and-floor`) ·
+**Found:** 2026-07-23, `app.dufeut.com` go-live day (edge live, near-zero real traffic) ·
+**Severity:** false **page** — a `severity: page` burn-rate alert fires with no user-visible problem.
+
+> **Resolution (change `slo-sloth-source-and-floor`):** a per-window minimum-**sample**
+> floor was authored into the `total_query` of every SLI in the existing Sloth sources
+> `monitoring/slo/{tenant-router,identity-sidecar}.slo.yaml`
+> (`... and (sum by (deployment_environment_name) (increase(<denom>[{{.window}}])) > 60)`),
+> regenerated via `monitoring/slo/generate.sh` into `monitoring/prometheus/rules/` and the
+> staged Helm copies, and covered by a new below-floor suppression case in the promtool
+> burn-rate tests. `60` is the repo's existing significance bar (`routingMinRps`/`enrichMinRps`
+> `0.2` ≈ 60 req/5m), generalized per window — sample-count, not a fixed rps, so low-traffic
+> tenants stay monitored on long windows. Both latency and availability are floored; the
+> traffic-independent readiness alerts (`NexusRoutingNotReady` / `NexusIdentitySidecarNotReady`,
+> `router_ready == 0`, `severity: critical`) remain the backstop for a near-zero-traffic outage.
+>
+> **Correction to this finding:** the claim below that "the source spec is not in the repo"
+> was **mistaken** — the Sloth sources, `generate.sh`, promtool `check.sh`, and CI drift
+> guard already existed under `monitoring/slo/`. Only the floor was missing.
+>
+> **Residual (follow-up, likely infra scope):** a floored availability SLO plus a total
+> process death is still uncovered — `router_ready` goes *absent* (not `0`), so neither the
+> SLO nor `router_ready == 0` fires. Wants a target-absent / `up == 0` alert at the platform layer.
+
+### What
+
+The generated Sloth rules `deploy/helm/routing-plane/files/slo/tenant-router.rules.yaml`
+(and the identity sibling `deploy/helm/identity-plane/files/slo/identity-sidecar.rules.yaml`)
+define ratio SLIs with **no minimum-denominator guard**. The latency SLI is
+
+```
+(rate(router_ext_proc_duration_seconds_count{result="hit"}[w])
+ - rate(router_ext_proc_duration_seconds_bucket{result="hit",le="0.1"}[w]))
+/ rate(router_ext_proc_duration_seconds_count{result="hit"}[w])
+```
+
+When the denominator is a handful of requests, the ratio is dominated by one or two slow
+samples. The multi-window burn-rate alert `TenantRouterLatency` (page) then fires on the
+`(30m > 6*0.01) and (6h > 6*0.01)` branch. Nothing gates it on request volume, so at idle
+traffic it pages on statistical noise. Same shape for `TenantRouterAvailability` and the
+identity-sidecar SLOs.
+
+### Why it matters
+
+This is the exact class of bug infra already fixed for the **infra-owned** rule
+`NexusRoutingLatencyHigh` on 2026-07-21 (a `and sum(rate(<count>[5m])) > 0.2` traffic floor,
+~0.2 req/s ≈ 60 req / 5m). Its **vendored** Sloth siblings never got that guard — and they are
+`page` severity. On go-live day, with only probe + smoke traffic on the new edge, this paged for
+a non-incident. Every idle window (pre-launch, off-peak, a quiet tenant) will keep doing so, which
+trains operators to ignore a page that is supposed to mean "customer latency SLO is burning."
+
+### Evidence (reproduce)
+
+Live on the infra cluster, 2026-07-23 (queried via the `victoria-metrics` datasource):
+
+```
+# firing alert (from vmalert):
+#   TenantRouterLatency  severity=page  sloth_id=tenant-router-latency
+#   activeAt 2026-07-23T22:19:30Z
+#   source: .../vmalert/alert?group_id=14583876427981286736&alert_id=6617408212189708029
+
+# SLI error ratio (fraction of hits slower than 100ms), by window:
+slo:sli_error:ratio_rate5m{sloth_id="tenant-router-latency"}   = 0.143   (1/7)
+slo:sli_error:ratio_rate30m{sloth_id="tenant-router-latency"}  = 0.143
+slo:sli_error:ratio_rate1h{sloth_id="tenant-router-latency"}   = 0.157
+slo:sli_error:ratio_rate6h{sloth_id="tenant-router-latency"}   = 0.942   <- trailing go-live cold-starts
+
+# actual request volume over the same windows:
+sum(increase(router_ext_proc_requests_total[6h])) = 749     (~0.035 req/s)
+sum(increase(router_ext_proc_requests_total[1h])) = 59
+sum(increase(router_ext_proc_requests_total[5m])) = 35
+```
+
+749 requests in 6h is not a traffic level at which a 1%-latency-budget page carries signal. The
+clean fractions (1/7, 8/51) are the tell: a few slow first-hits, not a regression.
+
+### Suggested fix (nexus-side)
+
+Add a **min-traffic floor to the SLI itself**, in the Sloth **source spec** — not the rendered
+file. Note the committed `*.rules.yaml` is `# DO NOT EDIT` (Sloth `v0.16.0`, `prometheus/v1`), and
+**the source spec is not in the repo** (only the generated output is committed) — so step one is
+to land the Sloth input spec in-repo so this is fixable without hand-editing generated output.
+
+Gate every ratio SLI (`raw.error_ratio_query`) so it yields no samples below a floor, e.g.:
+
+```
+( <existing error/total ratio> )
+and
+( sum by (deployment_environment_name) (rate(router_ext_proc_duration_seconds_count{result="hit"}[{{.window}}])) > 0.2 )
+```
+
+Below ~0.2 req/s the SLI is empty → no burn recorded → the page cannot fire on noise; above it,
+behaviour is unchanged. Use `router_ext_proc_requests_total` for the availability SLO's floor and
+the sidecar's request counter for identity-sidecar. Reuse the `0.2 req/s` floor
+`NexusRoutingLatencyHigh` already uses unless a per-SLO traffic profile argues otherwise. A
+min-sample floor only affects windows where the error budget is meaningless anyway; it does not
+move the 99% / 99.9% objectives.
+
+_Raised by infra-v1 (surfaced from a live go-live page; relates to infra change `alert-noise-retune`,
+which added the same floor to the infra-owned routing rules and explicitly flagged the vendored Sloth
+SLOs as the remaining gap). Infra can silence/interim-patch the vendored copy, but that is reverted on
+the next chart re-vendor — the durable fix is the floor in the Sloth source spec here._
