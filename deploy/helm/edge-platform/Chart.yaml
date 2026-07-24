@@ -11,6 +11,11 @@ description: >-
   Stores (PostgreSQL, optional Redis) and ZITADEL are external.
 type: application
 # Chart (package) version — bump on template changes; independent of appVersion.
+# 0.4.1: appVersion 0.0.7 -> 0.0.8 — ships the 0.0.8 first-party images on the combined
+# edge, carrying the tenant-router resolve KEEP-WARM release (N16 fix #2, ends the ~1/min
+# request-path cold miss). Subchart pins tracked to routing-plane 0.3.1 / identity-plane
+# 0.2.1. No umbrella template change; keep-warm is automatic (no new config). Chart
+# version bumped so a consumer re-vendoring by version picks up the new appVersion.
 # 0.4.0: ship the customer-domain TLS front tier (infra N12) under frontTier.* — a
 # front-tier Deployment/Service on :443/:80 (Caddy/CertMagic on-demand TLS), a dedicated
 # in-cluster ask Service exposing tenant-router :9300, and opt-in PROXY-protocol
@@ -26,11 +31,11 @@ type: application
 # 0.2.1: wire identity-contract signing into the COMBINED edge (infra N11) — the
 # co-located identity sidecar now mints + publishes JWKS on :9210 like the standalone
 # edge when identity-plane.sidecar.signing.enabled. No image change (appVersion 0.0.7).
-version: 0.4.0
+version: 0.4.1
 # The first-party image release this umbrella deploys. It is the DEFAULT tag for the
 # combined edge's images (operators can override via global.image.tag), so it MUST
 # equal the tag the images are published under — keep it in lockstep with the release.
-appVersion: "0.0.7"
+appVersion: "0.0.8"
 keywords:
   - identity
   - routing
@@ -41,8 +46,8 @@ maintainers:
   - name: edge-platform
 dependencies:
   - name: routing-plane
-    version: "0.3.0"
+    version: "0.3.1"
     repository: "file://../routing-plane"
   - name: identity-plane
-    version: "0.2.0"
+    version: "0.2.1"
     repository: "file://../identity-plane"

@@ -7,15 +7,21 @@ description: >-
   (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart (package) version — bump on template changes; independent of appVersion.
+# 0.2.1: appVersion 0.0.7 -> 0.0.8 — rebuilt at the 0.0.8 release for version parity with
+# the routing-plane keep-warm release (N16 fix #2). NO identity code change: the sidecar
+# api-key-cache keep-warm twin was intentionally NOT built (N16 sidecar follow-on closed
+# NO-BUILD — the resolve cache is default-OFF in prod and shows zero slow-hit symptom).
+# Image-tag bump only; no template change. Chart version bumped so the OCI artifact
+# carries the new appVersion (publish-charts skips an existing version).
 # 0.2.0: expose the fail-closed admin-auth postures the 0.0.7 authz-admin requires —
 # named-token pepper (authzAdmin.tokenPepper.*) and legacy migration
 # (authzAdmin.legacyTokenOk); render now FAILS if no posture is selected.
 # BREAKING: a token-only authzAdmin config now also requires legacyTokenOk=true.
-version: 0.2.0
+version: 0.2.1
 # The first-party image release this chart deploys. It is the DEFAULT image tag (an
 # operator can still override via images.tag / global.image.tag), so it MUST equal the
 # tag the images are published under — keep it in lockstep with the release.
-appVersion: "0.0.7"
+appVersion: "0.0.8"
 keywords:
   - identity
   - envoy

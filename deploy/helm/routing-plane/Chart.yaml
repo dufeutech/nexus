@@ -8,6 +8,13 @@ description: >-
   independent (../../../INFO.md §4/§7) production deployment.
 type: application
 # Chart version — bump on template changes.
+# 0.3.1: appVersion 0.0.7 -> 0.0.8 for the tenant-router resolve KEEP-WARM release
+# (N16 fix #2). A resident, actively-read routing entry is refreshed in the background
+# before its L1 lifetime expires, so no live request pays the store refill — ending the
+# periodic request-path cold miss behind N16's structural ~1/7 slow-request ratio.
+# Image/behavior release; no template change, and keep-warm is automatic (no new config —
+# the refresh point derives from ROUTING_CACHE_TTL). Chart version bumped so the OCI
+# artifact carries the new appVersion (publish-charts skips an existing version).
 # 0.3.0: expose the fail-closed admin-auth postures the 0.0.7 control-plane requires —
 # named-token pepper (controlPlane.auth.tokenPepper.*) and legacy migration
 # (controlPlane.auth.legacyTokenOk); render now FAILS if no posture is selected.
@@ -15,11 +22,11 @@ type: application
 # 0.2.0: control-plane /metrics + /healthz moved to a dedicated ops port :9401
 # (off the broker-only admin :9400); probes retargeted to :9401; NetworkPolicy
 # gains allowIngressControllerFrom / allowProbesFrom + fail-closed guards.
-version: 0.3.0
+version: 0.3.1
 # The first-party image release this chart deploys. It is the DEFAULT image tag (an
 # operator can still override via images.tag / global.image.tag), so it MUST equal the
 # tag the images are published under — keep it in lockstep with the release.
-appVersion: "0.0.7"
+appVersion: "0.0.8"
 keywords:
   - routing
   - tenant
